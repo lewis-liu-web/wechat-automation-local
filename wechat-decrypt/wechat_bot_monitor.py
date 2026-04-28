@@ -204,16 +204,29 @@ def has_self_sent_after(t, after_local_id, text_hint=None):
 
 def wait_sent_confirmation(t, before_local_id, text, config_path=CONFIG_PATH, timeout=5.0):
     """Refresh decrypted DB briefly and confirm a new self-sent row exists."""
-    deadline = time.time() + max(0.5, float(timeout or 5.0))
+    t0 = time.time()
+    deadline = t0 + max(0.5, float(timeout or 5.0))
+    attempts = 0
+    refresh_total = 0.0
+    lookup_total = 0.0
+    last_summary = ''
     while time.time() < deadline:
-        run_fast_refresh(config_path)
+        attempts += 1
+        refresh_t0 = time.time()
+        rc, refresh_dt, changed, failed, summary = run_fast_refresh(config_path)
+        refresh_total += time.time() - refresh_t0
+        last_summary = summary
+        lookup_t0 = time.time()
         sent = has_self_sent_after(t, before_local_id, text)
+        lookup_total += time.time() - lookup_t0
         if sent:
-            log('send DB-confirmed target=%s before=%s sent_local_id=%s content=%r' % (
-                t.get('name'), before_local_id, sent.get('local_id'), sent.get('message_content')))
+            log('send DB-confirmed target=%s before=%s sent_local_id=%s elapsed=%.3fs attempts=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=rc%s/changed%s/failed%s/%s content=%r' % (
+                t.get('name'), before_local_id, sent.get('local_id'), time.time() - t0, attempts, refresh_total, lookup_total,
+                rc, changed, failed, last_summary, sent.get('message_content')))
             return True
         time.sleep(0.5)
-    log('send NOT DB-confirmed target=%s before=%s timeout=%.1fs' % (t.get('name'), before_local_id, float(timeout or 5.0)))
+    log('send NOT DB-confirmed target=%s before=%s timeout=%.1fs elapsed=%.3fs attempts=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=%s' % (
+        t.get('name'), before_local_id, float(timeout or 5.0), time.time() - t0, attempts, refresh_total, lookup_total, last_summary))
     return False
 
 
@@ -388,15 +401,17 @@ def main():
                 if is_trigger(cfg, t, m):
                     hit_count += 1
                     context_limit = int(cfg.get('context_limit') or 12)
+                    context_t0 = time.time()
                     ctx = fetch_context_for_target(t, upto_local_id=lid, limit=context_limit)
+                    context_dt = time.time() - context_t0
                     if ctx:
                         m['context_messages'] = ctx
                     gen_t0 = time.time()
                     decision = generate_reply(m, t, cfg)
                     gen_dt = time.time() - gen_t0
                     text = decision.reply_text
-                    log('trigger hit target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
-                        t.get('name'), lid, len(ctx), gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
+                    log('trigger hit target=%s local_id=%s ctx=%d ctx=%.3fs gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
+                        t.get('name'), lid, len(ctx), context_dt, gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
                     if not decision.should_reply or not text:
                         log('decision: skip send')
                     elif args.dry_run:
