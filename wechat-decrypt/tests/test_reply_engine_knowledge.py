@@ -1,0 +1,102 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+import io
+import json
+import os
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from reply_engine import retrieve_knowledge, generate_reply
+
+class KnowledgeArchitectureTests(unittest.TestCase):
+    def make_wiki(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        (root/'core').mkdir()
+        (root/'core'/'reply_boundary.md').write_text('边界 不能承诺 不能泄露密钥', encoding='utf-8')
+        (root/'scenes'/'a').mkdir(parents=True)
+        (root/'scenes'/'a'/'faq.md').write_text('苹果 场景A 专用资料', encoding='utf-8')
+        (root/'scenes'/'b').mkdir(parents=True)
+        (root/'scenes'/'b'/'faq.md').write_text('香蕉 场景B 专用资料', encoding='utf-8')
+        return td, root
+
+    def test_core_always_loaded_and_zero_scene_allowed(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {}}
+        hits=retrieve_knowledge('完全无关问题', cfg, {'knowledge_bases': []})
+        labels=[h.label for h in hits]
+        self.assertTrue(any('core' in x for x in labels))
+        self.assertFalse(any('scene' in x for x in labels))
+
+    def test_target_selects_multiple_scene_kbs_without_cross_leak(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {
+            'scene.a': {'type':'local','path':'scenes/a'},
+            'scene.b': {'type':'local','path':'scenes/b'},
+        }}
+        hits=retrieve_knowledge('苹果', cfg, {'knowledge_bases':['scene.a']})
+        labels='\n'.join(h.label for h in hits)
+        self.assertIn('scene.a', labels)
+        self.assertNotIn('scene.b', labels)
+        hits2=retrieve_knowledge('香蕉', cfg, {'knowledge_bases':['scene.a','scene.b']})
+        self.assertIn('scene.b', '\n'.join(h.label for h in hits2))
+
+    def test_ima_without_key_is_safe_no_hit(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {'online.ima.x': {'type':'ima','api_key_env':'NON_EXISTENT_IMA_KEY_FOR_TEST'}}}
+        hits=retrieve_knowledge('whatever', cfg, {'knowledge_bases':['online.ima.x']})
+        self.assertTrue(all(h.source == 'local' for h in hits))
+
+    def test_ima_search_uses_official_contract_and_parses_hits(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        payload = {
+            'data': {
+                'info_list': [
+                    {'title': 'IMA标题', 'highlight_content': 'IMA命中内容', 'media_id': 'm1', 'parent_folder_id': 'f1'}
+                ]
+            }
+        }
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, exc_type, exc, tb): return False
+            def read(self): return json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        captured = {}
+        def fake_urlopen(req, timeout=0):
+            captured['url'] = req.full_url
+            captured['headers'] = dict(req.header_items())
+            captured['body'] = json.loads(req.data.decode('utf-8'))
+            captured['timeout'] = timeout
+            return FakeResp()
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {'online.ima.x': {
+            'type':'ima', 'knowledge_base_id':'kb123', 'client_id_env':'TEST_IMA_CLIENT', 'api_key_env':'TEST_IMA_KEY', 'timeout':3
+        }}}
+        with mock.patch.dict(os.environ, {'TEST_IMA_CLIENT':'cid', 'TEST_IMA_KEY':'akey'}), \
+             mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            hits=retrieve_knowledge('苹果', cfg, {'knowledge_bases':['online.ima.x']})
+        ima_hits=[h for h in hits if h.source == 'ima']
+        self.assertEqual(len(ima_hits), 1)
+        self.assertIn('/openapi/wiki/v1/search_knowledge', captured['url'])
+        self.assertEqual(captured['body'], {'query':'苹果', 'cursor':'', 'knowledge_base_id':'kb123'})
+        self.assertEqual(captured['headers'].get('Ima-openapi-clientid'), 'cid')
+        self.assertEqual(captured['headers'].get('Ima-openapi-apikey'), 'akey')
+        self.assertEqual(captured['timeout'], 3)
+        self.assertIn('IMA命中内容', ima_hits[0].content)
+        self.assertEqual(ima_hits[0].kb_id, 'kb123')
+
+    def test_generate_reply_reports_hits(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {'scene.a': {'type':'local','path':'scenes/a'}}, 'reply_engine': {'use_subagent': False}}
+        d=generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
+        self.assertTrue(d.should_reply)
+        self.assertTrue(any('scene.a' in x for x in d.wiki_hits))
+
+if __name__ == '__main__':
+    unittest.main()

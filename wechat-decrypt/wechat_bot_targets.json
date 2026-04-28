@@ -15,7 +15,9 @@
       "enabled": true,
       "triggers": [],
       "reply_template": "",
-      "wiki_dir": "wiki/groups/bot群聊测试"
+      "knowledge_bases": [
+        "scene.bot_testing"
+      ]
     },
     {
       "name": "重生之我在重庆移动当牛做马",
@@ -26,9 +28,11 @@
       "enabled": true,
       "triggers": [],
       "reply_template": "",
-      "wiki_dir": "wiki/groups/重生之我在重庆移动当牛做马",
       "last_send_failed_local_id": 26,
-      "last_send_failed_at": "2026-04-28 10:07:09"
+      "last_send_failed_at": "2026-04-28 10:07:09",
+      "knowledge_bases": [
+        "scene.chongqing_mobile_work"
+      ]
     }
   ],
   "wiki_dir": "wiki",
@@ -41,17 +45,31 @@
     "llm_timeout": 120,
     "subagent_task_prefix": "wechat_reply"
   },
-  "group_wiki_dirs": {
-    "bot群聊测试": "wiki/groups/bot群聊测试",
-    "47965620946@chatroom": "wiki/groups/bot群聊测试",
-    "重生之我在重庆移动当牛做马": "wiki/groups/重生之我在重庆移动当牛做马",
-    "45915981826@chatroom": "wiki/groups/重生之我在重庆移动当牛做马"
-  },
   "context_limit": 12,
   "send_mode": "foreground",
   "stop_file": "wechat_bot_monitor.stop",
   "send_confirm_timeout": 15.0,
   "advance_on_send_failure": true,
   "send_strategy": "current_or_pyweixin_uia_then_ocr_search_physical",
-  "uia_probe_enabled": true
+  "uia_probe_enabled": true,
+  "knowledge_bases": {
+    "scene.bot_testing": {
+      "type": "local",
+      "path": "scenes/bot_testing",
+      "scope": "scene",
+      "description": "安全测试群机器人知识库"
+    },
+    "scene.chongqing_mobile_work": {
+      "type": "local",
+      "path": "scenes/chongqing_mobile_work",
+      "scope": "scene",
+      "description": "重庆移动工作场景知识库"
+    },
+    "online.ima.default": {
+      "type": "ima",
+      "enabled": false,
+      "api_key_env": "IMA_API_KEY",
+      "description": "IMA线上知识库占位，启用前需配置官方API参数"
+    }
+  }
 }
