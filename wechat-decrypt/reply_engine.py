@@ -238,37 +238,113 @@ def _retrieve_local_kb(query: str, root: Path, spec: Dict[str, Any], limit: int)
     return out
 
 
-def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
-    """Retrieve hits from Tencent IMA OpenAPI knowledge-base search.
+def _ima_query_variants(query: str, limit: int = 8) -> List[str]:
+    """Generate conservative fallback queries for IMA search.
 
-    Official contract verified from ima-skills-1.1.7:
-    - POST https://ima.qq.com/openapi/wiki/v1/search_knowledge
-    - headers: ima-openapi-clientid, ima-openapi-apikey, ima-openapi-ctx, Content-Type
-    - body: {query, cursor, knowledge_base_id}
-
-    Security: credentials are never read from files here.  They must be supplied
-    via environment variables named by config (client_id_env/api_key_env), so the
-    repo never stores secrets.  Any missing config/network/API error degrades to
-    no online hits; local core boundaries remain active.
+    IMA's search endpoint can miss long chat messages that include sender names,
+    mentions and filler words.  Keep the original query first, then try cleaned
+    variants without changing API contract or local ranking behavior.
     """
+    raw = query or ""
+    variants: List[str] = []
+
+    def add(q: str) -> None:
+        q = re.sub(r"\s+", " ", q or "").strip(" ，,。！？!?:：；;、\n\t")
+        if q and q not in variants:
+            variants.append(q)
+
+    add(raw)
+    # Remove common WeChat sender prefix and @mentions.
+    clean = re.sub(r"^[^:\n：]{1,40}[:：]\s*", "", raw)
+    clean = re.sub(r"@[^\s\u2005]+[\s\u2005]*", "", clean)
+    clean = strip_triggers(clean)
+    noise_patterns = [
+        r"知识库里?找找?",
+        r"帮我?找找?",
+        r"你?找找?",
+        r"我让你",
+        r"请你?",
+        r"麻烦你?",
+        r"介绍的是",
+        r"介绍一下",
+        r"介绍下",
+        r"简单介绍",
+        r"说一下",
+        r"讲一下",
+    ]
+    focused_clean = clean
+    for pat in noise_patterns:
+        focused_clean = re.sub(pat, " ", focused_clean)
+    focused_clean = re.sub(r"[，,。！？!?:：；;、]+", " ", focused_clean)
+    add(clean)
+    add(focused_clean)
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:产品|业务|方案|材料|培训|办公|真实号|工作号)", focused_clean):
+        phrase = m.group(0)
+        phrase = re.sub(r"^(是|的|让|给|把|找|讲|说)+", "", phrase)
+        phrase = re.sub(r"(资料|材料|介绍)+$", "", phrase)
+        add(phrase)
+
+    # Extract compact product phrases such as "工作号真实号" from chatty text.
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:号|认证|办公|权益|套餐|实名|真实)[\u4e00-\u9fff]{0,8}(?:号|认证|办公|权益|套餐)?", clean):
+        phrase = m.group(0)
+        prev = None
+        while phrase and phrase != prev:
+            prev = phrase
+            phrase = re.sub(r"^(简单介绍|简单|介绍|一下|说下|讲下)+", "", phrase)
+            phrase = re.sub(r"(产品|业务|呢|吗|是什么|介绍|一下)+$", "", phrase)
+        add(phrase)
+
+    toks = [t for t in _query_tokens(clean) if len(t) >= 2]
+    generic = {"简单", "介绍", "一下", "产品", "这个", "那个", "什么", "怎么", "一下工", "介绍一"}
+    key_toks = [t for t in toks if t not in generic]
+    # Keep tokens that contain product-like words or are longer domain phrases.
+    focused = [t for t in key_toks if any(x in t for x in ("号", "认证", "办公", "权益", "套餐", "实名", "真实")) or len(t) >= 4]
+    add(" ".join(focused[:8]))
+    add(" ".join(key_toks[:8]))
+    return variants[:limit]
+
+
+def _get_secret_env(name: str) -> str | None:
+    """Return secret env value, falling back to Windows user environment.
+
+    This intentionally reads only named environment variables and never reads
+    secret files, logs values, or persists them.
+    """
+    value = os.environ.get(name)
+    if value:
+        return value
+    if os.name != "nt":
+        return None
+    try:
+        import winreg  # type: ignore
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+            reg_value, _ = winreg.QueryValueEx(key, name)
+        if reg_value:
+            value = str(reg_value)
+            os.environ[name] = value
+            return value
+    except Exception:
+        return None
+    return None
+
+
+def _ima_auth(spec: Dict[str, Any]) -> Tuple[str | None, str | None]:
     client_env = spec.get("client_id_env") or "IMA_CLIENT_ID"
     api_env = spec.get("api_key_env") or "IMA_API_KEY"
-    client_id = os.environ.get(client_env)
-    api_key = os.environ.get(api_env)
-    kb_id = spec.get("knowledge_base_id") or spec.get("kb_id") or spec.get("id")
-    if not client_id or not api_key or not kb_id:
-        return []
+    return _get_secret_env(client_env), _get_secret_env(api_env)
 
-    import urllib.error
+
+def _ima_post(spec: Dict[str, Any], api_path: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+    client_id, api_key = _ima_auth(spec)
+    if not client_id or not api_key:
+        return None
     import urllib.request
-
     base_url = str(spec.get("base_url") or "https://ima.qq.com").rstrip("/")
-    api_path = str(spec.get("api_path") or "openapi/wiki/v1/search_knowledge").lstrip("/")
     skill_version = str(spec.get("skill_version") or os.environ.get("IMA_SKILL_VERSION") or "1.1.7")
     timeout = float(spec.get("timeout") or 8)
-    body = json.dumps({"query": query or "", "cursor": "", "knowledge_base_id": str(kb_id)}, ensure_ascii=False).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
-        f"{base_url}/{api_path}",
+        f"{base_url}/{api_path.lstrip('/')}",
         data=body,
         method="POST",
         headers={
@@ -281,8 +357,64 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-        payload = json.loads(raw or "{}")
+        return json.loads(raw or "{}")
     except Exception:
+        return None
+
+
+def _read_url_text(url: str, headers: Any, timeout: float, max_chars: int) -> str:
+    if not url:
+        return ""
+    import urllib.request
+    req_headers: Dict[str, str] = {}
+    if isinstance(headers, dict):
+        req_headers = {str(k): str(v) for k, v in headers.items()}
+    elif isinstance(headers, list):
+        for h in headers:
+            if isinstance(h, dict) and h.get("key"):
+                req_headers[str(h.get("key"))] = str(h.get("value") or "")
+    try:
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = resp.headers.get_content_charset() or "utf-8"
+            raw = resp.read(max_chars * 4)
+        return raw.decode(ctype, errors="replace")[:max_chars].strip()
+    except Exception:
+        return ""
+
+
+def _fetch_ima_media_content(media_id: str, spec: Dict[str, Any], max_chars: int = 6000) -> str:
+    if not media_id:
+        return ""
+    payload = _ima_post(spec, "openapi/wiki/v1/get_media_info", {"media_id": media_id})
+    if not isinstance(payload, dict) or payload.get("code") not in (0, None):
+        return ""
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return ""
+    media_type = data.get("media_type")
+    nb = data.get("notebook_ext_info") or {}
+    note_id = nb.get("notebook_id") or nb.get("note_id") if isinstance(nb, dict) else ""
+    if str(media_type) == "11" and note_id:
+        note = _ima_post(spec, "openapi/note/v1/get_doc_content", {"note_id": str(note_id), "target_content_format": 0})
+        nd = note.get("data") if isinstance(note, dict) and isinstance(note.get("data"), dict) else note
+        content = nd.get("content") if isinstance(nd, dict) else ""
+        return str(content or "")[:max_chars].strip()
+    url_info = data.get("url_info") or {}
+    if isinstance(url_info, dict):
+        return _read_url_text(str(url_info.get("url") or ""), url_info.get("headers"), float(spec.get("timeout") or 8), max_chars)
+    return ""
+
+
+def _retrieve_ima_kb_once(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
+    client_id, api_key = _ima_auth(spec)
+    kb_id = spec.get("knowledge_base_id") or spec.get("kb_id") or spec.get("id")
+    if not client_id or not api_key or not kb_id:
+        return []
+
+    api_path = str(spec.get("api_path") or "openapi/wiki/v1/search_knowledge").lstrip("/")
+    payload = _ima_post(spec, api_path, {"query": query or "", "cursor": "", "knowledge_base_id": str(kb_id)})
+    if not isinstance(payload, dict):
         return []
 
     data = payload.get("data") if isinstance(payload, dict) else None
@@ -290,6 +422,7 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
         data = payload
     items = (data or {}).get("info_list") or []
     folder_id = str(spec.get("folder_id") or "")
+    kb_id_s = str(kb_id)
     out: List[KnowledgeHit] = []
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
@@ -305,14 +438,53 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
             continue
         title = str(item.get("title") or "")
         highlight = str(item.get("highlight_content") or "")
-        content = "\n".join(x for x in [title, highlight] if x).strip()
+        body = _fetch_ima_media_content(media_id, spec, int(spec.get("content_max_chars") or 6000))
+        content = "\n".join(x for x in [title, highlight, body] if x).strip()
         rel = media_id or title or f"search_result_{idx + 1}"
         if parent:
             rel = f"{parent}/{rel}"
         if content:
-            out.append(KnowledgeHit("ima", str(kb_id), str(spec.get("scope") or "online"), rel, content[:1200], max(1, limit - len(out))))
+            out.append(KnowledgeHit("ima", kb_id_s, str(spec.get("scope") or "online"), rel, content[:int(spec.get("hit_max_chars") or 6000)], max(1, limit - len(out))))
         if len(out) >= limit:
             break
+    return out
+
+
+def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
+    """Retrieve hits from Tencent IMA OpenAPI knowledge-base search.
+
+    Official contract verified from ima-skills-1.1.7:
+    - POST https://ima.qq.com/openapi/wiki/v1/search_knowledge
+    - headers: ima-openapi-clientid, ima-openapi-apikey, ima-openapi-ctx, Content-Type
+    - body: {query, cursor, knowledge_base_id}
+
+    Security: credentials are never read from files here.  They must be supplied
+    via environment variables named by config (client_id_env/api_key_env), so the
+    repo never stores secrets.  Any missing config/network/API error degrades to
+    no online hits; local core boundaries remain active.
+    """
+    out: List[KnowledgeHit] = []
+    seen: set[tuple[str, str]] = set()
+    for q in _ima_query_variants(query):
+        batch = _retrieve_ima_kb_once(q, spec, max(1, limit - len(out)))
+        if not batch and spec.get("folder_id"):
+            # IMA occasionally omits/varies parent_folder_id filtering metadata even
+            # when the returned rel_path clearly belongs to the configured folder.
+            # Retry without server-side folder filtering, then keep only hits whose
+            # normalized rel_path is under the target folder.
+            loose_spec = dict(spec)
+            folder_id = str(loose_spec.pop("folder_id") or "")
+            loose_hits = _retrieve_ima_kb_once(q, loose_spec, max(1, limit - len(out)))
+            prefix = folder_id.rstrip("/") + "/"
+            batch = [h for h in loose_hits if str(h.rel_path).startswith(prefix)]
+        for h in batch:
+            key = (h.kb_id, h.rel_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(h)
+            if len(out) >= limit:
+                return out
     return out
 
 

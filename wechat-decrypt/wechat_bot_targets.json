@@ -31,6 +31,7 @@
       "last_send_failed_local_id": 26,
       "last_send_failed_at": "2026-04-28 10:07:09",
       "knowledge_bases": [
+        "scene.chongqing_mobile_work",
         "online.ima.chongqing_mobile_work"
       ]
     }
