@@ -4,7 +4,6 @@
 *keys*.json
 all_keys.json
 config.json
-wechat_bot_targets.json
 targets.json
 extracted_candidate_keys.txt
 hook_verified_all_keys*.json

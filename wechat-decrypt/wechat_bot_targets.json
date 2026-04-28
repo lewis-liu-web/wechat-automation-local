@@ -1,0 +1,59 @@
+{
+  "poll_interval": 3,
+  "default_triggers": [
+    "@飞扬的跟屁虫",
+    "@飞扬"
+  ],
+  "default_reply_template": "",
+  "targets": [
+    {
+      "name": "bot群聊测试",
+      "username": "47965620946@chatroom",
+      "db": "message_0.db",
+      "table": "Msg_470b0d2a7fa20f5d3acc08ffc9fcab01",
+      "last_local_id": 65,
+      "enabled": true,
+      "triggers": [],
+      "reply_template": "",
+      "wiki_dir": "wiki/groups/bot群聊测试",
+      "last_send_failed_local_id": 60,
+      "last_send_failed_at": "2026-04-28 13:22:02"
+    },
+    {
+      "name": "重生之我在重庆移动当牛做马",
+      "username": "45915981826@chatroom",
+      "db": "message_0.db",
+      "table": "Msg_07c67c763d4805460accbaeb5c316f62",
+      "last_local_id": 46,
+      "enabled": true,
+      "triggers": [],
+      "reply_template": "",
+      "wiki_dir": "wiki/groups/重生之我在重庆移动当牛做马",
+      "last_send_failed_local_id": 26,
+      "last_send_failed_at": "2026-04-28 10:07:09"
+    }
+  ],
+  "wiki_dir": "wiki",
+  "reply_engine": {
+    "provider": "genericagent_subagent",
+    "use_subagent": true,
+    "llm_no": 3,
+    "llm_name": "my-oai-proxy",
+    "code_root": "D:\\Program Files\\GenericAgent-main",
+    "llm_timeout": 120,
+    "subagent_task_prefix": "wechat_reply"
+  },
+  "group_wiki_dirs": {
+    "bot群聊测试": "wiki/groups/bot群聊测试",
+    "47965620946@chatroom": "wiki/groups/bot群聊测试",
+    "重生之我在重庆移动当牛做马": "wiki/groups/重生之我在重庆移动当牛做马",
+    "45915981826@chatroom": "wiki/groups/重生之我在重庆移动当牛做马"
+  },
+  "context_limit": 12,
+  "send_mode": "foreground",
+  "stop_file": "wechat_bot_monitor.stop",
+  "send_confirm_timeout": 0.8,
+  "advance_on_send_failure": true,
+  "send_strategy": "current_or_pyweixin_uia_then_ocr_search_physical",
+  "uia_probe_enabled": true
+}
