@@ -289,20 +289,30 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
     if data is None and isinstance(payload, dict):
         data = payload
     items = (data or {}).get("info_list") or []
+    folder_id = str(spec.get("folder_id") or "")
     out: List[KnowledgeHit] = []
-    for idx, item in enumerate(items[:limit]):
+    for idx, item in enumerate(items):
         if not isinstance(item, dict):
+            continue
+        media_type = item.get("media_type")
+        media_id = str(item.get("media_id") or "")
+        parent = str(item.get("parent_folder_id") or "")
+        # IMA returns folders (media_type=99, media_id starts with folder_) in search results.
+        # For a target bound to one IMA folder, only use files directly under that folder.
+        if media_type == 99 or media_id.startswith("folder_"):
+            continue
+        if folder_id and parent != folder_id:
             continue
         title = str(item.get("title") or "")
         highlight = str(item.get("highlight_content") or "")
-        media_id = str(item.get("media_id") or "")
-        parent = str(item.get("parent_folder_id") or "")
         content = "\n".join(x for x in [title, highlight] if x).strip()
         rel = media_id or title or f"search_result_{idx + 1}"
         if parent:
             rel = f"{parent}/{rel}"
         if content:
-            out.append(KnowledgeHit("ima", str(kb_id), str(spec.get("scope") or "online"), rel, content[:1200], max(1, limit - idx)))
+            out.append(KnowledgeHit("ima", str(kb_id), str(spec.get("scope") or "online"), rel, content[:1200], max(1, limit - len(out))))
+        if len(out) >= limit:
+            break
     return out
 
 

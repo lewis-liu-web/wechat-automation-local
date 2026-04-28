@@ -59,7 +59,9 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         payload = {
             'data': {
                 'info_list': [
-                    {'title': 'IMA标题', 'highlight_content': 'IMA命中内容', 'media_id': 'm1', 'parent_folder_id': 'f1'}
+                    {'title': 'IMA标题', 'highlight_content': 'IMA命中内容', 'media_id': 'm1', 'parent_folder_id': 'f1'},
+                    {'title': '其他目录', 'highlight_content': '不应命中', 'media_id': 'm2', 'parent_folder_id': 'other'},
+                    {'title': '目录本身', 'highlight_content': '不应作为资料', 'media_id': 'folder_1', 'parent_folder_id': 'f1', 'media_type': 99},
                 ]
             }
         }
@@ -75,7 +77,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
             captured['timeout'] = timeout
             return FakeResp()
         cfg={'wiki_dir': str(root), 'knowledge_bases': {'online.ima.x': {
-            'type':'ima', 'knowledge_base_id':'kb123', 'client_id_env':'TEST_IMA_CLIENT', 'api_key_env':'TEST_IMA_KEY', 'timeout':3
+            'type':'ima', 'knowledge_base_id':'kb123', 'folder_id':'f1', 'client_id_env':'TEST_IMA_CLIENT', 'api_key_env':'TEST_IMA_KEY', 'timeout':3
         }}}
         with mock.patch.dict(os.environ, {'TEST_IMA_CLIENT':'cid', 'TEST_IMA_KEY':'akey'}), \
              mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
@@ -88,7 +90,9 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.assertEqual(captured['headers'].get('Ima-openapi-apikey'), 'akey')
         self.assertEqual(captured['timeout'], 3)
         self.assertIn('IMA命中内容', ima_hits[0].content)
+        self.assertNotIn('不应命中', ima_hits[0].content)
         self.assertEqual(ima_hits[0].kb_id, 'kb123')
+        self.assertIn('f1/m1', ima_hits[0].label)
 
     def test_generate_reply_reports_hits(self):
         td, root = self.make_wiki()

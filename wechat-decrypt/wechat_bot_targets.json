@@ -31,7 +31,7 @@
       "last_send_failed_local_id": 26,
       "last_send_failed_at": "2026-04-28 10:07:09",
       "knowledge_bases": [
-        "scene.chongqing_mobile_work"
+        "online.ima.chongqing_mobile_work"
       ]
     }
   ],
@@ -70,6 +70,17 @@
       "enabled": false,
       "api_key_env": "IMA_API_KEY",
       "description": "IMA线上知识库占位，启用前需配置官方API参数"
+    },
+    "online.ima.chongqing_mobile_work": {
+      "type": "ima",
+      "enabled": true,
+      "knowledge_base_id": "qtKs5bRxJr26owssZDa9cZLg3TKg-pe8er026YZj-sY=",
+      "folder_id": "folder_7454825390304070",
+      "client_id_env": "IMA_CLIENT_ID",
+      "api_key_env": "IMA_API_KEY",
+      "scope": "scene",
+      "limit": 5,
+      "description": "工作资料/中移互产品资料（重生之我在重庆移动当牛做马群专用）"
     }
   }
 }
