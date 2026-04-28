@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from reply_engine import DEFAULT_TRIGGERS, generate_reply
+from wechat_sender import send_reply_detailed
 
 ROOT = Path(__file__).resolve().parent
 MEMORY = (ROOT.parent.parent / 'memory').resolve()
@@ -57,6 +58,8 @@ def load_config(path=CONFIG_PATH):
     cfg.setdefault('reply_engine', {})
     cfg.setdefault('context_limit', 12)
     cfg.setdefault('send_mode', 'backend_only')
+    cfg.setdefault('send_strategy', 'current_or_uia_then_ocr_search_physical')
+    cfg.setdefault('uia_probe_enabled', True)
     cfg.setdefault('stop_file', str(STOP_FILE))
     cfg.setdefault('targets', [])
     for t in cfg['targets']:
@@ -201,16 +204,29 @@ def has_self_sent_after(t, after_local_id, text_hint=None):
 
 def wait_sent_confirmation(t, before_local_id, text, config_path=CONFIG_PATH, timeout=5.0):
     """Refresh decrypted DB briefly and confirm a new self-sent row exists."""
-    deadline = time.time() + max(0.5, float(timeout or 5.0))
+    t0 = time.time()
+    deadline = t0 + max(0.5, float(timeout or 5.0))
+    attempts = 0
+    refresh_total = 0.0
+    lookup_total = 0.0
+    last_summary = ''
     while time.time() < deadline:
-        run_fast_refresh(config_path)
+        attempts += 1
+        refresh_t0 = time.time()
+        rc, refresh_dt, changed, failed, summary = run_fast_refresh(config_path)
+        refresh_total += time.time() - refresh_t0
+        last_summary = summary
+        lookup_t0 = time.time()
         sent = has_self_sent_after(t, before_local_id, text)
+        lookup_total += time.time() - lookup_t0
         if sent:
-            log('send DB-confirmed target=%s before=%s sent_local_id=%s content=%r' % (
-                t.get('name'), before_local_id, sent.get('local_id'), sent.get('message_content')))
+            log('send DB-confirmed target=%s before=%s sent_local_id=%s elapsed=%.3fs attempts=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=rc%s/changed%s/failed%s/%s content=%r' % (
+                t.get('name'), before_local_id, sent.get('local_id'), time.time() - t0, attempts, refresh_total, lookup_total,
+                rc, changed, failed, last_summary, sent.get('message_content')))
             return True
         time.sleep(0.5)
-    log('send NOT DB-confirmed target=%s before=%s timeout=%.1fs' % (t.get('name'), before_local_id, float(timeout or 5.0)))
+    log('send NOT DB-confirmed target=%s before=%s timeout=%.1fs elapsed=%.3fs attempts=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=%s' % (
+        t.get('name'), before_local_id, float(timeout or 5.0), time.time() - t0, attempts, refresh_total, lookup_total, last_summary))
     return False
 
 
@@ -267,266 +283,22 @@ def reply_text(cfg, target):
     return target.get('reply_template') or cfg.get('default_reply_template') or ''
 
 
-def find_wechat_hwnd():
-    import win32gui
-    try:
-        if win32gui.IsWindow(WECHAT_HWND_HINT) and win32gui.GetWindowText(WECHAT_HWND_HINT) == '微信':
-            return WECHAT_HWND_HINT
-    except Exception:
-        pass
-    found = []
-    def cb(hwnd, extra):
-        if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd) == '微信':
-            found.append(hwnd)
-    win32gui.EnumWindows(cb, None)
-    if not found:
-        raise RuntimeError('微信窗口未找到')
-    return found[0]
-
-
-def _find_descendant_windows(hwnd):
-    import win32gui
-    out = []
-    def cb(child, extra):
-        try:
-            out.append((child, win32gui.GetClassName(child), win32gui.GetWindowText(child)))
-        except Exception:
-            pass
-    try:
-        win32gui.EnumChildWindows(hwnd, cb, None)
-    except Exception:
-        pass
-    return out
-
-
-def _post_ctrl_combo(hwnd, vk):
-    import win32gui, win32con
-    win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_CONTROL, 0x001D0001)
-    win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk, 0)
-    win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk, 0)
-    win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_CONTROL, 0xC01D0001)
-
-
-def _post_left_click(hwnd, x, y):
-    import win32gui, win32con
-    lp = (int(y) << 16) | (int(x) & 0xffff)
-    win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lp)
-    win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lp)
-    win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lp)
-
-
-def _post_enter(hwnd):
-    import win32gui, win32con
-    # Qt builds differ: try keydown/up with scan code and WM_CHAR CR/LF.
-    win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0x001C0001)
-    win32gui.PostMessage(hwnd, win32con.WM_CHAR, 0x0D, 0x001C0001)
-    win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0xC01C0001)
-
-
-def send_reply_backend(text):
-    """Paste/send without bringing WeChat to foreground.
-
-    Qt WeChat may ignore pure background keyboard messages on some builds.  This
-    function is intentionally best-effort and *does not* fall back to foreground
-    unless the caller explicitly chooses a foreground-capable send_mode.
-    """
-    import win32gui, win32con
-    import pyperclip
-    hwnd = find_wechat_hwnd()
-    pyperclip.copy(text)
-    client = win32gui.GetClientRect(hwnd)
-    input_x = int(client[2] * 0.72)
-    input_y = int(client[3] * 0.91)
-    send_x = int(client[2] * 0.94)
-    send_y = int(client[3] * 0.91)
-    fg = win32gui.GetForegroundWindow()
-    children = _find_descendant_windows(hwnd)
-    log('backend send try hwnd=%s fg=%s client=%s input=(%s,%s) send=(%s,%s) children=%d' % (
-        hwnd, fg, client, input_x, input_y, send_x, send_y, len(children)))
-
-    targets = [hwnd] + [c[0] for c in children]
-    # Click input area, paste, then try both Enter and clicking the Send button.
-    # This is best-effort only: recent Qt WeChat often rejects background input.
-    for target in targets[:16]:
-        try:
-            _post_left_click(target, input_x, input_y)
-        except Exception:
-            pass
-    time.sleep(0.08)
-    for target in targets[:16]:
-        try:
-            _post_ctrl_combo(target, ord('A'))
-            win32gui.PostMessage(target, win32con.WM_PASTE, 0, 0)
-        except Exception:
-            pass
-    time.sleep(0.12)
-    for target in targets[:16]:
-        try:
-            _post_enter(target)
-        except Exception:
-            pass
-    time.sleep(0.08)
-    for target in targets[:16]:
-        try:
-            _post_left_click(target, send_x, send_y)
-        except Exception:
-            pass
-    time.sleep(0.05)
-    preserved = (win32gui.GetForegroundWindow() == fg)
-    log('backend send attempted; foreground_preserved=%s (not DB-confirmed)' % preserved)
-    return preserved
-
-
-def _target_name_matches_ocr(target_name, ocr_text):
-    """Fuzzy match target chat title against OCR text from the conversation list."""
-    if not target_name or not ocr_text:
-        return False
-    def norm(s):
-        return ''.join(ch for ch in str(s) if not ch.isspace() and ch not in '.…·-_:：[]【】()（）')
-    a = norm(target_name)
-    b = norm(ocr_text)
-    if not a or not b:
-        return False
-    if a in b or b in a:
-        return True
-    # OCR/list often truncates long group names, e.g. "重生之我在重庆..".
-    return len(a) >= 6 and a[:6] in b
-
-
-def _open_chat_from_visible_list(hwnd, target_name, ljqCtrl):
-    """Open target chat by OCR-ing the visible conversation list; return True on hit."""
-    if not target_name:
-        return False
-    t0 = time.time()
-    try:
-        from PIL import ImageGrab
-        if str(MEMORY) not in sys.path:
-            sys.path.insert(0, str(MEMORY))
-        import ocr_utils
-        import win32gui
-        client = win32gui.GetClientRect(hwnd)
-        c0 = win32gui.ClientToScreen(hwnd, (0, 0))
-        # Left conversation list only: avoid full-screen screenshots per SOP.
-        x1 = c0[0] + 40
-        y1 = c0[1] + 70
-        x2 = c0[0] + min(360, max(260, int(client[2] * 0.34)))
-        y2 = c0[1] + min(client[3] - 20, 620)
-        img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-        res = ocr_utils.ocr_image(img, enhance=False, engine='rapid')
-        for d in res.get('details', []) or []:
-            txt = d.get('text') or ''
-            if _target_name_matches_ocr(target_name, txt):
-                box = d.get('bbox') or []
-                if len(box) >= 4:
-                    cy = sum(float(p[1]) for p in box[:4]) / 4.0
-                else:
-                    cy = 0
-                # Click row center, not the exact glyph; conversation rows are ~74px high.
-                click_x = c0[0] + 170
-                click_y = int(y1 + cy)
-                log('UI list-ocr hit target=%r text=%r click_xy=(%s,%s) dt=%.3fs' % (
-                    target_name, txt, click_x, click_y, time.time() - t0))
-                ljqCtrl.Click(click_x, click_y)
-                time.sleep(0.20)
-                return True
-        log('UI list-ocr miss target=%r text=%r dt=%.3fs' % (target_name, res.get('text', '')[:120], time.time() - t0))
-    except Exception as e:
-        log('UI list-ocr failed target=%r err=%r dt=%.3fs' % (target_name, e, time.time() - t0))
-    return False
-
-
-def send_reply_foreground(text, target=None):
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
-    sys.path.insert(0, str(MEMORY))
-    import win32gui, win32con
-    import pyperclip
-    import ljqCtrl
-    hwnd = find_wechat_hwnd()
-    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    time.sleep(0.15)
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-    except Exception as e:
-        log('SetForegroundWindow warn: %r' % (e,))
-    time.sleep(0.25)
-
-    client = win32gui.GetClientRect(hwnd)
-    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
-
-    # Multi-target bot: never assume the desired chat is the first item in the
-    # session list.  Open the target chat explicitly through WeChat search.
-    # Coordinates are client-relative physical pixels because this process is
-    # DPI-aware and ljqCtrl expects physical coords in this environment.
-    target_name = (target or {}).get('name') or (target or {}).get('username') or ''
-    if target_name:
-        opened = _open_chat_from_visible_list(hwnd, target_name, ljqCtrl)
-        if not opened:
-            search_x = c0[0] + 150
-            search_y = c0[1] + 38
-            first_result_x = c0[0] + 170
-            first_result_y = c0[1] + 115
-            log('UI search fallback target=%r hwnd=%s search_xy=(%s,%s) result_xy=(%s,%s) client=%s dpi=%s' % (
-                target_name, hwnd, search_x, search_y, first_result_x, first_result_y, client, getattr(ljqCtrl, 'dpi_scale', None)))
-            ljqCtrl.Click(search_x, search_y)
-            time.sleep(0.10)
-            ljqCtrl.Press('ctrl+a')
-            time.sleep(0.03)
-            pyperclip.copy(target_name)
-            ljqCtrl.Press('ctrl+v')
-            time.sleep(0.45)
-            ljqCtrl.Click(first_result_x, first_result_y)
-            time.sleep(0.35)
-    else:
-        log('UI target missing; fallback to currently selected chat')
-
-    client = win32gui.GetClientRect(hwnd)
-    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
-    x = c0[0] + int(client[2] * 0.72)
-    y = c0[1] + int(client[3] * 0.88)
-    send_x = c0[0] + int(client[2] * 0.92)
-    send_y = c0[1] + int(client[3] * 0.94)
-    log('UI click input hwnd=%s target=%r c0=%s client=%s input_xy=(%s,%s) send_xy=(%s,%s) dpi=%s' % (hwnd, target_name, c0, client, x, y, send_x, send_y, getattr(ljqCtrl, 'dpi_scale', None)))
-    ljqCtrl.Click(x, y)
-    time.sleep(0.15)
-    ljqCtrl.Press('ctrl+a')
-    time.sleep(0.05)
-    pyperclip.copy(text)
-    ljqCtrl.Press('ctrl+v')
-    time.sleep(0.25)
-    ljqCtrl.Press('enter')
-    time.sleep(0.25)
-    ljqCtrl.Click(send_x, send_y)
-    return True
-
 
 def send_reply(text, mode=None, target=None, before_local_id=None, cfg=None, config_path=CONFIG_PATH):
-    mode = (mode or 'backend_only').lower()
-    confirm_timeout = float((cfg or {}).get('send_confirm_timeout') or 5.0)
-
-    def confirmed_or(value):
-        if target is None or before_local_id is None:
-            return bool(value)
-        return wait_sent_confirmation(target, before_local_id, text, config_path=config_path, timeout=confirm_timeout)
-
-    if mode in ('backend', 'backend_only', 'background'):
-        attempted = send_reply_backend(text)
-        return confirmed_or(attempted)
-    if mode in ('foreground', 'front'):
-        attempted = send_reply_foreground(text, target=target)
-        return confirmed_or(attempted)
-    if mode in ('backend_then_foreground', 'background_then_foreground'):
-        try:
-            if send_reply_backend(text) and confirmed_or(True):
-                return True
-            log('backend send not confirmed, fallback foreground')
-        except Exception as e:
-            log('backend send failed, fallback foreground: %r' % (e,))
-        attempted = send_reply_foreground(text, target=target)
-        return confirmed_or(attempted)
-    raise ValueError('unknown send_mode: %s' % mode)
+    """Compatibility wrapper around wechat_sender with DB confirmation."""
+    result = send_reply_detailed(
+        text,
+        mode=mode,
+        target=target,
+        before_local_id=before_local_id,
+        cfg=cfg,
+        confirm=lambda t, lid, body, timeout: wait_sent_confirmation(
+            t, lid, body, config_path=config_path, timeout=timeout),
+        log=log,
+    )
+    log('send result ok=%s mode=%s reason=%s confirmed=%s attempted=%s detail_keys=%s' % (
+        result.ok, result.mode, result.reason, result.confirmed, ','.join(result.attempted), ','.join(sorted(result.detail.keys()))))
+    return bool(result)
 
 
 def enabled_targets(cfg):
@@ -629,15 +401,17 @@ def main():
                 if is_trigger(cfg, t, m):
                     hit_count += 1
                     context_limit = int(cfg.get('context_limit') or 12)
+                    context_t0 = time.time()
                     ctx = fetch_context_for_target(t, upto_local_id=lid, limit=context_limit)
+                    context_dt = time.time() - context_t0
                     if ctx:
                         m['context_messages'] = ctx
                     gen_t0 = time.time()
                     decision = generate_reply(m, t, cfg)
                     gen_dt = time.time() - gen_t0
                     text = decision.reply_text
-                    log('trigger hit target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
-                        t.get('name'), lid, len(ctx), gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
+                    log('trigger hit target=%s local_id=%s ctx=%d ctx=%.3fs gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
+                        t.get('name'), lid, len(ctx), context_dt, gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
                     if not decision.should_reply or not text:
                         log('decision: skip send')
                     elif args.dry_run:
