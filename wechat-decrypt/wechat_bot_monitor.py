@@ -344,10 +344,13 @@ def main():
         rc, dt, changed, failed, summary = run_fast_refresh(config_path, force=args.fast_refresh_force_start)
         log('initial fast-refresh rc=%s dt=%.3fs changed=%s failed=%s %s' % (rc, dt, changed, failed, summary))
 
+    runtime_min_last_local_id = {}
     for t in targets:
         latest = fetch_latest_for_target(t)
         if int(t.get('last_local_id') or 0) <= 0 and latest:
             t['last_local_id'] = int(latest.get('local_id') or 0)
+        target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
+        runtime_min_last_local_id[target_key] = int(t.get('last_local_id') or 0)
         log('baseline target=%s db=%s table=%s last_local_id=%s latest=%s' % (
             t.get('name'), t.get('db'), t.get('table'), t.get('last_local_id'), json.dumps(latest, ensure_ascii=False)))
     if not args.no_save_state:
@@ -390,6 +393,16 @@ def main():
         # Reload config each cycle so adding/removing groups does not require restart.
         cfg = load_config(config_path)
         targets = enabled_targets(cfg)
+        for t in targets:
+            target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
+            file_last_id = int(t.get('last_local_id') or 0)
+            runtime_last_id = int(runtime_min_last_local_id.get(target_key, 0) or 0)
+            if file_last_id < runtime_last_id:
+                log('warn config cursor regressed target=%s file_last_local_id=%s runtime_last_local_id=%s; using runtime value to avoid replay' % (
+                    t.get('name'), file_last_id, runtime_last_id))
+                t['last_local_id'] = runtime_last_id
+            else:
+                runtime_min_last_local_id[target_key] = file_last_id
         new_count = 0
         hit_count = 0
         for db_name, db_targets in group_targets_by_db(targets).items():

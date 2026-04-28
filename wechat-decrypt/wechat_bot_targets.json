@@ -11,7 +11,7 @@
       "username": "47965620946@chatroom",
       "db": "message_0.db",
       "table": "Msg_470b0d2a7fa20f5d3acc08ffc9fcab01",
-      "last_local_id": 69,
+      "last_local_id": 89,
       "enabled": true,
       "triggers": [],
       "reply_template": "",
@@ -24,12 +24,10 @@
       "username": "45915981826@chatroom",
       "db": "message_0.db",
       "table": "Msg_07c67c763d4805460accbaeb5c316f62",
-      "last_local_id": 54,
+      "last_local_id": 82,
       "enabled": true,
       "triggers": [],
       "reply_template": "",
-      "last_send_failed_local_id": 26,
-      "last_send_failed_at": "2026-04-28 10:07:09",
       "knowledge_bases": [
         "scene.chongqing_mobile_work",
         "online.ima.chongqing_mobile_work"
