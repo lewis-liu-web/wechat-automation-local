@@ -1,0 +1,3 @@
+backup_dir=D:\Program Files\GenericAgent-main\temp\plan_wechat_raw_incremental\backups\20260427_142546
+monitor_lines=
+target_dbs=["message_0.db"]

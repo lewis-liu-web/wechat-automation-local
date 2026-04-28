@@ -1,0 +1,11 @@
+# Keep source files with LF in repository
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+*.bat text eol=crlf

@@ -1,0 +1,78 @@
+{
+  "name": "wechat_dbkey_hook_delivery",
+  "generated_at": "2026-04-27T00:09:31.496522+00:00",
+  "status": "backend_pipeline_checked",
+  "notes": [
+    "Python adapter/validator backend chain passed local sample check.",
+    "C++ hook files are integration skeletons; fill project-specific signatures and hook framework before building.",
+    "Sample keys are random and expected to match zero real DB salts."
+  ],
+  "files": [
+    {
+      "path": "DELIVERY_WECHAT_DBKEY_HOOK.md",
+      "exists": true,
+      "size": 5405,
+      "sha256": "46e3a89a4afb9ecc5aab07793d96e9969d908e97263c0b4337de121f7d89ff1b"
+    },
+    {
+      "path": "wechat_hook_protocol.md",
+      "exists": true,
+      "size": 2077,
+      "sha256": "e6a3dc5a67585991b2ac8286ed0bebe1b5a7b7aab70cf575a4bdb3e2271dbec5"
+    },
+    {
+      "path": "run_wechat_hook_pipeline_check.py",
+      "exists": true,
+      "size": 4356,
+      "sha256": "dbf9f280b6be84d4043d66905c5539e875825126d939d228b2aae81ae4c61aad"
+    },
+    {
+      "path": "wechat_hook_output_adapter.py",
+      "exists": true,
+      "size": 2706,
+      "sha256": "f958f5faf440a88f574c41aeb73c9f2db65589f10b543db266add91c858da5d4"
+    },
+    {
+      "path": "wechat_key_candidate_validator.py",
+      "exists": true,
+      "size": 3910,
+      "sha256": "65d6ff8431f84bdb35a7ae7880b48fddd7b7cd01bb86088e46635157a00f49ad"
+    },
+    {
+      "path": "wechat_hook_capture_sample.jsonl",
+      "exists": true,
+      "size": 642,
+      "sha256": "40e6b0da4b67b537b0906559b2d02a4195e42e567c07e9368fa3ad89ae256437"
+    },
+    {
+      "path": "extracted_candidate_keys.txt",
+      "exists": true,
+      "size": 198,
+      "sha256": "e14bebc17d9f75fe38162afb2a9a1f5d8dcb149d991d91386fbe182f3af67510"
+    },
+    {
+      "path": "hook_verified_all_keys.json",
+      "exists": true,
+      "size": 207,
+      "sha256": "873d4e6c4cae9d4d1d64600645e3c5ec5ac1995fedf96ad3570285c3e55e4ed4"
+    },
+    {
+      "path": "hook_verified_all_keys.check.json",
+      "exists": true,
+      "size": 207,
+      "sha256": "873d4e6c4cae9d4d1d64600645e3c5ec5ac1995fedf96ad3570285c3e55e4ed4"
+    },
+    {
+      "path": "wechat_dbkey_hook_skeleton.cpp",
+      "exists": true,
+      "size": 3809,
+      "sha256": "38ec82cc6b8636ec43b84389c501a24f9ec169e38a3ddf8270a70269caaf94fb"
+    },
+    {
+      "path": "wechat_dbkey_hook_install_skeleton.cpp",
+      "exists": true,
+      "size": 6063,
+      "sha256": "27a3fcdb1a62054b1a38447641cfb01f19e2ec3452a0f50a19314afb14676726"
+    }
+  ]
+}

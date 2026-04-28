@@ -1,0 +1,15 @@
+任务：只读探测 wechat-decrypt 项目，评估“原始微信库增量同步/解密”可行性，并把结论写入 D:\Program Files\GenericAgent-main\temp\plan_wechat_raw_incremental\exploration_findings.md
+
+约束：
+- 只读探测，禁止修改任何项目文件，禁止启动/停止微信，禁止发送消息。
+- 禁止读取/打印任何密钥文件内容（例如 all_keys.json、keys、secret、token 等）；只可记录文件是否存在、大小、路径。
+- 控制在 10 次工具调用内。
+- 输出必须包含：## 环境现状 / ## 关键发现 / ## 风险/不确定点 / ## 建议实现路径。
+
+重点探测：
+1. temp/wechat-decrypt 的文件结构、入口脚本、config.py 如何定义 DB_DIR/OUT_DIR/KEYS_FILE。
+2. decrypt_db.py 是否支持只解密单个 message_N.db；若不支持，需要怎么最小改造。
+3. find_all_keys_windows.py 是否每次都必须跑，还是现有keys可复用；只读代码，不读密钥内容。
+4. 原始 message_0.db 路径、大小、mtime、wal/shm情况；只记录元信息。
+5. 单库目标刷新相比全库解密的理论性能收益；是否能做到目标库级准实时。
+6. 行级/页级真正增量的可行性和主要难点。

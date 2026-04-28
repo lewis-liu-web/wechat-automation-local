@@ -1,0 +1,13 @@
+{
+  "task": "只读调研微信Windows native bridge/Hook静默发送可落地方案，比较wxhelper/WeChatFerry/可用项目，输出安全性、兼容版本、集成路径；禁止修改文件之外的副作用，禁止注入/运行Hook。",
+  "work_dir": "D:\\Program Files\\GenericAgent-main\\temp\\plan_wechat_native_bridge",
+  "output_files": {
+    "findings": "D:\\Program Files\\GenericAgent-main\\temp\\plan_wechat_native_bridge\\exploration_findings.md"
+  },
+  "constraints": [
+    "只读调研",
+    "不要读取密钥",
+    "不要执行注入或hook",
+    "重点是安全可靠落地路径"
+  ]
+}

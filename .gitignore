@@ -1,0 +1,85 @@
+# Secrets, keys, configs, decrypted/private data
+*.key
+*key*.txt
+*keys*.json
+all_keys.json
+config.json
+wechat_bot_targets.json
+targets.json
+extracted_candidate_keys.txt
+hook_verified_all_keys*.json
+wechat-decrypt/decrypted/
+wechat-decrypt/decrypted_test_single/
+wechat-decrypt/decoded_images/
+wechat-decrypt/decoded_voices/
+*.db
+*.db-shm
+*.db-wal
+*.db.tmp_monitor
+*_export*.json
+*_transcribed*.json
+voice_transcriptions.json
+
+# Logs and runtime state
+*.log
+*.stdout.log
+*.stderr.log
+*.done
+*.ret.txt
+*.stop
+fast_refresh_state.json
+wechat-decrypt/.fast_refresh_tmp/
+
+# Screenshots and private media/runtime OCR captures
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+wechat_visible*.json
+model_responses/
+feishu_media/
+wechat_reply_*/
+wechat_reply_probe/
+
+# Build/package/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.zip
+*.7z
+*.rar
+*.exe
+*.dll
+*.so
+*.dylib
+find_all_keys_macos
+
+# Local temp/probe folders
+repo_probe/
+_sandbox/
+tmp/
+update_backup_*/
+remote_update/
+pywechat_probe/
+plan_*/backups/
+
+# Private bot knowledge and chat-derived samples
+wechat-decrypt/wiki/groups/
+wechat-decrypt/wiki/local/
+wechat-decrypt/wiki/重生*/
+*.jsonl
+
+# Local generated backups / scratch scripts
+*.bak
+*.bak_*
+*.backup
+*.orig
+tmp*.ai.py
+*.tmp
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
