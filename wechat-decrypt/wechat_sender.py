@@ -18,6 +18,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 MEMORY = (ROOT.parent.parent / 'memory').resolve()
+PYWECHAT_SRC = (ROOT.parent / 'pywechat_src').resolve()
 WECHAT_HWND_HINT = 67810
 
 LogFn = Callable[[str], None]
@@ -248,11 +249,84 @@ def _uia_collect_state(hwnd, target: Optional[dict] = None, limit: int = 500) ->
             'reason': 'uia_available',
             'hwnd': hwnd,
             'window_title': win32gui.GetWindowText(hwnd),
+            'window_class': win32gui.GetClassName(hwnd),
+            'children': len(find_descendant_windows(hwnd)),
             'controls': len(controls),
             'text_sample': texts[:30],
             'target_matched': matched,
         },
     }
+
+
+def _uia_is_effectively_available(hwnd, log: Optional[LogFn] = None) -> bool:
+    """Return False for Qt/Chromium WeChat builds that expose no useful UIA tree.
+
+    pywechat's UIA/pywinauto path needs visible Search/Edit/ListItem controls.  On
+    the local WeChat 4 Qt shell, UIA only exposes Window + a tiny Pane, while Win32
+    children are just Chrome_WidgetWin_0 / Intermediate D3D.  Trying UIA in that
+    state only adds failed probes before OCR/coordinate fallback.
+    """
+    try:
+        import win32gui
+        data = _uia_collect_state(hwnd, target=None, limit=80)
+        controls = data.get('controls') or []
+        texts = data.get('texts') or []
+        cls = win32gui.GetClassName(hwnd)
+        child_classes = [c[1] for c in find_descendant_windows(hwnd)]
+        has_useful_text = any(t and t not in ('微信', 'Weixin') and not t.endswith(' WindowControl') and not t.endswith(' PaneControl') for t in texts)
+        has_edit = any(_is_edit_control(c) for c in controls)
+        available = bool(has_edit or has_useful_text or len(controls) >= 8)
+        if not available:
+            _log(log, 'UIA disabled: no effective tree class=%r controls=%d texts=%r child_classes=%r' % (
+                cls, len(controls), texts[:8], child_classes[:8]))
+        else:
+            _log(log, 'UIA enabled: class=%r controls=%d texts=%r has_edit=%s' % (
+                cls, len(controls), texts[:8], has_edit))
+        return available
+    except Exception as e:
+        _log(log, 'UIA availability probe failed err=%r; disable UIA for this send' % (e,))
+        return False
+
+
+def _pyweixin_send_to_friend(target: Optional[dict], text: str, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
+    """Send via the verified pyweixin UIA path when WeChat exposes its cached UIA tree.
+
+    This path was validated on WeChat 4.x after Narrator/accessibility warm-up: the
+    Narrator process can be closed and the same WeChat process still keeps the UIA
+    tree usable.  It should be tried before coordinate/physical fallbacks, but it
+    intentionally does not start Narrator or restart WeChat.
+    """
+    aliases = target_aliases(target)
+    target_name = aliases[0] if aliases else ''
+    if not target_name:
+        _log(log, 'pyweixin send skipped: missing target_name')
+        return False
+    t0 = time.time()
+    try:
+        if str(PYWECHAT_SRC) not in sys.path:
+            sys.path.insert(0, str(PYWECHAT_SRC))
+        from pyweixin.WeChatAuto import Messages
+        clear = bool((cfg or {}).get('pyweixin_clear', True))
+        search_pages = int((cfg or {}).get('pyweixin_search_pages', 5))
+        send_delay = float((cfg or {}).get('pyweixin_send_delay', 0.2))
+        close_weixin = bool((cfg or {}).get('pyweixin_close_weixin', False))
+        is_maximize = bool((cfg or {}).get('pyweixin_is_maximize', False))
+        _log(log, 'pyweixin send start target=%r pages=%s clear=%s' % (target_name, search_pages, clear))
+        Messages.send_messages_to_friend(
+            target_name,
+            [text],
+            search_pages=search_pages,
+            clear=clear,
+            send_delay=send_delay,
+            is_maximize=is_maximize,
+            close_weixin=close_weixin,
+        )
+        _log(log, 'pyweixin send returned target=%r dt=%.3fs' % (target_name, time.time() - t0))
+        return True
+    except Exception as e:
+        _log(log, 'pyweixin send failed target=%r err=%r dt=%.3fs' % (target_name, e, time.time() - t0))
+        return False
+
 
 
 def probe_uia_state(target: Optional[dict] = None, log: Optional[LogFn] = None) -> Dict[str, object]:
@@ -626,22 +700,41 @@ def send_reply_foreground(text: str, target: Optional[dict] = None, cfg: Optiona
     target_name = aliases[0] if aliases else ''
     if cfg is None:
         cfg = {}
-    strategy = str(cfg.get('send_strategy') or 'current_or_uia_then_ocr_search_physical')
-    _log(log, 'send_strategy=%r target_name=%r hwnd=%s' % (strategy, target_name, hwnd))
+    strategy = str(cfg.get('send_strategy') or 'current_or_pyweixin_uia_then_ocr_search_physical')
+    prefer_pyweixin = ('pyweixin' in strategy) or bool(cfg.get('pyweixin_first'))
+    uia_enabled = ('uia' in strategy) and _uia_is_effectively_available(hwnd, log=log)
+    result.detail['uia_effectively_available'] = uia_enabled
+    result.detail['pyweixin_first'] = prefer_pyweixin
+    _log(log, 'send_strategy=%r target_name=%r hwnd=%s uia_enabled=%s pyweixin_first=%s' % (strategy, target_name, hwnd, uia_enabled, prefer_pyweixin))
 
-    # --- 1. Ensure target chat is open (UIA-first) ---
+    # --- 0. Prefer verified pyweixin UIA send path when requested. ---
+    if target_name and prefer_pyweixin:
+        result.attempted.append('pyweixin_uia_send')
+        pyweixin_sent = _pyweixin_send_to_friend(target, text, cfg=cfg, log=log)
+        result.detail['pyweixin_send'] = pyweixin_sent
+        if pyweixin_sent:
+            result.ok = True
+            result.reason = 'pyweixin_uia_sent'
+            _log(log, 'send_reply_foreground result=%s reason=%s attempted=%s detail=%s' % (
+                result.ok, result.reason, result.attempted, {k:v for k,v in result.detail.items() if not callable(v)}))
+            return result
+
+    # --- 1. Ensure target chat is open (UIA when effective, otherwise OCR/coordinate fallback) ---
     current_verified = False
-    if target_name:
+    if target_name and uia_enabled:
         current_verified = _uia_current_chat_matches(target, log=log)
         result.attempted.append('uia_current_check')
         result.detail['uia_current_matched'] = current_verified
         if current_verified:
             _log(log, 'UIA current chat matches target=%r' % target_name)
+    elif target_name and 'uia' in strategy:
+        result.attempted.append('uia_skipped_unavailable')
+        result.detail['uia_current_matched'] = None
 
     if target_name and not current_verified:
         opened = False
         # 1a. UIA search & select
-        if 'uia' in strategy:
+        if uia_enabled:
             result.attempted.append('uia_search')
             opened = _uia_open_chat_by_search(target, cfg=cfg, log=log)
             result.detail['uia_open_chat'] = opened
@@ -662,13 +755,15 @@ def send_reply_foreground(text: str, target: Optional[dict] = None, cfg: Optiona
         result.attempted.append('current_chat_no_target')
         _log(log, 'UI target missing; assume current chat')
 
-    # --- 2. Type and send (UIA-first) ---
+    # --- 2. Type and send (UIA when effective, otherwise physical) ---
     sent = False
-    if 'uia' in strategy:
+    if uia_enabled:
         sent = _uia_input_and_send(text, cfg=cfg, log=log)
         result.detail['uia_input_send'] = sent
         if sent:
             result.attempted.append('uia_input_send')
+    elif 'uia' in strategy:
+        result.detail['uia_input_send'] = None
 
     if not sent:
         result.attempted.append('physical_input')
