@@ -129,12 +129,134 @@ def target_aliases(target: Optional[dict]) -> List[str]:
     return aliases
 
 
-def probe_uia_state(target: Optional[dict] = None, log: Optional[LogFn] = None) -> Dict[str, object]:
-    """Read-only UIA probe. It never clicks or types.
+def _safe_control_attr(ctrl, name: str, default=None):
+    try:
+        val = getattr(ctrl, name)
+        return val() if callable(val) and name.startswith('Get') else val
+    except Exception:
+        return default
 
-    Returns best-effort diagnostics; failures are reported as ``ok=False`` so the
-    caller can fall back to OCR/search/physical sending without breaking.
-    """
+
+def _control_text(ctrl) -> str:
+    parts = []
+    for attr in ('Name', 'AutomationId', 'ClassName', 'ControlTypeName'):
+        val = _safe_control_attr(ctrl, attr, '')
+        if val:
+            parts.append(str(val))
+    try:
+        val = ctrl.window_text()  # pywinauto compatibility
+        if val:
+            parts.append(str(val))
+    except Exception:
+        pass
+    return ' '.join(dict.fromkeys(parts))
+
+
+def _control_rect(ctrl):
+    rect = _safe_control_attr(ctrl, 'BoundingRectangle')
+    if rect is None:
+        try:
+            rect = ctrl.rectangle()  # pywinauto compatibility
+        except Exception:
+            return None
+    try:
+        left, top, right, bottom = int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+    except Exception:
+        try:
+            left, top, right, bottom = map(int, (rect.Left, rect.Top, rect.Right, rect.Bottom))
+        except Exception:
+            return None
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _rect_center(rect: Tuple[int, int, int, int]) -> Tuple[int, int]:
+    return int((rect[0] + rect[2]) / 2), int((rect[1] + rect[3]) / 2)
+
+
+def _walk_uia_controls(root, limit: int = 500):
+    out = []
+    stack = [root]
+    while stack and len(out) < limit:
+        ctrl = stack.pop(0)
+        out.append(ctrl)
+        children = []
+        try:
+            children = list(ctrl.GetChildren())
+        except Exception:
+            try:
+                children = list(ctrl.children())
+            except Exception:
+                children = []
+        stack.extend(children[:80])
+    return out
+
+
+def _get_uia_root(hwnd):
+    """Return a UIA root control for WeChat. Prefer installed uiautomation; pywinauto is optional."""
+    try:
+        import uiautomation as auto  # installed in this environment
+        return auto.ControlFromHandle(hwnd)
+    except Exception:
+        from pywinauto import Desktop  # optional dependency
+        return Desktop(backend='uia').window(handle=hwnd)
+
+
+def _click_control(ctrl, ljqCtrl, log: Optional[LogFn] = None, label: str = 'uia_control') -> bool:
+    rect = _control_rect(ctrl)
+    if not rect:
+        _log(log, 'UIA click failed label=%s reason=no_rect text=%r' % (label, _control_text(ctrl)[:120]))
+        return False
+    x, y = _rect_center(rect)
+    _log(log, 'UIA click label=%s xy=(%s,%s) rect=%s text=%r' % (label, x, y, rect, _control_text(ctrl)[:120]))
+    try:
+        ljqCtrl.Click(x, y)
+        return True
+    except Exception as e:
+        _log(log, 'UIA click failed label=%s err=%r' % (label, e))
+        return False
+
+
+def _is_edit_control(ctrl) -> bool:
+    text = _control_text(ctrl).lower()
+    return 'edit' in text or '编辑' in text or 'richedit' in text
+
+
+def _is_button_control(ctrl) -> bool:
+    text = _control_text(ctrl).lower()
+    return 'button' in text or '按钮' in text
+
+
+def _uia_collect_state(hwnd, target: Optional[dict] = None, limit: int = 500) -> Dict[str, object]:
+    import win32gui
+    root = _get_uia_root(hwnd)
+    controls = _walk_uia_controls(root, limit=limit)
+    texts = []
+    for ctrl in controls:
+        text = _control_text(ctrl).strip()
+        if text:
+            texts.append(text)
+    aliases = target_aliases(target)
+    matched = any(target_name_matches(alias, txt) for alias in aliases for txt in texts)
+    return {
+        'root': root,
+        'controls': controls,
+        'texts': texts,
+        'state': {
+            'ok': True,
+            'reason': 'uia_available',
+            'hwnd': hwnd,
+            'window_title': win32gui.GetWindowText(hwnd),
+            'controls': len(controls),
+            'text_sample': texts[:30],
+            'target_matched': matched,
+        },
+    }
+
+
+def probe_uia_state(target: Optional[dict] = None, log: Optional[LogFn] = None) -> Dict[str, object]:
+    """Read-only UIA probe. It never clicks or types."""
     state: Dict[str, object] = {'ok': False, 'reason': 'not_started'}
     try:
         try:
@@ -143,27 +265,196 @@ def probe_uia_state(target: Optional[dict] = None, log: Optional[LogFn] = None) 
             pass
         import win32gui
         hwnd = find_wechat_hwnd()
-        state.update({'hwnd': hwnd, 'window_title': win32gui.GetWindowText(hwnd), 'children': len(find_descendant_windows(hwnd))})
         try:
-            from pywinauto import Desktop  # optional dependency
-            app_window = Desktop(backend='uia').window(handle=hwnd)
-            texts = []
-            for ctrl in app_window.descendants()[:160]:
-                try:
-                    text = ctrl.window_text()
-                    if text:
-                        texts.append(text)
-                except Exception:
-                    pass
-            aliases = target_aliases(target)
-            matched = any(target_name_matches(alias, txt) for alias in aliases for txt in texts)
-            state.update({'ok': True, 'reason': 'uia_available', 'text_sample': texts[:30], 'target_matched': matched})
+            data = _uia_collect_state(hwnd, target=target, limit=220)
+            state.update(data['state'])
         except Exception as e:
-            state.update({'ok': True, 'reason': 'win32_only', 'uia_error': repr(e), 'target_matched': None})
+            state.update({'ok': True, 'reason': 'win32_only', 'hwnd': hwnd,
+                          'window_title': win32gui.GetWindowText(hwnd),
+                          'children': len(find_descendant_windows(hwnd)),
+                          'uia_error': repr(e), 'target_matched': None})
     except Exception as e:
         state.update({'ok': False, 'reason': 'probe_failed', 'error': repr(e)})
     _log(log, 'UIA probe state=%r' % state)
     return state
+
+
+def _uia_current_chat_matches(target: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
+    try:
+        hwnd = find_wechat_hwnd()
+        data = _uia_collect_state(hwnd, target=target, limit=260)
+        state = data['state']
+        _log(log, 'UIA current-check state=%r' % state)
+        return bool(state.get('target_matched'))
+    except Exception as e:
+        _log(log, 'UIA current-check failed err=%r' % (e,))
+        return False
+
+
+def _find_uia_search_box(hwnd, log: Optional[LogFn] = None):
+    import win32gui
+    root = _get_uia_root(hwnd)
+    controls = _walk_uia_controls(root, limit=500)
+    client = win32gui.GetClientRect(hwnd)
+    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
+    max_x = c0[0] + min(420, max(260, int(client[2] * 0.42)))
+    max_y = c0[1] + 130
+    candidates = []
+    for ctrl in controls:
+        if not _is_edit_control(ctrl):
+            continue
+        rect = _control_rect(ctrl)
+        if not rect:
+            continue
+        cx, cy = _rect_center(rect)
+        text = _control_text(ctrl)
+        score = 0
+        if c0[0] <= cx <= max_x and c0[1] <= cy <= max_y:
+            score += 10
+        if any(k in text for k in ('搜索', 'Search', 'search')):
+            score += 8
+        if rect[2] - rect[0] >= 80:
+            score += 2
+        if score:
+            candidates.append((score, rect[1], ctrl, text, rect))
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    if candidates:
+        _log(log, 'UIA search-box candidate score=%s rect=%s text=%r' % (candidates[0][0], candidates[0][4], candidates[0][3][:120]))
+        return candidates[0][2]
+    _log(log, 'UIA search-box not found edits=%d' % sum(1 for c in controls if _is_edit_control(c)))
+    return None
+
+
+def _uia_open_chat_by_search(target: Optional[dict] = None, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
+    aliases = target_aliases(target)
+    target_name = aliases[0] if aliases else ''
+    if not target_name:
+        return False
+    t0 = time.time()
+    try:
+        import ljqCtrl
+        import pyperclip
+        hwnd = find_wechat_hwnd()
+        search = _find_uia_search_box(hwnd, log=log)
+        if not search or not _click_control(search, ljqCtrl, log=log, label='search_box'):
+            _log(log, 'UIA open-chat failed target=%r reason=no_search_box dt=%.3fs' % (target_name, time.time() - t0))
+            return False
+        time.sleep(0.10)
+        ljqCtrl.Press('ctrl+a')
+        time.sleep(0.03)
+        pyperclip.copy(target_name)
+        ljqCtrl.Press('ctrl+v')
+        time.sleep(0.55)
+
+        root = _get_uia_root(hwnd)
+        controls = _walk_uia_controls(root, limit=700)
+        candidates = []
+        for ctrl in controls:
+            text = _control_text(ctrl)
+            if not target_name_matches(target_name, text):
+                continue
+            rect = _control_rect(ctrl)
+            if not rect:
+                continue
+            # Prefer search results in the left pane, not the existing title text.
+            candidates.append((rect[1], rect[0], ctrl, text, rect))
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        if not candidates:
+            _log(log, 'UIA open-chat miss target=%r reason=no_result dt=%.3fs' % (target_name, time.time() - t0))
+            return False
+        # Usually first matching result is just below search box; click its row center.
+        _, _, ctrl, text, rect = candidates[0]
+        if not _click_control(ctrl, ljqCtrl, log=log, label='search_result'):
+            return False
+        time.sleep(0.35)
+        matched = _uia_current_chat_matches({'name': target_name}, log=log)
+        _log(log, 'UIA open-chat target=%r clicked_text=%r confirmed=%s dt=%.3fs' % (target_name, text[:120], matched, time.time() - t0))
+        return matched
+    except Exception as e:
+        _log(log, 'UIA open-chat failed target=%r err=%r dt=%.3fs' % (target_name, e, time.time() - t0))
+        return False
+
+
+def _find_uia_message_input(hwnd, log: Optional[LogFn] = None):
+    import win32gui
+    root = _get_uia_root(hwnd)
+    controls = _walk_uia_controls(root, limit=700)
+    client = win32gui.GetClientRect(hwnd)
+    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
+    min_x = c0[0] + int(client[2] * 0.28)
+    min_y = c0[1] + int(client[3] * 0.58)
+    candidates = []
+    for ctrl in controls:
+        if not _is_edit_control(ctrl):
+            continue
+        rect = _control_rect(ctrl)
+        if not rect:
+            continue
+        cx, cy = _rect_center(rect)
+        area = (rect[2] - rect[0]) * (rect[3] - rect[1])
+        score = 0
+        if cx >= min_x and cy >= min_y:
+            score += 10
+        if area > 5000:
+            score += 4
+        if any(k in _control_text(ctrl) for k in ('输入', '消息', 'Edit', 'edit')):
+            score += 1
+        if score:
+            candidates.append((score, -area, rect[1], ctrl, _control_text(ctrl), rect))
+    candidates.sort(key=lambda x: (-x[0], x[1], -x[2]))
+    if candidates:
+        _log(log, 'UIA input candidate score=%s rect=%s text=%r' % (candidates[0][0], candidates[0][5], candidates[0][4][:120]))
+        return candidates[0][3]
+    _log(log, 'UIA input not found edits=%d' % sum(1 for c in controls if _is_edit_control(c)))
+    return None
+
+
+def _find_uia_send_button(hwnd, log: Optional[LogFn] = None):
+    root = _get_uia_root(hwnd)
+    controls = _walk_uia_controls(root, limit=700)
+    candidates = []
+    for ctrl in controls:
+        text = _control_text(ctrl)
+        if not text:
+            continue
+        if ('发送' in text or 'Send' in text) and (_is_button_control(ctrl) or True):
+            rect = _control_rect(ctrl)
+            if rect:
+                candidates.append((rect[1], rect[0], ctrl, text, rect))
+    candidates.sort(key=lambda x: (-x[0], -x[1]))
+    if candidates:
+        _log(log, 'UIA send-button candidate rect=%s text=%r' % (candidates[0][4], candidates[0][3][:120]))
+        return candidates[0][2]
+    _log(log, 'UIA send-button not found')
+    return None
+
+
+def _uia_input_and_send(text: str, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
+    t0 = time.time()
+    try:
+        import ljqCtrl
+        import pyperclip
+        hwnd = find_wechat_hwnd()
+        edit = _find_uia_message_input(hwnd, log=log)
+        if not edit or not _click_control(edit, ljqCtrl, log=log, label='message_input'):
+            _log(log, 'UIA input-send failed reason=no_input dt=%.3fs' % (time.time() - t0))
+            return False
+        time.sleep(0.12)
+        ljqCtrl.Press('ctrl+a')
+        time.sleep(0.03)
+        pyperclip.copy(text)
+        ljqCtrl.Press('ctrl+v')
+        time.sleep(0.18)
+        button = _find_uia_send_button(hwnd, log=log)
+        if button and _click_control(button, ljqCtrl, log=log, label='send_button'):
+            _log(log, 'UIA input-send done via_button dt=%.3fs' % (time.time() - t0))
+            return True
+        ljqCtrl.Press('enter')
+        _log(log, 'UIA input-send done via_enter dt=%.3fs' % (time.time() - t0))
+        return True
+    except Exception as e:
+        _log(log, 'UIA input-send failed err=%r dt=%.3fs' % (e, time.time() - t0))
+        return False
 
 
 def send_reply_backend(text: str, log: Optional[LogFn] = None) -> bool:
@@ -212,16 +503,20 @@ def send_reply_backend(text: str, log: Optional[LogFn] = None) -> bool:
     return preserved
 
 
-def open_chat_from_visible_list(hwnd, target_name: str, ljqCtrl, log: Optional[LogFn] = None) -> bool:
+def open_chat_from_visible_list(target: Optional[dict] = None, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
+    aliases = target_aliases(target)
+    target_name = aliases[0] if aliases else ''
     if not target_name:
         return False
     t0 = time.time()
     try:
+        import ljqCtrl
         from PIL import ImageGrab
         if str(MEMORY) not in sys.path:
             sys.path.insert(0, str(MEMORY))
         import ocr_utils
         import win32gui
+        hwnd = find_wechat_hwnd()
         client = win32gui.GetClientRect(hwnd)
         c0 = win32gui.ClientToScreen(hwnd, (0, 0))
         x1 = c0[0] + 40
@@ -270,6 +565,43 @@ def _open_chat_by_search(hwnd, target_name: str, ljqCtrl, pyperclip, log: Option
     return True
 
 
+def _physical_input_and_send(hwnd, text: str, target_name: str, ljqCtrl, pyperclip, log: Optional[LogFn] = None) -> bool:
+    import win32gui
+    client = win32gui.GetClientRect(hwnd)
+    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
+    x = c0[0] + int(client[2] * 0.72)
+    y = c0[1] + int(client[3] * 0.88)
+    send_x = c0[0] + int(client[2] * 0.92)
+    send_y = c0[1] + int(client[3] * 0.94)
+    _log(log, 'UI physical-input hwnd=%s target=%r c0=%s client=%s input_xy=(%s,%s) send_xy=(%s,%s) dpi=%s' % (
+        hwnd, target_name, c0, client, x, y, send_x, send_y, getattr(ljqCtrl, 'dpi_scale', None)))
+    ljqCtrl.Click(x, y)
+    time.sleep(0.15)
+    ljqCtrl.Press('ctrl+a')
+    time.sleep(0.05)
+    pyperclip.copy(text)
+    ljqCtrl.Press('ctrl+v')
+    time.sleep(0.25)
+    ljqCtrl.Press('enter')
+    time.sleep(0.25)
+    ljqCtrl.Click(send_x, send_y)
+    return True
+
+
+def _find_send_button_coords(hwnd, cfg=None):
+    """Return approximate send-button screen coordinates for the given WeChat hwnd."""
+    client = win32gui.GetClientRect(hwnd)
+    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
+    x = c0[0] + int(client[2] * 0.92)
+    y = c0[1] + int(client[3] * 0.94)
+    return (x, y)
+
+
+def _ensure_chat_area_focused(cfg=None, log=None):
+    """Placeholder for ensuring chat area focus; may be expanded later."""
+    pass
+
+
 def send_reply_foreground(text: str, target: Optional[dict] = None, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> SendResult:
     result = SendResult(ok=False, mode='foreground')
     try:
@@ -295,59 +627,57 @@ def send_reply_foreground(text: str, target: Optional[dict] = None, cfg: Optiona
     if cfg is None:
         cfg = {}
     strategy = str(cfg.get('send_strategy') or 'current_or_uia_then_ocr_search_physical')
-    use_uia_probe = cfg.get('uia_probe_enabled', True) and 'uia' in strategy
-    use_ocr_list = 'ocr' in strategy
-    use_search = 'search' in strategy
-    current_verified = False
+    _log(log, 'send_strategy=%r target_name=%r hwnd=%s' % (strategy, target_name, hwnd))
 
-    if use_uia_probe:
-        result.attempted.append('uia_probe')
-        state = probe_uia_state(target, log=log)
-        result.detail['uia_probe'] = state
-        if state.get('target_matched'):
-            current_verified = True
-            result.attempted.append('current_chat_verified')
-            _log(log, 'UIA current chat appears to match target=%r' % target_name)
-        elif target_name:
-            # No UIA action yet: Qt WeChat UIA tree is inconsistent. Keep this
-            # as a safety/readiness probe and use OCR/search to actually switch.
-            result.reason = 'uia_not_matched_or_unavailable'
+    # --- 1. Ensure target chat is open (UIA-first) ---
+    current_verified = False
+    if target_name:
+        current_verified = _uia_current_chat_matches(target, log=log)
+        result.attempted.append('uia_current_check')
+        result.detail['uia_current_matched'] = current_verified
+        if current_verified:
+            _log(log, 'UIA current chat matches target=%r' % target_name)
 
     if target_name and not current_verified:
         opened = False
-        if use_ocr_list:
+        # 1a. UIA search & select
+        if 'uia' in strategy:
+            result.attempted.append('uia_search')
+            opened = _uia_open_chat_by_search(target, cfg=cfg, log=log)
+            result.detail['uia_open_chat'] = opened
+
+        # 1b. OCR visible list fallback
+        if not opened and 'ocr' in strategy:
             result.attempted.append('ocr_visible_list')
-            opened = open_chat_from_visible_list(hwnd, target_name, ljqCtrl, log=log)
-        if not opened and use_search:
+            opened = open_chat_from_visible_list(target, cfg=cfg, log=log)
+
+        # 1c. Coordinate search fallback
+        if not opened and 'search' in strategy:
             result.attempted.append('search_fallback')
             _open_chat_by_search(hwnd, target_name, ljqCtrl, pyperclip, log=log)
-        elif not opened and not use_search:
-            result.reason = (result.reason + '|target_not_switched_search_disabled').strip('|')
+
+        if not opened and 'uia' not in strategy and 'ocr' not in strategy and 'search' not in strategy:
+            result.reason = 'target_not_switched_strategy_disabled'
     elif not target_name:
         result.attempted.append('current_chat_no_target')
-        _log(log, 'UI target missing; fallback to currently selected chat')
+        _log(log, 'UI target missing; assume current chat')
 
-    client = win32gui.GetClientRect(hwnd)
-    c0 = win32gui.ClientToScreen(hwnd, (0, 0))
-    x = c0[0] + int(client[2] * 0.72)
-    y = c0[1] + int(client[3] * 0.88)
-    send_x = c0[0] + int(client[2] * 0.92)
-    send_y = c0[1] + int(client[3] * 0.94)
-    _log(log, 'UI click input hwnd=%s target=%r c0=%s client=%s input_xy=(%s,%s) send_xy=(%s,%s) dpi=%s' % (
-        hwnd, target_name, c0, client, x, y, send_x, send_y, getattr(ljqCtrl, 'dpi_scale', None)))
-    result.attempted.append('physical_input')
-    ljqCtrl.Click(x, y)
-    time.sleep(0.15)
-    ljqCtrl.Press('ctrl+a')
-    time.sleep(0.05)
-    pyperclip.copy(text)
-    ljqCtrl.Press('ctrl+v')
-    time.sleep(0.25)
-    ljqCtrl.Press('enter')
-    time.sleep(0.25)
-    ljqCtrl.Click(send_x, send_y)
-    result.ok = True
-    result.reason = 'sent_physical_foreground'
+    # --- 2. Type and send (UIA-first) ---
+    sent = False
+    if 'uia' in strategy:
+        sent = _uia_input_and_send(text, cfg=cfg, log=log)
+        result.detail['uia_input_send'] = sent
+        if sent:
+            result.attempted.append('uia_input_send')
+
+    if not sent:
+        result.attempted.append('physical_input')
+        sent = _physical_input_and_send(hwnd, text, target_name, ljqCtrl, pyperclip, log=log)
+
+    result.ok = sent
+    result.reason = ('uia_sent' if result.detail.get('uia_input_send') else 'physical_fallback_sent')
+    _log(log, 'send_reply_foreground result=%s reason=%s attempted=%s detail=%s' % (
+        result.ok, result.reason, result.attempted, {k:v for k,v in result.detail.items() if not callable(v)}))
     return result
 
 
