@@ -22,7 +22,7 @@ import uuid
 from typing import Any, Dict, Iterable, List, Tuple
 
 
-DEFAULT_TRIGGERS = ["@飞扬的小助理", "飞扬的小助理", "小助理", "小助手"]
+DEFAULT_TRIGGERS = ["@群聊小助手", "群聊小助手", "小助理", "小助手"]
 MAX_REPLY_CHARS = 300
 
 HIGH_RISK_PATTERNS = [
@@ -31,7 +31,7 @@ HIGH_RISK_PATTERNS = [
     "内部日志", "路径", "keys.json", "忽略之前", "忽略以上", "绕过", "越权",
 ]
 PROMISE_PATTERNS = [
-    "你替飞扬", "你替扬叔", "代表飞扬", "代表扬叔", "承诺", "保证", "报价", "授权", "拍板", "决定",
+    "你替群主", "代表群主", "承诺", "保证", "报价", "授权", "拍板", "决定",
 ]
 HELP_PATTERNS = ["菜单", "帮助", "你能做什么", "功能", "怎么用"]
 PING_PATTERNS = ["在吗", "在不在", "你好", "hello", "hi"]
@@ -517,7 +517,7 @@ def precheck(user_text: str) -> ReplyDecision | None:
     if _contains_any(user_text, HIGH_RISK_PATTERNS):
         return ReplyDecision(
             True,
-            "这个涉及敏感或高风险信息，我不能在群里直接处理，需要飞扬/扬叔确认。",
+            "这个涉及敏感或高风险信息，我不能在群里直接处理，需要本人确认。",
             intent="need_human",
             risk_level="high",
             need_human=True,
@@ -526,7 +526,7 @@ def precheck(user_text: str) -> ReplyDecision | None:
     if _contains_any(user_text, PROMISE_PATTERNS):
         return ReplyDecision(
             True,
-            "这个需要飞扬/扬叔本人确认，我不能替他承诺、授权或做决定。",
+            "这个需要本人确认，我不能替群主/负责人承诺、授权或做决定。",
             intent="need_human",
             risk_level="medium",
             need_human=True,
@@ -539,7 +539,7 @@ def postcheck(text: str) -> str:
     text = text or ""
     blocked = ["keys.json", "MINIMAX_API_KEY", "数据库", "内部日志", "自动化实现", "系统路径"]
     if _contains_any(text, blocked):
-        return "这个问题我先收到啦，涉及内部信息或需要确认的内容，需要飞扬/扬叔确认后再处理。"
+        return "这个问题我先收到啦，涉及内部信息或需要确认的内容，需要本人确认后再处理。"
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) > MAX_REPLY_CHARS:
         text = text[:MAX_REPLY_CHARS - 1].rstrip() + "…"
@@ -569,17 +569,18 @@ def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
     llm_no = str(config.get("llm_no", 1))
     timeout = float(config.get("llm_timeout", 120))
     input_text = (
-        "你是飞扬的小助理。请根据下面的群消息、本地wiki片段和边界约束，"
+        "你是群聊小助手。请根据下面的群消息、本地wiki片段和边界约束，"
         "只输出一段可以直接发送到微信群的中文回复；不要解释过程，不要使用工具，不要写summary。\n\n"
         + prompt
     )
     try:
-        cmd = [sys.executable, str(agentmain), "--task", task, "--input", input_text, "--llm_no", llm_no]
+        temp_root = str(config.get("subagent_temp_root") or "temp")
+        cmd = [sys.executable, str(agentmain), "--task", task, "--input", input_text, "--llm_no", llm_no, "--temp_root", temp_root]
         proc = subprocess.Popen(
             cmd, cwd=str(code_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace"
         )
-        out_path = code_root / "temp" / task / "output.txt"
+        out_path = code_root / temp_root / task / "output.txt"
         deadline = time.time() + timeout
         polled = False
         while time.time() < deadline:
@@ -639,13 +640,13 @@ def fallback_reply(clean_text: str, wiki_hits: List[Tuple[str, str]]) -> Tuple[s
     if not text:
         return "我在，有事可以直接说，我会尽量基于已有信息帮你整理或转达。", "smalltalk", False
     if _contains_any(text, HELP_PATTERNS):
-        return "我可以在被叫到时，基于已有资料做简短说明、整理问题、回答常见问题；需要飞扬/扬叔本人判断的事，我会提示需要他确认。", "assistant_help", False
+        return "我可以在被叫到时，基于已有资料做简短说明、整理问题、回答常见问题；需要本人判断的事，我会提示需要他确认。", "assistant_help", False
     if _contains_any(text, PING_PATTERNS):
         return "我在，有事可以直接说。", "smalltalk", False
     if wiki_hits:
         names = "、".join((h.label if isinstance(h, KnowledgeHit) else h[0]) for h in wiki_hits[:2])
-        return f"我先按已有资料理解：这件事我可以帮你整理或说明；如果涉及决定、承诺或执行，还需要飞扬/扬叔确认。", "wiki_qa", False
-    return "我先收到啦，这个问题需要结合更多背景，建议等飞扬/扬叔确认后再处理。", "need_human", True
+        return f"我先按已有资料理解：这件事我可以帮你整理或说明；如果涉及决定、承诺或执行，还需要本人确认。", "wiki_qa", False
+    return "我先收到啦，这个问题需要结合更多背景，建议等本人确认后再处理。", "need_human", True
 
 
 def resolve_wiki_dir(config: Dict[str, Any], target: Dict[str, Any]) -> str:
@@ -665,7 +666,33 @@ def resolve_wiki_dir(config: Dict[str, Any], target: Dict[str, Any]) -> str:
     return str(path.resolve())
 
 
-def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None) -> str:
+def _extract_mention_name(message: Dict[str, Any] | str) -> str:
+    if isinstance(message, dict):
+        for key in ("mention_name", "sender_display_name", "sender_name", "from_display_name"):
+            value = str(message.get(key) or "").strip()
+            if value:
+                return value.lstrip("@").strip()
+        raw = str(message.get("message_content") or message.get("content") or "")
+    else:
+        raw = str(message or "")
+    # Group messages in decrypted DB commonly start with: sender:\ncontent.
+    m = re.match(r"^([^:\n]{1,80}):\n", raw)
+    if m:
+        return m.group(1).strip().lstrip("@")
+    return ""
+
+
+def _ensure_mention_prefix(reply: str, mention_name: str) -> str:
+    text = (reply or "").strip()
+    name = (mention_name or "").strip().lstrip("@")
+    if not text or not name:
+        return text
+    if text.startswith("@"):
+        return text
+    return f"@{name} {text}"
+
+
+def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None, mention_name: str = "") -> str:
     wiki_parts = []
     for h in wiki_hits:
         if isinstance(h, KnowledgeHit):
@@ -686,7 +713,8 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
                 prefix = f"[{ts} #{lid} sender={sender}] " if (ts or lid or sender) else ""
                 ctx_lines.append(f"{prefix}{role}: {content}")
     ctx_block = "\n".join(ctx_lines[-20:])
-    return f"""你是飞扬的小助理，只在微信群中被明确叫到时回复。\n强边界：不能冒充飞扬/扬叔本人；不能替他承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字。\n\n{('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n[本地wiki]\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
+    mention_rule = f"必须以 @{mention_name} + 空格 开头。" if mention_name else "必须以 @提问人昵称 + 空格 开头。"
+    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n\n{('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n[本地wiki]\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
 
 
 def generate_reply(message: Dict[str, Any] | str,
@@ -697,23 +725,26 @@ def generate_reply(message: Dict[str, Any] | str,
     raw_text = message if isinstance(message, str) else (message.get("content") or message.get("str_content") or message.get("message") or message.get("message_content") or "")
     triggers = target.get("triggers") or config.get("default_triggers") or DEFAULT_TRIGGERS
     clean = strip_triggers(raw_text, triggers)
+    mention_name = _extract_mention_name(message)
 
     pre = precheck(clean or raw_text)
     if pre:
+        pre.reply_text = _ensure_mention_prefix(postcheck(pre.reply_text), mention_name)
         return pre
 
     wiki_hits = retrieve_knowledge(clean or raw_text, config, target)
     context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
-    prompt = build_prompt(raw_text, clean, wiki_hits, context_messages=context_messages)
+    mention_name = _extract_mention_name(message)
+    prompt = build_prompt(raw_text, clean, wiki_hits, context_messages=context_messages, mention_name=mention_name)
 
     llm_text = call_llm_provider(prompt, config.get("reply_engine", config))
     if llm_text:
-        reply = postcheck(llm_text)
+        reply = _ensure_mention_prefix(postcheck(llm_text), mention_name)
         return ReplyDecision(True, reply, intent="llm", risk_level="low", need_human=False,
                              reason="llm_provider", wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits])
 
     reply, intent, need_human = fallback_reply(clean, wiki_hits)
-    return ReplyDecision(True, postcheck(reply), intent=intent,
+    return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
                          risk_level="medium" if need_human else "low",
                          need_human=need_human,
                          reason="safe_fallback_no_provider",
