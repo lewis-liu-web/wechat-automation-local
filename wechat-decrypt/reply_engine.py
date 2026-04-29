@@ -304,11 +304,15 @@ def _ima_query_variants(query: str, limit: int = 8) -> List[str]:
     focused_clean = re.sub(r"[，,。！？!?:：；;、]+", " ", focused_clean)
     add(clean)
     add(focused_clean)
-    for m in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:产品|业务|方案|材料|培训|办公|真实号|工作号)", focused_clean):
+    for m in re.finditer(r"[A-Za-z0-9\u4e00-\u9fff]{2,20}(?:产品|业务|方案|材料|培训|办公|真实号|工作号)", focused_clean):
         phrase = m.group(0)
         phrase = re.sub(r"^(是|的|让|给|把|找|讲|说)+", "", phrase)
         phrase = re.sub(r"(资料|材料|介绍)+$", "", phrase)
         add(phrase)
+        # IMA search may miss a product phrase when the user appends generic
+        # category words (observed: "AI语音质检产品" -> 0, "AI语音质检" -> hit).
+        trimmed = re.sub(r"(产品|业务|方案|资料|材料|介绍)+$", "", phrase).strip()
+        add(trimmed)
 
     # Extract compact product phrases such as "工作号真实号" from chatty text.
     for m in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:号|认证|办公|权益|套餐|实名|真实)[\u4e00-\u9fff]{0,8}(?:号|认证|办公|权益|套餐)?", clean):
@@ -514,6 +518,67 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
     return out
 
 
+def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
+    """Retrieve hits via getnote-cli semantic search.
+
+    Expected CLI contract verified against iswalle/getnote-cli:
+    - getnote search <query> --kb <topic_id> --limit <n> -o json
+    - JSON shape: {success: true, data: {results: [{title, content, note_id, note_type, ...}]}}
+
+    Credentials stay outside config: getnote-cli reads GETNOTE_API_KEY / its own
+    config.  Any CLI/API error degrades to no online hits.
+    """
+    kb_id = str(spec.get("knowledge_base_id") or spec.get("kb_id") or spec.get("topic_id") or spec.get("id") or "")
+    if not kb_id:
+        return []
+    exe = str(spec.get("executable") or spec.get("cmd") or os.environ.get("GETNOTE_BIN") or "getnote")
+    timeout = float(spec.get("timeout") or 20)
+    per_limit = max(1, int(limit or spec.get("limit") or 5))
+    cmd = [exe, "search", query or "", "--kb", kb_id, "--limit", str(per_limit), "-o", "json"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except Exception:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return []
+    out: List[KnowledgeHit] = []
+    seen: set[str] = set()
+    max_chars = int(spec.get("hit_max_chars") or 6000)
+    for idx, item in enumerate(results):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        content = str(item.get("content") or item.get("excerpt") or "").strip()
+        note_id = str(item.get("note_id") or "").strip()
+        note_type = str(item.get("note_type") or item.get("type") or "").strip()
+        rel = note_id or title or f"search_result_{idx + 1}"
+        if note_type:
+            rel = f"{note_type}:{rel}"
+        body = "\n".join(x for x in [title, content] if x).strip()
+        if not body or rel in seen:
+            continue
+        seen.add(rel)
+        out.append(KnowledgeHit("getnote", kb_id, str(spec.get("scope") or "online"), rel, body[:max_chars], max(1, per_limit - idx)))
+        if len(out) >= per_limit:
+            break
+    return out
+
+
 def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
     core_hits: List[KnowledgeHit] = []
@@ -539,6 +604,8 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
             batch = _retrieve_local_kb(query, root, spec, per_limit)
         elif typ == "ima":
             batch = _retrieve_ima_kb(query, spec, per_limit)
+        elif typ == "getnote":
+            batch = _retrieve_getnote_kb(query, spec, per_limit)
         for h in batch:
             if h.scope == "core" or str(h.rel_path).startswith("core/"):
                 core_hits.append(h)

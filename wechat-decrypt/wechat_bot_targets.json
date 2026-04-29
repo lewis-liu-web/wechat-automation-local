@@ -30,7 +30,7 @@
       "reply_template": "",
       "knowledge_bases": [
         "scene.chongqing_mobile_work",
-        "online.ima.chongqing_mobile_work"
+        "online.getnote.chongqing_mobile_work"
       ]
     }
   ],
@@ -73,14 +73,24 @@
     },
     "online.ima.chongqing_mobile_work": {
       "type": "ima",
-      "enabled": true,
+      "enabled": false,
       "knowledge_base_id": "qtKs5bRxJr26owssZDa9cZLg3TKg-pe8er026YZj-sY=",
       "folder_id": "folder_7454825390304070",
       "client_id_env": "IMA_CLIENT_ID",
       "api_key_env": "IMA_API_KEY",
       "scope": "scene",
       "limit": 5,
-      "description": "工作资料/中移互产品资料（重生之我在重庆移动当牛做马群专用）"
+      "description": "工作资料/中移互产品资料（已停用，保留为IMA回退配置）"
+    },
+    "online.getnote.chongqing_mobile_work": {
+      "type": "getnote",
+      "enabled": true,
+      "knowledge_base_id": "QYAxqbPn",
+      "executable": "D:\\Program Files\\GenericAgent\\GenericAgent-main\\temp\\getnote_bin\\getnote.exe",
+      "scope": "scene",
+      "limit": 5,
+      "timeout": 25,
+      "description": "Get笔记/工作资料知识库（重生之我在重庆移动当牛做马群专用）"
     }
   },
   "pyweixin_first": true
