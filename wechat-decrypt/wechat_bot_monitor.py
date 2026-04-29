@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 MEMORY = (ROOT.parent.parent / 'memory').resolve()
 CONFIG_PATH = ROOT / 'wechat_bot_targets.json'
 DECRYPTED_MESSAGE_DIR = ROOT / 'decrypted' / 'message'
+DECRYPTED_CONTACT_DB = ROOT / 'decrypted' / 'contact' / 'contact.db'
 WECHAT_HWND_HINT = 67810
 LOG = ROOT / 'wechat_bot_monitor.log'
 STOP_FILE = ROOT / 'wechat_bot_monitor.stop'
@@ -118,6 +119,59 @@ def row_to_dict(row):
 
 def table_exists(con, table):
     return con.execute("select 1 from sqlite_master where type='table' and name=?", (table,)).fetchone() is not None
+
+
+def load_contact_name_map(db_path=DECRYPTED_CONTACT_DB):
+    """Return username -> display name from the decrypted contact DB.
+
+    Group messages in message DB are stored as "username:\ncontent".  That
+    username is stable but not suitable for a human-facing @ prefix, so resolve
+    it to remark/nick_name before passing the message to reply_engine.
+    """
+    p = Path(db_path)
+    if not p.exists():
+        return {}
+    con = sqlite3.connect('file:%s?mode=ro' % p.as_posix(), uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        if not table_exists(con, 'contact'):
+            return {}
+        names = {}
+        for row in con.execute('select username, remark, nick_name, alias from contact'):
+            username = str(row['username'] or '').strip()
+            if not username:
+                continue
+            display = str(row['remark'] or row['nick_name'] or row['alias'] or username).strip()
+            names[username] = display or username
+        return names
+    except Exception as e:
+        log('warn load contact names failed: %r' % (e,))
+        return {}
+    finally:
+        con.close()
+
+
+def extract_group_sender_username(message_content):
+    text = str(message_content or '')
+    if ':\n' not in text:
+        return ''
+    prefix = text.split(':\n', 1)[0].strip()
+    # Avoid treating ordinary prose as a username; WeChat ids/usernames do not
+    # contain whitespace and are stored as a short prefix before the newline.
+    if not prefix or len(prefix) > 128 or any(ch.isspace() for ch in prefix):
+        return ''
+    return prefix
+
+
+def enrich_sender_display_name(msg, contact_names):
+    sender = extract_group_sender_username(msg.get('message_content'))
+    if not sender:
+        return msg
+    display = (contact_names or {}).get(sender) or sender
+    msg['sender_username'] = sender
+    msg['sender_display_name'] = display
+    msg['mention_name'] = display
+    return msg
 
 
 def fetch_new_for_db(db_name, targets):
@@ -344,10 +398,15 @@ def main():
         rc, dt, changed, failed, summary = run_fast_refresh(config_path, force=args.fast_refresh_force_start)
         log('initial fast-refresh rc=%s dt=%.3fs changed=%s failed=%s %s' % (rc, dt, changed, failed, summary))
 
+    runtime_min_last_local_id = {}
+    contact_names = load_contact_name_map()
+    log('contact display names loaded=%d' % len(contact_names))
     for t in targets:
         latest = fetch_latest_for_target(t)
         if int(t.get('last_local_id') or 0) <= 0 and latest:
             t['last_local_id'] = int(latest.get('local_id') or 0)
+        target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
+        runtime_min_last_local_id[target_key] = int(t.get('last_local_id') or 0)
         log('baseline target=%s db=%s table=%s last_local_id=%s latest=%s' % (
             t.get('name'), t.get('db'), t.get('table'), t.get('last_local_id'), json.dumps(latest, ensure_ascii=False)))
     if not args.no_save_state:
@@ -389,11 +448,23 @@ def main():
 
         # Reload config each cycle so adding/removing groups does not require restart.
         cfg = load_config(config_path)
+        contact_names = load_contact_name_map()
         targets = enabled_targets(cfg)
+        for t in targets:
+            target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
+            file_last_id = int(t.get('last_local_id') or 0)
+            runtime_last_id = int(runtime_min_last_local_id.get(target_key, 0) or 0)
+            if file_last_id < runtime_last_id:
+                log('warn config cursor regressed target=%s file_last_local_id=%s runtime_last_local_id=%s; using runtime value to avoid replay' % (
+                    t.get('name'), file_last_id, runtime_last_id))
+                t['last_local_id'] = runtime_last_id
+            else:
+                runtime_min_last_local_id[target_key] = file_last_id
         new_count = 0
         hit_count = 0
         for db_name, db_targets in group_targets_by_db(targets).items():
             for t, m in fetch_new_for_db(db_name, db_targets):
+                enrich_sender_display_name(m, contact_names)
                 new_count += 1
                 lid = int(m.get('local_id') or 0)
                 advance_state = True

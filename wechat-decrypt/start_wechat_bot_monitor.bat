@@ -17,6 +17,9 @@ if "%ERRORLEVEL%"=="10" (
 
 if exist wechat_bot_monitor.stop del /f /q wechat_bot_monitor.stop >nul 2>nul
 
+rem Load IMA credentials from user environment for non-interactive launchers.
+for /f "tokens=1,* delims==" %%A in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$names=@(''IMA_CLIENT_ID'',''IMA_API_KEY'',''IMA_SKILL_VERSION''); foreach($n in $names){ $v=[Environment]::GetEnvironmentVariable($n,''User''); if($v){ Write-Output ($n+''=''+$v) } }"') do set "%%A=%%B"
+
 start "" "%PYTHONW%" "%SCRIPT%"
 echo 已启动微信自动监听。
 timeout /t 2 /nobreak >nul
