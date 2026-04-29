@@ -809,7 +809,23 @@ def send_reply_detailed(text: str, mode: Optional[str] = None, target: Optional[
 
     if mode in ('foreground', 'front'):
         result = send_reply_foreground(text, target=target, cfg=cfg, log=log)
-        return _confirm_result(result, target, before_local_id, text, confirm, confirm_timeout)
+        result = _confirm_result(result, target, before_local_id, text, confirm, confirm_timeout)
+        # pyweixin/pywinauto reports success once it has pasted and pressed Alt+S,
+        # but it has no post-send acknowledgement.  On local WeChat Qt this can be
+        # a false positive (Edit exists, Alt+S/focus does not actually send).  If
+        # DB confirmation says the message did not appear, retry once through the
+        # normal foreground physical path instead of returning a silent failure.
+        if (not result.ok) and ('pyweixin_uia_send' in (result.attempted or [])):
+            retry_cfg = dict(cfg or {})
+            retry_cfg['pyweixin_first'] = False
+            retry_cfg['send_strategy'] = str(retry_cfg.get('send_strategy') or '').replace('pyweixin_', '').replace('pyweixin', '') or 'current_or_ocr_search_physical'
+            _log(log, 'pyweixin send not confirmed, fallback foreground physical reason=%s' % result.reason)
+            retry = send_reply_foreground(text, target=target, cfg=retry_cfg, log=log)
+            retry.mode = mode
+            retry.attempted = list(result.attempted or []) + ['confirm_failed_retry'] + list(retry.attempted or [])
+            retry.detail['pyweixin_unconfirmed_reason'] = result.reason
+            return _confirm_result(retry, target, before_local_id, text, confirm, confirm_timeout)
+        return result
 
     if mode in ('backend_then_foreground', 'background_then_foreground'):
         try:

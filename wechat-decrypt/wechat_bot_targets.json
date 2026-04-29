@@ -11,7 +11,7 @@
       "username": "47965620946@chatroom",
       "db": "message_0.db",
       "table": "Msg_470b0d2a7fa20f5d3acc08ffc9fcab01",
-      "last_local_id": 89,
+      "last_local_id": 125,
       "enabled": true,
       "triggers": [],
       "reply_template": "",
@@ -42,7 +42,8 @@
     "llm_name": "my-oai-proxy",
     "code_root": "D:\\Program Files\\GenericAgent-main",
     "llm_timeout": 120,
-    "subagent_task_prefix": "wechat_reply"
+    "subagent_task_prefix": "wechat_reply",
+    "subagent_temp_root": "wechat_reply_archive"
   },
   "context_limit": 12,
   "send_mode": "foreground",
@@ -81,5 +82,6 @@
       "limit": 5,
       "description": "工作资料/中移互产品资料（重生之我在重庆移动当牛做马群专用）"
     }
-  }
+  },
+  "pyweixin_first": true
 }

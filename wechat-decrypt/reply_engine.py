@@ -28,7 +28,7 @@ MAX_REPLY_CHARS = 300
 HIGH_RISK_PATTERNS = [
     "转账", "付款", "打款", "收款码", "银行卡", "验证码", "密码", "密钥", "token", "api key",
     "登录", "删", "删除", "格式化", "改配置", "系统设置", "发文件", "聊天记录", "数据库",
-    "内部日志", "路径", "keys.json", "忽略之前", "忽略以上", "绕过", "越权",
+    "内部日志", "路径", "keys.json", "忽略之前", "忽略以上", "绕过", "越权", "退群", "踢人", "移出群",
 ]
 PROMISE_PATTERNS = [
     "你替群主", "代表群主", "承诺", "保证", "报价", "授权", "拍板", "决定",
@@ -69,18 +69,44 @@ class KnowledgeHit:
         return f"{self.source}:{self.kb_id}:{self.rel_path}"
 
 
-def strip_triggers(text: str, triggers: Iterable[str] | None = None) -> str:
+def strip_group_sender_prefix(text: str) -> str:
+    """Remove the decrypted group sender prefix: "username:\ncontent"."""
     text = text or ""
+    return re.sub(r"^[^:\n]{1,80}:\n", "", text, count=1)
+
+
+def strip_triggers(text: str, triggers: Iterable[str] | None = None) -> str:
+    text = strip_group_sender_prefix(text or "")
     triggers = list(triggers or DEFAULT_TRIGGERS)
     for trig in sorted(triggers, key=len, reverse=True):
         text = text.replace(trig, " ")
-    text = re.sub(r"\s+", " ", text).strip(" ，,。:：\n\t")
+    text = re.sub(r"@[^\s\u2005]+", " ", text)
+    text = text.replace("@", " ")
+    text = re.sub(r"\s+", " ", text).strip(" ，,。:：\n\t\u2005")
     return text
 
 
 def _contains_any(text: str, words: Iterable[str]) -> bool:
     low = (text or "").lower()
     return any(w.lower() in low for w in words)
+
+
+def _looks_like_smalltalk(text: str) -> bool:
+    """Cheap gate before online retrieval so casual chat never blocks monitor.
+
+    Return True only for obvious conversational messages.  Product/work/wiki-style
+    questions still go through scene retrieval.
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if len(t) <= 18 and not _contains_any(t, [
+        "资料", "知识库", "产品", "业务", "方案", "套餐", "认证", "实名", "真实号", "工作号", "权益", "重庆", "移动", "中移", "介绍", "是什么", "怎么", "如何", "多少", "价格", "报价", "合同", "授权", "审批"
+    ]):
+        return True
+    return _contains_any(t, [
+        "哈哈", "笑死", "讲个笑话", "开个玩笑", "在吗", "在不在", "早上好", "下午好", "晚上好", "无聊", "天气不错", "吃饭了吗", "你觉得呢", "咋样啊", "聊聊"
+    ])
 
 
 def load_wiki(base_dir: str | Path | None = None) -> List[Tuple[str, str]]:
@@ -488,14 +514,16 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
     return out
 
 
-def retrieve_knowledge(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> List[KnowledgeHit]:
+def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
-    hits: List[KnowledgeHit] = []
+    core_hits: List[KnowledgeHit] = []
+    scene_hits: List[KnowledgeHit] = []
+
     # First principle: core rules/boundaries always apply for every target.
     core_docs = load_wiki(root / "core")
     core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=3)
     for rel, body in core_ranked:
-        hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
+        core_hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
 
     selected = target.get("knowledge_bases")
     if selected is None:
@@ -506,11 +534,23 @@ def retrieve_knowledge(query: str, config: Dict[str, Any], target: Dict[str, Any
             continue
         typ = str(spec.get("type") or "local").lower()
         per_limit = int(spec.get("limit") or limit)
+        batch: List[KnowledgeHit] = []
         if typ == "local":
-            hits.extend(_retrieve_local_kb(query, root, spec, per_limit))
+            batch = _retrieve_local_kb(query, root, spec, per_limit)
         elif typ == "ima":
-            hits.extend(_retrieve_ima_kb(query, spec, per_limit))
-    return hits[:limit]
+            batch = _retrieve_ima_kb(query, spec, per_limit)
+        for h in batch:
+            if h.scope == "core" or str(h.rel_path).startswith("core/"):
+                core_hits.append(h)
+            else:
+                scene_hits.append(h)
+
+    return {"core": core_hits[:3], "scene": scene_hits[:max(0, limit - min(len(core_hits), 3))]}
+
+
+def retrieve_knowledge(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> List[KnowledgeHit]:
+    layers = retrieve_knowledge_layers(query, config, target, limit=limit)
+    return (layers["core"] + layers["scene"])[:limit]
 
 
 def precheck(user_text: str) -> ReplyDecision | None:
@@ -574,13 +614,14 @@ def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
         + prompt
     )
     try:
-        temp_root = str(config.get("subagent_temp_root") or "temp")
-        cmd = [sys.executable, str(agentmain), "--task", task, "--input", input_text, "--llm_no", llm_no, "--temp_root", temp_root]
+        # agentmain.py writes task output under <code_root>/temp/<task> and does not support --temp_root.
+        # Keep archive/temp_root config for callers that manage files externally, but do not pass it to CLI.
+        cmd = [sys.executable, str(agentmain), "--task", task, "--input", input_text, "--llm_no", llm_no]
         proc = subprocess.Popen(
             cmd, cwd=str(code_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace"
         )
-        out_path = code_root / temp_root / task / "output.txt"
+        out_path = code_root / "temp" / task / "output.txt"
         deadline = time.time() + timeout
         polled = False
         while time.time() < deadline:
@@ -635,7 +676,7 @@ def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None) -> str 
     return None
 
 
-def fallback_reply(clean_text: str, wiki_hits: List[Tuple[str, str]]) -> Tuple[str, str, bool]:
+def fallback_reply(clean_text: str, wiki_hits: List[Tuple[str, str]], mode: str = "scene") -> Tuple[str, str, bool]:
     text = clean_text or ""
     if not text:
         return "我在，有事可以直接说，我会尽量基于已有信息帮你整理或转达。", "smalltalk", False
@@ -643,6 +684,14 @@ def fallback_reply(clean_text: str, wiki_hits: List[Tuple[str, str]]) -> Tuple[s
         return "我可以在被叫到时，基于已有资料做简短说明、整理问题、回答常见问题；需要本人判断的事，我会提示需要他确认。", "assistant_help", False
     if _contains_any(text, PING_PATTERNS):
         return "我在，有事可以直接说。", "smalltalk", False
+    if mode == "chat":
+        if _contains_any(text, ["哈哈", "笑死", "好玩", "有意思"]):
+            return "哈哈，我也觉得挺有意思的。", "smalltalk", False
+        if _contains_any(text, ["你是谁", "你是干嘛", "你能干嘛"]):
+            return "我是群里的小助手呀，被@到的时候可以陪聊、整理信息，也能按已有资料回答问题。", "smalltalk", False
+        if len(text) <= 20:
+            return "哈哈收到，我在呢。", "smalltalk", False
+        return "我懂你意思了，咱们可以继续聊；如果要问具体资料，我再帮你按已有信息整理。", "smalltalk", False
     if wiki_hits:
         names = "、".join((h.label if isinstance(h, KnowledgeHit) else h[0]) for h in wiki_hits[:2])
         return f"我先按已有资料理解：这件事我可以帮你整理或说明；如果涉及决定、承诺或执行，还需要本人确认。", "wiki_qa", False
@@ -692,7 +741,7 @@ def _ensure_mention_prefix(reply: str, mention_name: str) -> str:
     return f"@{name} {text}"
 
 
-def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None, mention_name: str = "") -> str:
+def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None, mention_name: str = "", mode: str = "scene") -> str:
     wiki_parts = []
     for h in wiki_hits:
         if isinstance(h, KnowledgeHit):
@@ -714,7 +763,13 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
                 ctx_lines.append(f"{prefix}{role}: {content}")
     ctx_block = "\n".join(ctx_lines[-20:])
     mention_rule = f"必须以 @{mention_name} + 空格 开头。" if mention_name else "必须以 @提问人昵称 + 空格 开头。"
-    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n\n{('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n[本地wiki]\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
+    if mode == "chat":
+        task_rule = "当前没有命中场景知识库。请只依据core边界约束和群聊上下文自然闲聊；不要编造产品/业务事实；不确定就轻松说明可以继续问具体问题。"
+        wiki_label = "[core约束]"
+    else:
+        task_rule = "当前已命中场景知识库。请优先依据场景wiki回答，同时遵守core边界约束；知识库无依据时说明不确定。"
+        wiki_label = "[core约束与场景wiki]"
+    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n任务策略：{task_rule}\n\n{('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
 
 
 def generate_reply(message: Dict[str, Any] | str,
@@ -727,27 +782,49 @@ def generate_reply(message: Dict[str, Any] | str,
     clean = strip_triggers(raw_text, triggers)
     mention_name = _extract_mention_name(message)
 
-    pre = precheck(clean or raw_text)
+    if not clean:
+        reply, intent, need_human = fallback_reply(clean, [])
+        return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
+                             risk_level="medium" if need_human else "low",
+                             need_human=need_human,
+                             reason="empty_after_trigger_fallback",
+                             wiki_hits=[])
+
+    pre = precheck(clean)
     if pre:
         pre.reply_text = _ensure_mention_prefix(postcheck(pre.reply_text), mention_name)
         return pre
 
-    wiki_hits = retrieve_knowledge(clean or raw_text, config, target)
+    if _looks_like_smalltalk(clean):
+        # Obvious casual chat must not touch scene/online KB (IMA may block); keep only core boundaries.
+        layers = {"core": retrieve_knowledge_layers("小助手 能做什么", config, {"knowledge_bases": []}).get("core") or [], "scene": []}
+    else:
+        layers = retrieve_knowledge_layers(clean or raw_text, config, target)
+    core_hits = layers.get("core") or []
+    scene_hits = layers.get("scene") or []
+    mode = "scene" if scene_hits else "chat"
+    wiki_hits = (core_hits + scene_hits) if scene_hits else core_hits
     context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
     mention_name = _extract_mention_name(message)
-    prompt = build_prompt(raw_text, clean, wiki_hits, context_messages=context_messages, mention_name=mention_name)
+    prompt = build_prompt(raw_text, clean, wiki_hits, context_messages=context_messages, mention_name=mention_name, mode=mode)
 
-    llm_text = call_llm_provider(prompt, config.get("reply_engine", config))
+    llm_config = dict(config.get("reply_engine", config) or {})
+    if mode == "chat":
+        # No scene wiki hit: this is the normal small-talk path. Give the LLM a short,
+        # bounded window so the monitor never blocks the whole chat loop for minutes.
+        llm_config["llm_timeout"] = float(llm_config.get("chat_llm_timeout", 20))
+    llm_text = call_llm_provider(prompt, llm_config)
     if llm_text:
         reply = _ensure_mention_prefix(postcheck(llm_text), mention_name)
-        return ReplyDecision(True, reply, intent="llm", risk_level="low", need_human=False,
-                             reason="llm_provider", wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits])
+        return ReplyDecision(True, reply, intent="wiki_qa" if scene_hits else "smalltalk", risk_level="low", need_human=False,
+                             reason="llm_provider_scene" if scene_hits else "llm_provider_core_chat",
+                             wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits])
 
-    reply, intent, need_human = fallback_reply(clean, wiki_hits)
+    reply, intent, need_human = fallback_reply(clean, scene_hits, mode=mode)
     return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
                          risk_level="medium" if need_human else "low",
                          need_human=need_human,
-                         reason="safe_fallback_no_provider",
+                         reason="safe_fallback_scene_no_provider" if scene_hits else "safe_fallback_core_chat_no_provider",
                          wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits])
 
 
