@@ -743,19 +743,22 @@ _LOCAL_LLM_CLIENTS: Dict[str, Any] = {}
 _LOCAL_LLM_LOCK = threading.Lock()
 
 
-def _resolve_code_root(config: Dict[str, Any]) -> Path:
-    """Resolve GenericAgent runtime root used to import llmcore in-process."""
+def _resolve_code_root(config: Dict[str, Any]) -> Path | None:
+    """Resolve external agent runtime root used to import llmcore in-process."""
     cfg_root = config.get("code_root")
     if cfg_root:
-        return Path(cfg_root).expanduser().resolve()
-    # Canonical source lives in E:/projects/GA-projects/wechat-automation-local/wechat-decrypt;
-    # default runtime root is the surrounding GenericAgent runtime/project root.
-    return Path(__file__).resolve().parents[2]
+        p = Path(cfg_root).expanduser().resolve()
+        return p if p.exists() else None
+    # Project root detection fallback: two levels up from this file.
+    p = Path(__file__).resolve().parents[2]
+    return p if p.exists() else None
 
 
 def _load_local_llm_client(config: Dict[str, Any]):
     """Build one GenericAgent llmcore client without spawning agentmain/subagent."""
     code_root = _resolve_code_root(config)
+    if code_root is None:
+        return None
     cache_key = f"{code_root}|{config.get('llm_no', 0)}"
     with _LOCAL_LLM_LOCK:
         cached = _LOCAL_LLM_CLIENTS.get(cache_key)
@@ -841,7 +844,9 @@ def _call_local_llm_provider(prompt: str, config: Dict[str, Any]) -> str | None:
 def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
     if not config.get("use_subagent", False):
         return None
-    code_root = Path(config.get("code_root") or (Path(__file__).resolve().parents[1]))
+    code_root = _resolve_code_root(config)
+    if code_root is None:
+        return None
     agentmain = code_root / "agentmain.py"
     if not agentmain.exists():
         return None
@@ -897,7 +902,7 @@ def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
 
 
 def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None) -> str | None:
-    """Optional provider hook. Prefer in-process GenericAgent llmcore in the sub-wechat runtime."""
+    """Optional provider hook. Prefer in-process llmcore client when available."""
     config = config or {}
     local = _call_local_llm_provider(prompt, config)
     if local:

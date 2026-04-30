@@ -1,0 +1,121 @@
+{
+  "poll_interval": 3,
+  "default_triggers": [
+    "@机器人名称"
+  ],
+  "default_reply_template": "",
+  "targets": [
+    {
+      "name": "示例群聊名称",
+      "username": "example_chatroom_id@chatroom",
+      "db": "message_0.db",
+      "table": "Msg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "last_local_id": 0,
+      "enabled": true,
+      "triggers": [
+        "@机器人名称"
+      ],
+      "reply_template": "",
+      "knowledge_bases": [
+        "scene.bot_testing",
+        "online.getnote.bot_testing",
+        "online.getnote.bot_testing_work"
+      ]
+    },
+    {
+      "name": "示例群聊名称",
+      "username": "example_chatroom_id@chatroom",
+      "db": "message_0.db",
+      "table": "Msg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "last_local_id": 0,
+      "enabled": true,
+      "triggers": [
+        "@机器人名称"
+      ],
+      "reply_template": "",
+      "knowledge_bases": [
+        "scene.chongqing_mobile_work",
+        "online.getnote.chongqing_mobile_work"
+      ]
+    }
+  ],
+  "wiki_dir": "./wiki",
+  "reply_engine": {
+    "provider": "cmd",
+    "command": "echo 请配置你的 LLM 命令",
+    "temperature": 0.7,
+    "max_tokens": 800
+  },
+  "context_limit": 15,
+  "send_mode": "foreground",
+  "stop_file": "wechat_bot.stop",
+  "send_confirm_timeout": 5.0,
+  "advance_on_send_failure": true,
+  "send_strategy": "single",
+  "uia_probe_enabled": false,
+  "knowledge_bases": {
+    "scene.bot_testing": {
+      "type": "local",
+      "path": "scenes/bot_testing",
+      "scope": "scene",
+      "description": "安全测试群机器人知识库",
+      "knowledge_base_id": "YOUR_KB_ID"
+    },
+    "scene.chongqing_mobile_work": {
+      "type": "local",
+      "path": "scenes/chongqing_mobile_work",
+      "scope": "scene",
+      "description": "重庆移动工作场景知识库",
+      "knowledge_base_id": "YOUR_KB_ID"
+    },
+    "online.ima.default": {
+      "type": "ima",
+      "enabled": false,
+      "api_key_env": "IMA_API_KEY",
+      "description": "IMA线上知识库占位，启用前需配置官方API参数",
+      "knowledge_base_id": "YOUR_KB_ID"
+    },
+    "online.ima.chongqing_mobile_work": {
+      "type": "ima",
+      "enabled": false,
+      "knowledge_base_id": "YOUR_KB_ID",
+      "folder_id": "folder_7454825390304070",
+      "client_id_env": "IMA_CLIENT_ID",
+      "api_key_env": "IMA_API_KEY",
+      "scope": "scene",
+      "limit": 5,
+      "description": "工作资料/中移互产品资料（已停用，保留为IMA回退配置）"
+    },
+    "online.getnote.bot_testing": {
+      "type": "getnote",
+      "enabled": true,
+      "knowledge_base_id": "YOUR_KB_ID",
+      "executable": "getnote",
+      "scope": "scene",
+      "limit": 5,
+      "timeout": 25,
+      "description": "Get笔记知识库（bot群聊测试群专用）"
+    },
+    "online.getnote.bot_testing_work": {
+      "type": "getnote",
+      "enabled": true,
+      "knowledge_base_id": "YOUR_KB_ID",
+      "executable": "getnote",
+      "scope": "scene",
+      "limit": 5,
+      "timeout": 25,
+      "description": "Get笔记/工作资料知识库（bot群聊测试群附加绑定）"
+    },
+    "online.getnote.chongqing_mobile_work": {
+      "type": "getnote",
+      "enabled": true,
+      "knowledge_base_id": "YOUR_KB_ID",
+      "executable": "getnote",
+      "scope": "scene",
+      "limit": 5,
+      "timeout": 25,
+      "description": "Get笔记/工作资料知识库（重生之我在重庆移动当牛做马群专用）"
+    }
+  },
+  "pyweixin_first": true
+}
