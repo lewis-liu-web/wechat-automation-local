@@ -203,6 +203,35 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
 
 **[查看使用案例 →](USAGE.md)**
 
+### 群聊机器人知识库接入
+
+`manage_targets.py` 支持把本地目录或任意线上知识库别名绑定到群聊。线上知识库推荐使用通用 `hook` 类型：本项目只负责在回复前调用一个适配器，具体接哪家知识库由用户自己的 agent/脚本完成。
+
+1. 准备一个适配器可执行文件，例如 `kb_adapter.bat` / `kb_adapter.py` / 二进制程序。
+2. 适配器从环境变量读取：
+   - `KB_QUERY`：自然语言查询文本
+   - `KB_ID`：外部知识库 ID，可选
+   - `KB_LIMIT`：期望返回条数
+3. 适配器向 stdout 输出 JSON：
+
+```json
+{
+  "results": [
+    {"id": "doc-1", "title": "标题", "source": "可选来源", "content": "召回内容"}
+  ]
+}
+```
+
+注册并绑定到群：
+
+```bash
+python manage_targets.py kb-add online_docs --type hook --executable C:\path\to\kb_adapter.bat --kid your_kb_id --limit 5
+python manage_targets.py kb 群名 online_docs
+python manage_targets.py kb-info online_docs
+```
+
+运行时如果 hook 超时、报错或输出格式不合法，会降级为空结果，不影响本地 core 边界与普通回复流程。
+
 ### 图片解密 (V2 格式)
 
 微信 4.0 (2025-08+) 的 .dat 图片文件使用 AES-128-ECB + XOR 混合加密 (V2 格式)。AES 密钥需要从运行中的微信进程内存中提取：

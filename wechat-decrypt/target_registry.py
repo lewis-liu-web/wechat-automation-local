@@ -382,6 +382,17 @@ def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=No
             spec["limit"] = int(limit)
         if timeout is not None:
             spec["timeout"] = int(timeout)
+    elif kb_type == "hook":
+        if not executable:
+            raise ValueError("--executable is required for hook knowledge base")
+        spec["executable"] = executable
+        if knowledge_base_id:
+            spec["knowledge_base_id"] = knowledge_base_id
+        spec["scope"] = scope or "scene"
+        if limit is not None:
+            spec["limit"] = int(limit)
+        if timeout is not None:
+            spec["timeout"] = int(timeout)
     elif kb_type == "local":
         if not path:
             raise ValueError("--path is required for local knowledge base")

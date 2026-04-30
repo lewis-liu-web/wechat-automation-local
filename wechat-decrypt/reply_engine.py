@@ -593,6 +593,65 @@ def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[K
             break
     return out
 
+def _retrieve_hook_kb(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
+    """
+    Generic hook adapter for any external knowledge provider.
+
+    Contract:
+    - spec["executable"] or spec["cli"] points to the adapter script/binary.
+    - The adapter receives query via KB_QUERY, kb_id via KB_ID, limit via KB_LIMIT env vars.
+    - Adapter prints JSON to stdout: {"results": [{"title", "content", "source", "id"}, ...]}
+    - Degrades to [] on any error so local core boundaries remain active.
+    """
+    kb_id = str(spec.get("knowledge_base_id") or spec.get("kb_id") or spec.get("id") or "").strip()
+    exe = str(spec.get("executable") or spec.get("cli") or "").strip()
+    if not exe:
+        return []
+    try:
+        per_limit = max(1, min(int(limit or spec.get("limit") or 5), 10))
+    except Exception:
+        per_limit = 5
+    env = os.environ.copy()
+    env["KB_QUERY"] = query or ""
+    if kb_id:
+        env["KB_ID"] = kb_id
+    env["KB_LIMIT"] = str(per_limit)
+    timeout = float(spec.get("timeout") or 25)
+    try:
+        proc = subprocess.run([exe], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    except Exception:
+        return []
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return []
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    items = data.get("results") or data.get("notes") or []
+    if not isinstance(items, list):
+        return []
+    out: List[KnowledgeHit] = []
+    max_chars = int(spec.get("hit_max_chars") or 6000)
+    scope = str(spec.get("scope") or "online")
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        note_id = str(item.get("id") or item.get("note_id") or f"result_{idx + 1}")
+        title = str(item.get("title") or "").strip()
+        content = str(item.get("content") or item.get("summary") or "").strip()
+        source = str(item.get("source") or "").strip()
+        body = "\n".join(x for x in [title, source, content] if x).strip()
+        if not body:
+            continue
+        rel = note_id if not title else f"{note_id}/{title[:80]}"
+        out.append(KnowledgeHit("hook", kb_id, scope, rel, body[:max_chars], max(1, per_limit - len(out))))
+        if len(out) >= per_limit:
+            break
+    return out
+
 def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
     core_hits: List[KnowledgeHit] = []
@@ -620,6 +679,8 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
             batch = _retrieve_ima_kb(query, spec, per_limit)
         elif typ == "getnote":
             batch = _retrieve_getnote_kb(query, spec, per_limit)
+        elif typ == "hook":
+            batch = _retrieve_hook_kb(query, spec, per_limit)
         for h in batch:
             if h.scope == "core" or str(h.rel_path).startswith("core/"):
                 core_hits.append(h)

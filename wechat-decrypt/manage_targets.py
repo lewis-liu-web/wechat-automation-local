@@ -265,11 +265,11 @@ def main(argv=None):
     # kb-add = create/update knowledge base alias
     p = sub.add_parser("kb-add", aliases=["wiki-add"], help="create a knowledge base alias for binding to groups")
     p.add_argument("id", help="alias used by 'kb', e.g. canteen or workdocs")
-    p.add_argument("--type", choices=["getnote", "local"], default="getnote")
-    p.add_argument("--kid", "--knowledge-base-id", dest="knowledge_base_id", help="external GetNote knowledge_base_id")
+    p.add_argument("--type", choices=["getnote", "local", "hook"], default="getnote")
+    p.add_argument("--kid", "--knowledge-base-id", dest="knowledge_base_id", help="external provider knowledge base id (optional for --type hook; required for getnote)")
     p.add_argument("--path", help="local wiki path for --type local")
     p.add_argument("--description", "--desc", default="")
-    p.add_argument("--executable", help="getnote executable path; default provider setting is used when omitted")
+    p.add_argument("--executable", help="adapter executable path for --type hook/getnote")
     p.add_argument("--scope", default="scene")
     p.add_argument("--limit", type=int)
     p.add_argument("--timeout", type=int)
@@ -554,6 +554,10 @@ def main(argv=None):
                 elif info.get("type") == "getnote":
                     safe_print("外部ID: %s" % info.get("knowledge_base_id"))
                     safe_print("可执行文件: %s" % (info.get("executable") or "默认"))
+                elif info.get("type") == "hook":
+                    safe_print("外部ID: %s" % (info.get("knowledge_base_id") or "(未设置)"))
+                    safe_print("适配器: %s" % (info.get("executable") or info.get("cli") or "(未设置)"))
+                    safe_print("调用约定: 环境变量 KB_QUERY/KB_ID/KB_LIMIT，stdout 输出 JSON results")
             return 0
 
         # -- kb / bind-wiki --
