@@ -337,3 +337,60 @@ def list_items(kind="all", config_path=CONFIG_PATH, candidates_path=CANDIDATES_P
     cfg = load_config(config_path)
     data = load_candidates(candidates_path)
     return {"targets": cfg.get("targets", []), "candidates": data.get("candidates", [])}
+
+
+def list_groups(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
+    """Return a merged group view for CLI display.
+
+    Candidates and configured targets are merged by username.  Pending groups remain
+    visible after a target is configured, with an explicit listen_enabled column.
+    """
+    cfg = load_config(config_path)
+    data = load_candidates(candidates_path)
+    by_user = {}
+
+    def ensure(username):
+        if username not in by_user:
+            by_user[username] = {
+                "status": "",
+                "listen_enabled": False,
+                "name": username,
+                "username": username,
+                "db": "",
+                "last_local_id": "",
+                "last_message_time": "",
+                "knowledge_bases": "",
+            }
+        return by_user[username]
+
+    for c in data.get("candidates", []):
+        username = c.get("username")
+        if not username or c.get("type") != "group":
+            continue
+        row = ensure(username)
+        row.update({
+            "status": c.get("status") or "pending",
+            "name": c.get("name") or username,
+            "db": c.get("db") or "",
+            "last_local_id": c.get("last_local_id") or "",
+            "last_message_time": c.get("last_message_time_text") or "",
+        })
+
+    for t in cfg.get("targets", []):
+        username = t.get("username")
+        if not username or not str(username).endswith("@chatroom"):
+            continue
+        row = ensure(username)
+        row.update({
+            "status": "enabled" if t.get("enabled", True) else "disabled",
+            "listen_enabled": bool(t.get("enabled", True)),
+            "name": t.get("name") or row.get("name") or username,
+            "db": t.get("db") or row.get("db") or "",
+            "last_local_id": t.get("last_local_id") or row.get("last_local_id") or "",
+            "knowledge_bases": ",".join(t.get("knowledge_bases") or []),
+        })
+
+    rows = list(by_user.values())
+    rows.sort(key=lambda r: (0 if r.get("status") == "pending" else 1, str(r.get("last_message_time") or "")), reverse=False)
+    return rows
+
