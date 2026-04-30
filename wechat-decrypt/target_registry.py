@@ -346,11 +346,81 @@ def set_enabled(key, enabled, config_path=CONFIG_PATH):
     return t
 
 
+def list_knowledge_bases(config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    rows = []
+    for kb_id, spec in sorted((cfg.get("knowledge_bases") or {}).items()):
+        spec = spec or {}
+        rows.append({
+            "id": kb_id,
+            "type": spec.get("type") or "local",
+            "enabled": spec.get("enabled", True),
+            "knowledge_base_id": spec.get("knowledge_base_id") or "",
+            "path": spec.get("path") or spec.get("dir") or "",
+            "description": spec.get("description") or "",
+        })
+    return rows
+
+
+def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=None, description="",
+                       executable=None, scope="scene", limit=None, timeout=None,
+                       enabled=True, replace=False, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    cfg.setdefault("knowledge_bases", {})
+    if kb_id in cfg["knowledge_bases"] and not replace:
+        raise ValueError("knowledge base already exists: %s (use --replace to update)" % kb_id)
+    spec = {"type": kb_type, "enabled": bool(enabled)}
+    if kb_type == "getnote":
+        if not knowledge_base_id:
+            raise ValueError("--kid/--knowledge-base-id is required for getnote knowledge base")
+        spec["knowledge_base_id"] = knowledge_base_id
+        if executable:
+            spec["executable"] = executable
+        spec["scope"] = scope or "scene"
+        if limit is not None:
+            spec["limit"] = int(limit)
+        if timeout is not None:
+            spec["timeout"] = int(timeout)
+    elif kb_type == "local":
+        if not path:
+            raise ValueError("--path is required for local knowledge base")
+        spec["path"] = path
+        spec["scope"] = scope or "scene"
+    else:
+        raise ValueError("unsupported knowledge base type: %s" % kb_type)
+    if description:
+        spec["description"] = description
+    cfg["knowledge_bases"][kb_id] = spec
+    save_json_atomic(config_path, cfg)
+    out = dict(spec)
+    out["id"] = kb_id
+    return out
+
+
+def _unknown_kb_message(kb, cfg):
+    for known_id, spec in (cfg.get("knowledge_bases") or {}).items():
+        if str((spec or {}).get("knowledge_base_id") or "") == str(kb):
+            return "unknown knowledge base id: %s. Did you mean configured alias '%s'? Use: python manage_targets.py kb <群名> %s" % (kb, known_id, known_id)
+    return "unknown knowledge base id: %s. Run 'python manage_targets.py kb-list' or create one with 'python manage_targets.py kb-add <别名> --kid <外部知识库ID>'" % kb
+
+
+def validate_knowledge_bases(knowledge_bases, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    known = cfg.get("knowledge_bases") or {}
+    for kb in knowledge_bases or []:
+        if str(kb).startswith("legacy:"):
+            continue
+        if kb not in known:
+            raise ValueError(_unknown_kb_message(kb, cfg))
+    return True
+
+
 def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     t = find_target(cfg, key)
     if not t:
         raise ValueError("target not found: %s" % key)
+    validate_knowledge_bases(knowledge_bases, config_path=config_path)
     if replace:
         t["knowledge_bases"] = list(knowledge_bases)
     else:

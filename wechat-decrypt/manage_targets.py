@@ -258,8 +258,26 @@ def main(argv=None):
     p.add_argument("key")
     p.add_argument("--json", action="store_true")
 
+    # kb-list = list configured knowledge bases
+    p = sub.add_parser("kb-list", aliases=["kbs", "wiki-list"], help="list configured knowledge base aliases")
+    p.add_argument("--json", action="store_true")
+
+    # kb-add = create/update knowledge base alias
+    p = sub.add_parser("kb-add", aliases=["wiki-add"], help="create a knowledge base alias for binding to groups")
+    p.add_argument("id", help="alias used by 'kb', e.g. canteen or workdocs")
+    p.add_argument("--type", choices=["getnote", "local"], default="getnote")
+    p.add_argument("--kid", "--knowledge-base-id", dest="knowledge_base_id", help="external GetNote knowledge_base_id")
+    p.add_argument("--path", help="local wiki path for --type local")
+    p.add_argument("--description", "--desc", default="")
+    p.add_argument("--executable", help="getnote executable path; default provider setting is used when omitted")
+    p.add_argument("--scope", default="scene")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--timeout", type=int)
+    p.add_argument("--replace", action="store_true", help="update alias if it already exists")
+    p.add_argument("--json", action="store_true")
+
     # kb = bind-wiki
-    p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind one or more knowledge bases to a target")
+    p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind one or more knowledge base aliases to a target")
     p.add_argument("key")
     p.add_argument("wiki", nargs="+")
     p.add_argument("--replace", action="store_true")
@@ -413,6 +431,46 @@ def main(argv=None):
                     safe_print("监听进程运行中，变更会在下一轮轮询生效。")
                 else:
                     safe_print("监听进程未运行，请执行：python manage_targets.py start")
+            return 0
+
+        # -- kb-list / kbs --
+        if cmd in ("kb-list", "kbs", "wiki-list"):
+            rows = reg.list_knowledge_bases()
+            if args.json:
+                print_json({"count": len(rows), "knowledge_bases": rows})
+            else:
+                htransform = {
+                    "id": "别名",
+                    "type": "类型",
+                    "enabled": "启用",
+                    "knowledge_base_id": "外部ID",
+                    "path": "路径",
+                    "description": "说明",
+                }
+                print_table(rows, ["id", "type", "enabled", "knowledge_base_id", "path", "description"], htransform=htransform)
+                safe_print("\n绑定示例：python manage_targets.py kb \"群名\" <别名> --replace")
+                safe_print("创建示例：python manage_targets.py kb-add canteen --kid <GetNote知识库ID> --description \"食堂菜品知识库\"")
+            return 0
+
+        # -- kb-add / wiki-add --
+        if cmd in ("kb-add", "wiki-add"):
+            out = reg.add_knowledge_base(
+                args.id,
+                kb_type=args.type,
+                knowledge_base_id=args.knowledge_base_id,
+                path=args.path,
+                description=args.description,
+                executable=args.executable,
+                scope=args.scope,
+                limit=args.limit,
+                timeout=args.timeout,
+                replace=args.replace,
+            )
+            if args.json:
+                print_json({"ok": True, "knowledge_base": out})
+            else:
+                safe_print("已创建/更新知识库别名: %s" % out.get("id"))
+                safe_print("下一步绑定到群：python manage_targets.py kb \"群名\" %s --replace" % out.get("id"))
             return 0
 
         # -- kb / bind-wiki --
