@@ -276,6 +276,27 @@ def main(argv=None):
     p.add_argument("--replace", action="store_true", help="update alias if it already exists")
     p.add_argument("--json", action="store_true")
 
+    # kb-local = create local directory-backed knowledge base
+    p = sub.add_parser("kb-local", aliases=["wiki-local"], help="create a local directory-backed knowledge base")
+    p.add_argument("id", help="alias used by 'kb', e.g. canteen")
+    p.add_argument("--description", "--desc", default="")
+    p.add_argument("--replace", action="store_true", help="update alias if it already exists")
+    p.add_argument("--json", action="store_true")
+
+    # kb-import = copy files into a local knowledge base
+    p = sub.add_parser("kb-import", aliases=["wiki-import"], help="copy a file or directory into a local knowledge base")
+    p.add_argument("id", help="local knowledge base alias")
+    p.add_argument("source", help="file or directory to copy into the knowledge base")
+    p.add_argument("--json", action="store_true")
+
+    # kb-open/info = manage local knowledge base contents
+    p = sub.add_parser("kb-open", aliases=["wiki-open"], help="open a local knowledge base directory")
+    p.add_argument("id", help="local knowledge base alias")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("kb-info", aliases=["wiki-info"], help="show knowledge base details and file stats")
+    p.add_argument("id", help="knowledge base alias")
+    p.add_argument("--json", action="store_true")
+
     # kb = bind-wiki
     p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind one or more knowledge base aliases to a target")
     p.add_argument("key")
@@ -471,6 +492,68 @@ def main(argv=None):
             else:
                 safe_print("已创建/更新知识库别名: %s" % out.get("id"))
                 safe_print("下一步绑定到群：python manage_targets.py kb \"群名\" %s --replace" % out.get("id"))
+            return 0
+
+        # -- kb-local / wiki-local --
+        if cmd in ("kb-local", "wiki-local"):
+            out = reg.create_local_kb_dir(args.id, description=args.description, replace=args.replace)
+            if args.json:
+                print_json({"ok": True, "knowledge_base": out})
+            else:
+                safe_print("已创建本地知识库: %s" % out.get("id"))
+                safe_print("目录: %s" % out.get("path"))
+                safe_print("\n接下来你可以:")
+                safe_print("  1. 把 .md/.txt/.pdf/.docx 文件放入该目录")
+                safe_print("  2. python manage_targets.py kb-import %s <文件或目录>" % out.get("id"))
+                safe_print("  3. python manage_targets.py kb \"群名\" %s --replace" % out.get("id"))
+                safe_print("\n或打开目录手动管理:")
+                safe_print("  python manage_targets.py kb-open %s" % out.get("id"))
+            return 0
+
+        # -- kb-import / wiki-import --
+        if cmd in ("kb-import", "wiki-import"):
+            copied = reg.import_kb_file(args.id, args.source)
+            if args.json:
+                print_json({"ok": True, "copied": copied})
+            else:
+                safe_print("已导入 %d 个文件到知识库 '%s':" % (len(copied), args.id))
+                for c in copied:
+                    safe_print("  %s" % c)
+                safe_print("\n绑定到群:")
+                safe_print("  python manage_targets.py kb \"群名\" %s --replace" % args.id)
+            return 0
+
+        # -- kb-open / wiki-open --
+        if cmd in ("kb-open", "wiki-open"):
+            path = reg.open_kb_dir(args.id)
+            if args.json:
+                print_json({"ok": True, "path": path})
+            else:
+                safe_print("已打开目录: %s" % path)
+            return 0
+
+        # -- kb-info / wiki-info --
+        if cmd in ("kb-info", "wiki-info"):
+            info = reg.get_kb_info(args.id)
+            if not info:
+                if args.json:
+                    print_json({"ok": False, "message": "知识库不存在: %s" % args.id})
+                else:
+                    safe_print("知识库不存在: %s" % args.id)
+                return 1
+            if args.json:
+                print_json({"ok": True, "knowledge_base": info})
+            else:
+                safe_print("[%s] %s" % (info.get("type"), info.get("id")))
+                safe_print("说明: %s" % info.get("description", ""))
+                if info.get("type") == "local":
+                    safe_print("路径: %s" % info.get("path"))
+                    safe_print("目录存在: %s" % ("是" if info.get("exists") else "否"))
+                    safe_print("文档文件数: %d" % info.get("file_count", 0))
+                    safe_print("总文件数: %d" % info.get("total_files", 0))
+                elif info.get("type") == "getnote":
+                    safe_print("外部ID: %s" % info.get("knowledge_base_id"))
+                    safe_print("可执行文件: %s" % (info.get("executable") or "默认"))
             return 0
 
         # -- kb / bind-wiki --

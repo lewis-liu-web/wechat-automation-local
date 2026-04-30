@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -431,6 +432,109 @@ def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
         t["knowledge_bases"] = cur
     save_json_atomic(config_path, cfg)
     return t
+
+
+def _wiki_root():
+    return ROOT / "wiki"
+
+
+def create_local_kb_dir(kb_id, description="", replace=False, config_path=CONFIG_PATH):
+    """Create a local directory-based knowledge base and register it."""
+    if not kb_id:
+        raise ValueError("知识库名称不能为空")
+    kb_id = str(kb_id).strip()
+    cfg = load_config(config_path)
+    kbs = cfg.setdefault("knowledge_bases", {})
+    if kb_id in kbs and not replace:
+        raise ValueError("知识库别名已存在: %s (使用 --replace 覆盖)" % kb_id)
+    base_dir = _wiki_root() / kb_id
+    base_dir.mkdir(parents=True, exist_ok=True)
+    spec = {
+        "id": kb_id,
+        "type": "local",
+        "path": str(base_dir.resolve()),
+        "description": description or "本地知识库: %s" % kb_id,
+        "enabled": True,
+    }
+    kbs[kb_id] = spec
+    save_json_atomic(config_path, cfg)
+    return spec
+
+
+def get_kb_info(kb_id, config_path=CONFIG_PATH):
+    """Return knowledge base info including file stats for local dirs."""
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        return None
+    info = dict(spec)
+    if spec.get("type") == "local":
+        p = Path(spec.get("path") or "")
+        if not p.exists() or not p.is_dir():
+            info["file_count"] = 0
+            info["exists"] = False
+        else:
+            files = list(p.rglob("*"))
+            docs = [f for f in files if f.is_file() and f.suffix.lower() in {".md", ".txt", ".pdf", ".docx", ".csv", ".json"}]
+            info["file_count"] = len(docs)
+            info["total_files"] = len([f for f in files if f.is_file()])
+            info["exists"] = True
+    return info
+
+
+def import_kb_file(kb_id, source_path, config_path=CONFIG_PATH):
+    """Copy a file or directory into a local knowledge base."""
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("type") != "local":
+        raise ValueError("仅支持导入本地知识库: %s" % kb_id)
+    dst = Path(spec.get("path") or "")
+    if not dst.exists():
+        dst.mkdir(parents=True, exist_ok=True)
+    src = Path(source_path)
+    if not src.exists():
+        raise ValueError("源路径不存在: %s" % source_path)
+    copied = []
+    if src.is_file():
+        tgt = dst / src.name
+        shutil.copy2(str(src), str(tgt))
+        copied.append(str(tgt))
+    elif src.is_dir():
+        for item in src.rglob("*"):
+            if item.is_file():
+                rel = item.relative_to(src)
+                tgt = dst / rel
+                tgt.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(item), str(tgt))
+                copied.append(str(tgt))
+    else:
+        raise ValueError("不支持的源路径类型: %s" % source_path)
+    return copied
+
+
+def open_kb_dir(kb_id, config_path=CONFIG_PATH):
+    """Open local knowledge base directory in file manager."""
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("type") != "local":
+        raise ValueError("仅支持打开本地知识库目录: %s" % kb_id)
+    p = Path(spec.get("path") or "")
+    if not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+    import platform
+    import subprocess
+    system = platform.system()
+    if system == "Windows":
+        subprocess.Popen(["explorer", str(p)])
+    elif system == "Darwin":
+        subprocess.Popen(["open", str(p)])
+    else:
+        subprocess.Popen(["xdg-open", str(p)])
+    return str(p)
 
 
 def list_items(kind="all", config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
