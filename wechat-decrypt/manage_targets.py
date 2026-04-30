@@ -154,8 +154,8 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
 
     # on = enable
-    p = sub.add_parser("on", aliases=["enable"], help="enable a pending candidate by name or username")
-    p.add_argument("key")
+    p = sub.add_parser("on", aliases=["enable"], help="enable a pending/disabled target by name or username")
+    p.add_argument("key", nargs="?", help="group name or username; omit to show pending groups")
     p.add_argument("--wiki", action="append", default=[], help="knowledge base id; can repeat")
     p.add_argument("--json", action="store_true")
 
@@ -236,6 +236,23 @@ def main(argv=None):
 
         # -- on / enable --
         if cmd in ("on", "enable"):
+            if not args.key:
+                if args.json:
+                    rows = reg.list_groups()
+                    rows = [r for r in rows if r.get("status") in ("pending", "disabled") or not r.get("listen_enabled")]
+                    print_json({"ok": False, "message": "missing key", "hint": "python manage_targets.py on <群名或微信ID>", "groups": rows})
+                else:
+                    safe_print("缺少群名或微信ID。用法：")
+                    safe_print("  python manage_targets.py on \"群名\"")
+                    safe_print("  python manage_targets.py on \"45915981826@chatroom\"")
+                    safe_print("\n可启用/重新启用的群：")
+                    rows = reg.list_groups()
+                    rows = [r for r in rows if r.get("status") in ("pending", "disabled") or not r.get("listen_enabled")]
+                    if rows:
+                        print_table(rows, ["status", "listen_enabled", "name", "username"], htransform={"status": "状态", "listen_enabled": "监听", "name": "名称", "username": "微信ID"})
+                    else:
+                        safe_print("(empty)")
+                return 2
             out = reg.enable_candidate(args.key, knowledge_bases=args.wiki)
             if args.json:
                 print_json(out)

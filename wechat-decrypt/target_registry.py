@@ -276,15 +276,45 @@ def find_candidate(data, key):
 
 def enable_candidate(key, knowledge_bases=None, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
     cfg = load_config(config_path)
-    if find_target(cfg, key):
-        raise ValueError("target already configured: %s" % key)
     data = load_candidates(candidates_path)
+
+    existing = find_target(cfg, key)
+    if existing:
+        existing["enabled"] = True
+        if knowledge_bases:
+            cur = list(existing.get("knowledge_bases") or [])
+            for kb in knowledge_bases:
+                if kb not in cur:
+                    cur.append(kb)
+            existing["knowledge_bases"] = cur
+        cand = find_candidate(data, existing.get("username") or key)
+        if cand:
+            cand["status"] = "enabled"
+            cand["updated_at"] = now_text()
+            data["updated_at"] = now_text()
+            save_json_atomic(candidates_path, data)
+        save_json_atomic(config_path, cfg)
+        return existing
+
     cand = find_candidate(data, key)
     if not cand:
         raise ValueError("candidate not found: %s (run discover first)" % key)
     username = cand["username"]
-    if find_target(cfg, username):
-        raise ValueError("target already configured: %s" % username)
+    existing = find_target(cfg, username)
+    if existing:
+        existing["enabled"] = True
+        if knowledge_bases:
+            cur = list(existing.get("knowledge_bases") or [])
+            for kb in knowledge_bases:
+                if kb not in cur:
+                    cur.append(kb)
+            existing["knowledge_bases"] = cur
+        cand["status"] = "enabled"
+        cand["updated_at"] = now_text()
+        data["updated_at"] = now_text()
+        save_json_atomic(config_path, cfg)
+        save_json_atomic(candidates_path, data)
+        return existing
     target = {
         "name": cand.get("name") or username,
         "username": username,
