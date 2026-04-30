@@ -29,20 +29,30 @@ WAL_FRAME_HEADER_SZ = 24
 
 # ============ 配置加载 ============
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+CONFIG_FILE = os.environ.get("WECHAT_MCP_CONFIG") or os.path.join(SCRIPT_DIR, "config.json")
 
-with open(CONFIG_FILE, encoding="utf-8") as f:
-    _cfg = json.load(f)
+_DEFAULT_CFG = {
+    "db_dir": os.path.join(SCRIPT_DIR, "db_storage"),
+    "keys_file": "all_keys.json",
+    "decrypted_dir": "decrypted",
+    "wechat_process": "Weixin.exe",
+}
+try:
+    with open(CONFIG_FILE, encoding="utf-8") as f:
+        _cfg = json.load(f)
+except FileNotFoundError:
+    # Keep the module importable in fresh clones and unit tests without private config.
+    _cfg = dict(_DEFAULT_CFG)
 for _key in ("keys_file", "decrypted_dir"):
     if _key in _cfg and not os.path.isabs(_cfg[_key]):
         _cfg[_key] = os.path.join(SCRIPT_DIR, _cfg[_key])
 
-DB_DIR = _cfg["db_dir"]
-KEYS_FILE = _cfg["keys_file"]
-DECRYPTED_DIR = _cfg["decrypted_dir"]
+DB_DIR = _cfg.get("db_dir") or _DEFAULT_CFG["db_dir"]
+KEYS_FILE = _cfg.get("keys_file") or os.path.join(SCRIPT_DIR, _DEFAULT_CFG["keys_file"])
+DECRYPTED_DIR = _cfg.get("decrypted_dir") or os.path.join(SCRIPT_DIR, _DEFAULT_CFG["decrypted_dir"])
 
 # 图片相关路径
-_db_dir = _cfg["db_dir"]
+_db_dir = DB_DIR
 if os.path.basename(_db_dir) == "db_storage":
     WECHAT_BASE_DIR = os.path.dirname(_db_dir)
 else:
@@ -54,8 +64,12 @@ if not DECODED_IMAGE_DIR:
 elif not os.path.isabs(DECODED_IMAGE_DIR):
     DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, DECODED_IMAGE_DIR)
 
-with open(KEYS_FILE, encoding="utf-8") as f:
-    ALL_KEYS = strip_key_metadata(json.load(f))
+try:
+    with open(KEYS_FILE, encoding="utf-8") as f:
+        ALL_KEYS = strip_key_metadata(json.load(f))
+except FileNotFoundError:
+    # No private key file in a packaged checkout; runtime decrypt calls will simply miss.
+    ALL_KEYS = {}
 
 # ============ 解密函数 ============
 
