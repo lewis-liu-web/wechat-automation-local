@@ -21,6 +21,95 @@ ROOT = Path(__file__).resolve().parent
 MONITOR_SCRIPT = ROOT / "wechat_bot_monitor.py"
 STOP_FILE = ROOT / (reg.load_config().get("stop_file") or "wechat_bot_monitor.stop")
 
+INIT_SCRIPT = ROOT / "config.py"
+KEY_SCRIPT = ROOT / "find_all_keys_windows.py" if (ROOT / "find_all_keys_windows.py").exists() else ROOT / "find_all_keys.py"
+DECRYPT_SCRIPT = ROOT / "decrypt_db.py"
+ADMIN_SETUP_SCRIPT = ROOT / "admin_extract_and_decrypt.py"
+
+
+# ------------------------------------------------------------------
+# Decrypt / key extraction helpers
+# ------------------------------------------------------------------
+def _run_script(script, extra_args=None):
+    extra_args = list(extra_args or [])
+    cmd = [sys.executable, str(script)] + extra_args
+    safe_print("$ " + " ".join([Path(cmd[0]).name] + [str(x) for x in cmd[1:]]))
+    return subprocess.run(cmd, cwd=str(ROOT)).returncode
+
+
+def cmd_init(json_mode=False):
+    """Initialize config.json by loading config.auto-detection."""
+    from config import load_config
+    cfg = load_config()
+    out = {
+        "ok": True,
+        "db_dir": cfg.get("db_dir"),
+        "keys_file": cfg.get("keys_file"),
+        "decrypted_dir": cfg.get("decrypted_dir"),
+        "message": "微信数据库配置已初始化/确认。",
+    }
+    if json_mode:
+        print_json(out)
+    else:
+        safe_print(out["message"])
+        safe_print("db_dir: %s" % out["db_dir"])
+        safe_print("keys_file: %s" % out["keys_file"])
+        safe_print("decrypted_dir: %s" % out["decrypted_dir"])
+        safe_print("下一步：python manage_targets.py key  # 提取数据库密钥")
+        safe_print("或：  python manage_targets.py setup  # 提钥并解密全部数据库")
+    return 0
+
+
+def cmd_key(json_mode=False):
+    if json_mode:
+        safe_print(json.dumps({"ok": True, "action": "extract_keys", "script": str(KEY_SCRIPT)}, ensure_ascii=False))
+    safe_print("开始从微信进程提取数据库密钥；请确保微信已启动并登录。")
+    safe_print("注意：控制台/日志不应打印完整密钥；密钥文件仅保留在本机运行目录。")
+    return _run_script(KEY_SCRIPT)
+
+
+def cmd_dec(target_db=None, out_dir=None, keys_file=None, db_dir=None, json_mode=False):
+    args = []
+    if target_db:
+        args += ["--db", target_db]
+    if out_dir:
+        args += ["--out-dir", out_dir]
+    if keys_file:
+        args += ["--keys-file", keys_file]
+    if db_dir:
+        args += ["--db-dir", db_dir]
+    if json_mode:
+        safe_print(json.dumps({"ok": True, "action": "decrypt", "script": str(DECRYPT_SCRIPT), "args": args}, ensure_ascii=False))
+    safe_print("开始解密微信数据库。若提示缺少密钥，请先执行：python manage_targets.py key")
+    return _run_script(DECRYPT_SCRIPT, args)
+
+
+def cmd_setup(admin=False, json_mode=False):
+    if admin:
+        safe_print("开始管理员一键提钥+解密流程。必要时请用管理员权限运行当前终端。")
+        if json_mode:
+            safe_print(json.dumps({"ok": True, "action": "admin_setup", "script": str(ADMIN_SETUP_SCRIPT)}, ensure_ascii=False))
+        return _run_script(ADMIN_SETUP_SCRIPT)
+    safe_print("开始初始化 + 提取密钥 + 解密全部数据库。")
+    code = cmd_init(json_mode=False)
+    if code != 0:
+        return code
+    code = cmd_key(json_mode=False)
+    if code != 0:
+        safe_print("提取密钥失败；请确认微信已启动/登录，必要时以管理员权限运行：python manage_targets.py setup --admin")
+        return code
+    code = cmd_dec(json_mode=False)
+    if code == 0:
+        safe_print("完成。下一步可执行：python manage_targets.py scan 发现群；python manage_targets.py start 启动监听。")
+    return code
+
+
+def cmd_refresh(force=False, json_mode=False):
+    args = ["--force"] if force else []
+    if json_mode:
+        args.append("--json")
+    return _run_script(ROOT / "fast_refresh_targets.py", args)
+
 
 # ------------------------------------------------------------------
 # Monitor process helpers
@@ -176,6 +265,28 @@ def main(argv=None):
     p.add_argument("--replace", action="store_true")
     p.add_argument("--json", action="store_true")
 
+    # db decrypt lifecycle
+    p = sub.add_parser("init", aliases=["cfg"], help="initialize/confirm config.json and auto-detected db_dir")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("key", aliases=["keys"], help="extract WeChat database keys from running WeChat process")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("dec", aliases=["decrypt"], help="decrypt WeChat databases")
+    p.add_argument("--db", dest="target_db", help="only decrypt one relative DB, e.g. message/message_0.db")
+    p.add_argument("--out-dir", help="output directory; default from config.json")
+    p.add_argument("--keys-file", help="keys json path; default from config.json")
+    p.add_argument("--db-dir", help="raw db_storage path; default from config.json")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("setup", aliases=["bootstrap"], help="init + extract keys + decrypt all databases")
+    p.add_argument("--admin", action="store_true", help="run admin_extract_and_decrypt.py one-shot helper")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("refresh", aliases=["rf"], help="refresh only enabled target message DBs")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--json", action="store_true")
+
     # process control
     p = sub.add_parser("start", help="start monitor process")
     p.add_argument("--json", action="store_true")
@@ -190,6 +301,18 @@ def main(argv=None):
     cmd = args.cmd
 
     try:
+        # -- db decrypt lifecycle --
+        if cmd in ("init", "cfg"):
+            return cmd_init(json_mode=args.json)
+        if cmd in ("key", "keys"):
+            return cmd_key(json_mode=args.json)
+        if cmd in ("dec", "decrypt"):
+            return cmd_dec(target_db=args.target_db, out_dir=args.out_dir, keys_file=args.keys_file, db_dir=args.db_dir, json_mode=args.json)
+        if cmd in ("setup", "bootstrap"):
+            return cmd_setup(admin=args.admin, json_mode=args.json)
+        if cmd in ("refresh", "rf"):
+            return cmd_refresh(force=args.force, json_mode=args.json)
+
         # -- process control --
         if cmd in ("start",):
             return cmd_start(json_mode=args.json)
