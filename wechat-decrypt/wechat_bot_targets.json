@@ -16,7 +16,8 @@
       "triggers": [],
       "reply_template": "",
       "knowledge_bases": [
-        "scene.bot_testing"
+        "scene.bot_testing",
+        "online.getnote.bot_testing"
       ]
     },
     {
@@ -81,6 +82,16 @@
       "scope": "scene",
       "limit": 5,
       "description": "工作资料/中移互产品资料（已停用，保留为IMA回退配置）"
+    },
+    "online.getnote.bot_testing": {
+      "type": "getnote",
+      "enabled": true,
+      "knowledge_base_id": "Q0QR9zbJ",
+      "executable": "D:\\Program Files\\GenericAgent\\GenericAgent-main\\temp\\getnote_bin\\getnote.exe",
+      "scope": "scene",
+      "limit": 5,
+      "timeout": 25,
+      "description": "Get笔记知识库（bot群聊测试群专用）"
     },
     "online.getnote.chongqing_mobile_work": {
       "type": "getnote",

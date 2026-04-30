@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Tuple
@@ -304,15 +305,11 @@ def _ima_query_variants(query: str, limit: int = 8) -> List[str]:
     focused_clean = re.sub(r"[，,。！？!?:：；;、]+", " ", focused_clean)
     add(clean)
     add(focused_clean)
-    for m in re.finditer(r"[A-Za-z0-9\u4e00-\u9fff]{2,20}(?:产品|业务|方案|材料|培训|办公|真实号|工作号)", focused_clean):
+    for m in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:产品|业务|方案|材料|培训|办公|真实号|工作号)", focused_clean):
         phrase = m.group(0)
         phrase = re.sub(r"^(是|的|让|给|把|找|讲|说)+", "", phrase)
         phrase = re.sub(r"(资料|材料|介绍)+$", "", phrase)
         add(phrase)
-        # IMA search may miss a product phrase when the user appends generic
-        # category words (observed: "AI语音质检产品" -> 0, "AI语音质检" -> hit).
-        trimmed = re.sub(r"(产品|业务|方案|资料|材料|介绍)+$", "", phrase).strip()
-        add(trimmed)
 
     # Extract compact product phrases such as "工作号真实号" from chatty text.
     for m in re.finditer(r"[\u4e00-\u9fff]{2,12}(?:号|认证|办公|权益|套餐|实名|真实)[\u4e00-\u9fff]{0,8}(?:号|认证|办公|权益|套餐)?", clean):
@@ -518,66 +515,65 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
     return out
 
 
+
 def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
-    """Retrieve hits via getnote-cli semantic search.
+    """Retrieve hits from Get笔记 CLI knowledge base.
 
-    Expected CLI contract verified against iswalle/getnote-cli:
-    - getnote search <query> --kb <topic_id> --limit <n> -o json
-    - JSON shape: {success: true, data: {results: [{title, content, note_id, note_type, ...}]}}
+    CLI contract verified with getnote.exe:
+    - getnote search <query> --kb <knowledge_base_id> --limit N -o json
+    - JSON: {success: true, data: {results: [{note_id,title,content,created_at,...}]}}
 
-    Credentials stay outside config: getnote-cli reads GETNOTE_API_KEY / its own
-    config.  Any CLI/API error degrades to no online hits.
+    This path intentionally degrades to [] on any error so local core boundaries
+    remain active and the WeChat monitor is not blocked by online retrieval.
     """
-    kb_id = str(spec.get("knowledge_base_id") or spec.get("kb_id") or spec.get("topic_id") or spec.get("id") or "")
+    kb_id = str(spec.get("knowledge_base_id") or spec.get("kb_id") or spec.get("id") or "").strip()
     if not kb_id:
         return []
-    exe = str(spec.get("executable") or spec.get("cmd") or os.environ.get("GETNOTE_BIN") or "getnote")
-    timeout = float(spec.get("timeout") or 20)
-    per_limit = max(1, int(limit or spec.get("limit") or 5))
-    cmd = [exe, "search", query or "", "--kb", kb_id, "--limit", str(per_limit), "-o", "json"]
+    exe = str(spec.get("executable") or spec.get("cli") or "getnote").strip() or "getnote"
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
+        per_limit = max(1, min(int(limit or spec.get("limit") or 5), 10))
+    except Exception:
+        per_limit = 5
+    cmd = [exe, "search", query or "", "--kb", kb_id, "--limit", str(per_limit), "-o", "json"]
+    api_key_env = str(spec.get("api_key_env") or "").strip()
+    env = os.environ.copy()
+    if api_key_env and os.environ.get(api_key_env):
+        env["GETNOTE_API_KEY"] = os.environ.get(api_key_env, "")
+    timeout = float(spec.get("timeout") or 25)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
     except Exception:
         return []
-    if proc.returncode != 0:
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
         return []
     try:
-        payload = json.loads(proc.stdout or "{}")
+        payload = json.loads(proc.stdout)
     except Exception:
         return []
     data = payload.get("data") if isinstance(payload, dict) else None
-    results = data.get("results") if isinstance(data, dict) else None
-    if not isinstance(results, list):
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    items = data.get("results") or data.get("notes") or []
+    if not isinstance(items, list):
         return []
     out: List[KnowledgeHit] = []
-    seen: set[str] = set()
     max_chars = int(spec.get("hit_max_chars") or 6000)
-    for idx, item in enumerate(results):
+    scope = str(spec.get("scope") or "online")
+    for idx, item in enumerate(items):
         if not isinstance(item, dict):
             continue
+        note_id = str(item.get("note_id") or item.get("id") or f"result_{idx + 1}")
         title = str(item.get("title") or "").strip()
-        content = str(item.get("content") or item.get("excerpt") or "").strip()
-        note_id = str(item.get("note_id") or "").strip()
-        note_type = str(item.get("note_type") or item.get("type") or "").strip()
-        rel = note_id or title or f"search_result_{idx + 1}"
-        if note_type:
-            rel = f"{note_type}:{rel}"
-        body = "\n".join(x for x in [title, content] if x).strip()
-        if not body or rel in seen:
+        content = str(item.get("content") or item.get("summary") or "").strip()
+        created = str(item.get("created_at") or "").strip()
+        body = "\n".join(x for x in [title, created, content] if x).strip()
+        if not body:
             continue
-        seen.add(rel)
-        out.append(KnowledgeHit("getnote", kb_id, str(spec.get("scope") or "online"), rel, body[:max_chars], max(1, per_limit - idx)))
+        rel = note_id if not title else f"{note_id}/{title[:80]}"
+        out.append(KnowledgeHit("getnote", kb_id, scope, rel, body[:max_chars], max(1, per_limit - len(out))))
         if len(out) >= per_limit:
             break
     return out
-
 
 def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
@@ -664,6 +660,105 @@ def _clean_agent_output(text: str) -> str:
     return " ".join(useful[-3:]).strip() if useful else text.strip()
 
 
+_LOCAL_LLM_CLIENTS: Dict[str, Any] = {}
+_LOCAL_LLM_LOCK = threading.Lock()
+
+
+def _resolve_code_root(config: Dict[str, Any]) -> Path:
+    """Resolve GenericAgent runtime root used to import llmcore in-process."""
+    cfg_root = config.get("code_root")
+    if cfg_root:
+        return Path(cfg_root).expanduser().resolve()
+    # Canonical source lives in E:/projects/GA-projects/wechat-automation-local/wechat-decrypt;
+    # default runtime root is the surrounding GenericAgent runtime/project root.
+    return Path(__file__).resolve().parents[2]
+
+
+def _load_local_llm_client(config: Dict[str, Any]):
+    """Build one GenericAgent llmcore client without spawning agentmain/subagent."""
+    code_root = _resolve_code_root(config)
+    cache_key = f"{code_root}|{config.get('llm_no', 0)}"
+    with _LOCAL_LLM_LOCK:
+        cached = _LOCAL_LLM_CLIENTS.get(cache_key)
+        if cached is not None:
+            return cached
+        llmcore_path = code_root / "llmcore.py"
+        if not llmcore_path.exists():
+            return None
+        root_str = str(code_root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        try:
+            from llmcore import (  # type: ignore
+                reload_mykeys, LLMSession, ToolClient, ClaudeSession, MixinSession,
+                NativeToolClient, NativeClaudeSession, NativeOAISession,
+            )
+            mykeys, _changed = reload_mykeys()
+            sessions: List[Any] = []
+            for key, cfg in mykeys.items():
+                if not any(x in key for x in ["api", "config", "cookie"]):
+                    continue
+                try:
+                    if "native" in key and "claude" in key:
+                        sessions.append(NativeToolClient(NativeClaudeSession(cfg=cfg)))
+                    elif "native" in key and "oai" in key:
+                        sessions.append(NativeToolClient(NativeOAISession(cfg=cfg)))
+                    elif "claude" in key:
+                        sessions.append(ToolClient(ClaudeSession(cfg=cfg)))
+                    elif "oai" in key:
+                        sessions.append(ToolClient(LLMSession(cfg=cfg)))
+                    elif "mixin" in key:
+                        sessions.append({"mixin_cfg": cfg})
+                except Exception:
+                    continue
+            for i, sess in enumerate(list(sessions)):
+                if isinstance(sess, dict) and "mixin_cfg" in sess:
+                    try:
+                        mixin = MixinSession(sessions, sess["mixin_cfg"])
+                        if isinstance(mixin._sessions[0], (NativeClaudeSession, NativeOAISession)):
+                            sessions[i] = NativeToolClient(mixin)
+                        else:
+                            sessions[i] = ToolClient(mixin)
+                    except Exception:
+                        sessions[i] = None
+            sessions = [s for s in sessions if s is not None and not isinstance(s, dict)]
+            if not sessions:
+                return None
+            llm_no = int(config.get("llm_no", 0) or 0)
+            client = sessions[llm_no % len(sessions)]
+            _LOCAL_LLM_CLIENTS[cache_key] = client
+            return client
+        except Exception:
+            return None
+
+
+def _call_local_llm_provider(prompt: str, config: Dict[str, Any]) -> str | None:
+    provider = str(config.get("provider") or "").lower()
+    if provider and provider not in {"genericagent_local", "genericagent_llmcore", "genericagent_subagent"}:
+        return None
+    client = _load_local_llm_client(config)
+    if client is None:
+        return None
+    input_text = (
+        "你是群聊小助手。请根据下面的群消息、本地wiki片段和边界约束，"
+        "只输出一段可以直接发送到微信群的中文回复；不要解释过程，不要使用工具，不要写summary。\n\n"
+        + prompt
+    )
+    messages = [{"role": "user", "content": input_text}]
+    try:
+        gen = client.chat(messages, tools=[])
+        try:
+            while True:
+                next(gen)
+        except StopIteration as e:
+            resp = e.value
+    except Exception:
+        return None
+    if resp is not None and getattr(resp, "content", None):
+        return postcheck(str(resp.content).strip())
+    return None
+
+
 def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
     if not config.get("use_subagent", False):
         return None
@@ -723,11 +818,16 @@ def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
 
 
 def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None) -> str | None:
-    """Optional provider hook. Prefer GenericAgent subagent with llm_no=1 (minimax-anthropic)."""
+    """Optional provider hook. Prefer in-process GenericAgent llmcore in the sub-wechat runtime."""
     config = config or {}
-    sub = _call_subagent_provider(prompt, config)
-    if sub:
-        return sub
+    local = _call_local_llm_provider(prompt, config)
+    if local:
+        return local
+    # Backward-compatible escape hatch only; sub-wechat should not spawn subagent during normal replies.
+    if config.get("allow_subagent_fallback", False):
+        sub = _call_subagent_provider(prompt, config)
+        if sub:
+            return sub
     cmd = config.get("llm_provider_cmd") or os.environ.get("WECHAT_REPLY_LLM_CMD")
     if not cmd:
         return None
