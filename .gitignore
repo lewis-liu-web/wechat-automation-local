@@ -27,6 +27,7 @@ voice_transcriptions.json
 *.ret.txt
 *.stop
 fast_refresh_state.json
+wechat-decrypt/wechat_bot_candidates.json
 wechat-decrypt/.fast_refresh_tmp/
 
 # Screenshots and private media/runtime OCR captures
