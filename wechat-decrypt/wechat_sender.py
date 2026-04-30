@@ -799,7 +799,7 @@ def send_reply_detailed(text: str, mode: Optional[str] = None, target: Optional[
                         before_local_id: Optional[int] = None, cfg: Optional[dict] = None,
                         confirm: Optional[ConfirmFn] = None, log: Optional[LogFn] = None) -> SendResult:
     cfg = cfg or {}
-    mode = (mode or cfg.get('send_mode') or 'backend_only').lower()
+    mode = (mode or cfg.get('send_mode') or 'foreground').lower()
     confirm_timeout = float(cfg.get('send_confirm_timeout') or 5.0)
 
     if mode in ('backend', 'backend_only', 'background'):

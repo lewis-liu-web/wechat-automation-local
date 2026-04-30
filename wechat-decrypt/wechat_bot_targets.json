@@ -17,7 +17,8 @@
       "reply_template": "",
       "knowledge_bases": [
         "scene.bot_testing",
-        "online.getnote.bot_testing"
+        "online.getnote.bot_testing",
+        "online.getnote.bot_testing_work"
       ]
     },
     {
@@ -37,14 +38,12 @@
   ],
   "wiki_dir": "wiki",
   "reply_engine": {
-    "provider": "genericagent_subagent",
-    "use_subagent": true,
+    "provider": "genericagent_local",
     "llm_no": 3,
     "llm_name": "my-oai-proxy",
-    "code_root": "D:\\Program Files\\GenericAgent-main",
+    "code_root": "D:\\Program Files\\GenericAgent\\GenericAgent-main",
     "llm_timeout": 120,
-    "subagent_task_prefix": "wechat_reply",
-    "subagent_temp_root": "wechat_reply_archive"
+    "allow_subagent_fallback": false
   },
   "context_limit": 12,
   "send_mode": "foreground",
@@ -92,6 +91,16 @@
       "limit": 5,
       "timeout": 25,
       "description": "Get笔记知识库（bot群聊测试群专用）"
+    },
+    "online.getnote.bot_testing_work": {
+      "type": "getnote",
+      "enabled": true,
+      "knowledge_base_id": "QYAxqbPn",
+      "executable": "D:\\Program Files\\GenericAgent\\GenericAgent-main\\temp\\getnote_bin\\getnote.exe",
+      "scope": "scene",
+      "limit": 5,
+      "timeout": 25,
+      "description": "Get笔记/工作资料知识库（bot群聊测试群附加绑定）"
     },
     "online.getnote.chongqing_mobile_work": {
       "type": "getnote",

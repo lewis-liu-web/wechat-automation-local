@@ -47,6 +47,7 @@ class ReplyDecision:
     need_human: bool = False
     reason: str = ""
     wiki_hits: List[str] | None = None
+    retrieval_debug: Dict[str, Any] | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -102,7 +103,7 @@ def _looks_like_smalltalk(text: str) -> bool:
     if not t:
         return True
     if len(t) <= 18 and not _contains_any(t, [
-        "资料", "知识库", "产品", "业务", "方案", "套餐", "认证", "实名", "真实号", "工作号", "权益", "重庆", "移动", "中移", "介绍", "是什么", "怎么", "如何", "多少", "价格", "报价", "合同", "授权", "审批"
+        "资料", "知识库", "产品", "业务", "方案", "套餐", "认证", "实名", "真实号", "工作号", "权益", "重庆", "移动", "中移", "介绍", "是什么", "怎么", "如何", "多少", "价格", "报价", "合同", "授权", "审批", "记录", "笔记"
     ]):
         return True
     return _contains_any(t, [
@@ -155,6 +156,23 @@ def _score_doc(query: str, rel: str, body: str) -> int:
         score += body.count(tok)
         score += rel.count(tok) * 3
     return score
+
+
+def _strong_scene_hits(query: str, hits: List[KnowledgeHit], min_score: int = 2) -> List[KnowledgeHit]:
+    """Keep only scene hits that still overlap with the original query locally.
+
+    Some providers return broad semantic/default results even for pure pings such
+    as "哈哈" or "在吗".  Those are not reliable evidence that the user asked a
+    knowledge-bound question.  Use our local token-overlap scorer as a provider
+    agnostic quality gate; any surviving hit means the message should be treated
+    as KB-grounded rather than casual chat.
+    """
+    strong: List[KnowledgeHit] = []
+    for h in hits or []:
+        score = _score_doc(query, h.rel_path, h.content)
+        if score >= min_score:
+            strong.append(h)
+    return strong
 
 
 def _rank_wiki_docs(query: str, docs: List[Tuple[str, str]], limit: int = 3) -> List[Tuple[str, str]]:
@@ -962,13 +980,23 @@ def generate_reply(message: Dict[str, Any] | str,
         pre.reply_text = _ensure_mention_prefix(postcheck(pre.reply_text), mention_name)
         return pre
 
-    if _looks_like_smalltalk(clean):
-        # Obvious casual chat must not touch scene/online KB (IMA may block); keep only core boundaries.
-        layers = {"core": retrieve_knowledge_layers("小助手 能做什么", config, {"knowledge_bases": []}).get("core") or [], "scene": []}
-    else:
-        layers = retrieve_knowledge_layers(clean or raw_text, config, target)
+    # Retrieval comes before chat classification.  A message with scene KB hits is
+    # by definition a knowledge-bound question, even if it looks casual/short.
+    # If retrieval yields no scene hits, core boundaries still apply and the
+    # request falls back to bounded chat mode.
+    layers = retrieve_knowledge_layers(clean or raw_text, config, target)
     core_hits = layers.get("core") or []
-    scene_hits = layers.get("scene") or []
+    raw_scene_hits = layers.get("scene") or []
+    scene_hits = _strong_scene_hits(clean or raw_text, raw_scene_hits)
+    retrieval_debug = {
+        "query": clean or raw_text,
+        "selected_kbs": list(target.get("knowledge_bases") or resolve_target_kb_ids(config, target) or []),
+        "core_count": len(core_hits),
+        "raw_scene_count": len(raw_scene_hits),
+        "strong_scene_count": len(scene_hits),
+        "raw_scene_hits": [h.label if isinstance(h, KnowledgeHit) else str(h) for h in raw_scene_hits[:10]],
+        "strong_scene_hits": [h.label if isinstance(h, KnowledgeHit) else str(h) for h in scene_hits[:10]],
+    }
     mode = "scene" if scene_hits else "chat"
     wiki_hits = (core_hits + scene_hits) if scene_hits else core_hits
     context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
@@ -982,17 +1010,21 @@ def generate_reply(message: Dict[str, Any] | str,
         llm_config["llm_timeout"] = float(llm_config.get("chat_llm_timeout", 20))
     llm_text = call_llm_provider(prompt, llm_config)
     if llm_text:
+        llm_text = _clean_agent_output(llm_text)
+    if llm_text:
         reply = _ensure_mention_prefix(postcheck(llm_text), mention_name)
         return ReplyDecision(True, reply, intent="wiki_qa" if scene_hits else "smalltalk", risk_level="low", need_human=False,
                              reason="llm_provider_scene" if scene_hits else "llm_provider_core_chat",
-                             wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits])
+                             wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits],
+                             retrieval_debug=retrieval_debug)
 
     reply, intent, need_human = fallback_reply(clean, scene_hits, mode=mode)
     return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
                          risk_level="medium" if need_human else "low",
                          need_human=need_human,
                          reason="safe_fallback_scene_no_provider" if scene_hits else "safe_fallback_core_chat_no_provider",
-                         wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits])
+                         wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits],
+                         retrieval_debug=retrieval_debug)
 
 
 if __name__ == "__main__":

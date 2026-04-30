@@ -58,7 +58,7 @@ def load_config(path=CONFIG_PATH):
     cfg.setdefault('wiki_dir', str(ROOT / 'wiki'))
     cfg.setdefault('reply_engine', {})
     cfg.setdefault('context_limit', 12)
-    cfg.setdefault('send_mode', 'backend_only')
+    cfg.setdefault('send_mode', 'foreground')
     cfg.setdefault('send_strategy', 'current_or_uia_then_ocr_search_physical')
     cfg.setdefault('uia_probe_enabled', True)
     cfg.setdefault('stop_file', str(STOP_FILE))
@@ -483,6 +483,17 @@ def main():
                     text = decision.reply_text
                     log('trigger hit target=%s local_id=%s ctx=%d ctx=%.3fs gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
                         t.get('name'), lid, len(ctx), context_dt, gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
+                    try:
+                        detail = decision.to_dict()
+                        detail['target'] = t.get('name')
+                        detail['local_id'] = lid
+                        detail['context_count'] = len(ctx)
+                        detail['context_seconds'] = round(context_dt, 3)
+                        detail['generate_seconds'] = round(gen_dt, 3)
+                        detail['reply_preview'] = (text or '')[:200]
+                        log('decision_detail %s' % json.dumps(detail, ensure_ascii=False, default=str))
+                    except Exception as e:
+                        log('decision_detail_error target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
                     if not decision.should_reply or not text:
                         log('decision: skip send')
                     elif args.dry_run:
