@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -21,6 +23,59 @@ CANDIDATES_PATH = ROOT / "wechat_bot_candidates.json"
 DECRYPTED_DIR = ROOT / "decrypted"
 DECRYPTED_MESSAGE_DIR = DECRYPTED_DIR / "message"
 DECRYPTED_CONTACT_DB = DECRYPTED_DIR / "contact" / "contact.db"
+METADATA_DBS = ("contact/contact.db", "session/session.db")
+
+
+def _load_runtime_paths():
+    try:
+        from config import load_config as _load_config
+        cfg = _load_config()
+        return Path(cfg.get("db_dir", "")), Path(cfg.get("decrypted_dir", str(DECRYPTED_DIR)))
+    except Exception:
+        return Path(""), DECRYPTED_DIR
+
+
+def _needs_refresh(raw_db, decrypted_db):
+    raw_db = Path(raw_db)
+    decrypted_db = Path(decrypted_db)
+    if not raw_db.exists():
+        return False
+    if not decrypted_db.exists():
+        return True
+    try:
+        return raw_db.stat().st_mtime > decrypted_db.stat().st_mtime + 0.5
+    except OSError:
+        return False
+
+
+def refresh_metadata_dbs(metadata_dbs=METADATA_DBS):
+    """Refresh small contact/session DBs before discovery so chatroom names are current.
+
+    Best-effort: failures are reported to the caller but do not block message discovery.
+    """
+    db_dir, decrypted_dir = _load_runtime_paths()
+    results = []
+    for rel in metadata_dbs:
+        raw = db_dir / rel if db_dir else Path("")
+        out = decrypted_dir / rel
+        item = {"db": rel, "refreshed": False, "skipped": False, "ok": True, "message": ""}
+        if not _needs_refresh(raw, out):
+            item["skipped"] = True
+            item["message"] = "up_to_date_or_missing_raw"
+            results.append(item)
+            continue
+        cmd = [sys.executable, str(ROOT / "decrypt_db.py"), "--db", rel]
+        try:
+            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=180)
+            item["refreshed"] = (r.returncode == 0)
+            item["ok"] = (r.returncode == 0)
+            tail = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[-1000:]
+            item["message"] = tail
+        except Exception as e:
+            item["ok"] = False
+            item["message"] = str(e)
+        results.append(item)
+    return results
 
 
 def now_text():
@@ -167,7 +222,8 @@ def candidate_by_username(data):
     return {c.get("username"): c for c in data.get("candidates", []) if c.get("username")}
 
 
-def discover_candidates(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH, include_contacts=False):
+def discover_candidates(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH, include_contacts=False, refresh_metadata=True):
+    metadata_refresh = refresh_metadata_dbs() if refresh_metadata else []
     cfg = load_config(config_path)
     configured = target_usernames(cfg)
     data = load_candidates(candidates_path)
@@ -201,7 +257,7 @@ def discover_candidates(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH
             added += 1
     data["updated_at"] = now_text()
     save_json_atomic(candidates_path, data)
-    return {"discovered": len(found), "added": added, "updated": updated, "pending": sum(1 for c in data["candidates"] if c.get("status") == "pending")}
+    return {"discovered": len(found), "added": added, "updated": updated, "pending": sum(1 for c in data["candidates"] if c.get("status") == "pending"), "metadata_refresh": metadata_refresh}
 
 
 def find_target(cfg, key):
