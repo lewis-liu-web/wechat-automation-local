@@ -924,9 +924,111 @@ def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
     return None
 
 
-def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None) -> str | None:
-    """Optional provider hook. Prefer in-process llmcore client when available."""
+def _extract_command_reply(out: str) -> str | None:
+    """Extract reply from command stdout.
+
+    Preferred stdout is a single JSON object, but some agent apps print logs
+    before the final JSON. Be forgiving: scan from the last non-empty line
+    backwards and accept JSON dict/string; otherwise return the last line.
+    """
+    out = (out or "").strip()
+    if not out:
+        return None
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    candidates = list(reversed(lines)) + [out]
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                for key in ("reply", "text", "content", "output"):
+                    value = obj.get(key)
+                    if value:
+                        return str(value).strip()
+            if isinstance(obj, str):
+                return obj.strip()
+        except Exception:
+            continue
+    return lines[-1] if lines else out
+
+
+def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
+    """Call an external agent app through a tiny stdin/stdout protocol.
+
+    This is the product-friendly path for users who already have OpenClaw,
+    Hermes, GenericAgent, or any other agent app configured with its own LLM.
+
+    Supported config:
+      provider: "command"
+      cmd: ["agent", "--single-turn"] or "agent --single-turn"
+      input_format: "plain" | "json"   (default: plain)
+      timeout / llm_timeout: seconds
+
+    stdin:
+      plain -> prompt text
+      json  -> payload JSON, always including payload["prompt"]
+
+    stdout:
+      plain text, or JSON object with one of: reply/text/content/output
+    """
+    cmd = config.get("cmd") or config.get("llm_provider_cmd") or os.environ.get("WECHAT_REPLY_LLM_CMD")
+    if not cmd:
+        return None
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    if not isinstance(cmd, list) or not cmd:
+        return None
+
+    fmt = str(config.get("input_format") or "plain").lower()
+    if fmt == "json":
+        body = dict(payload or {})
+        body.setdefault("prompt", prompt)
+        stdin_data = json.dumps(body, ensure_ascii=False)
+    else:
+        stdin_data = prompt
+
+    timeout = float(config.get("timeout", config.get("llm_timeout", 30)))
+    env = os.environ.copy()
+    # UTF-8 is part of the command-provider contract. Force Python-based
+    # bridge apps on Windows away from the inherited ANSI code page (GBK/CP936).
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        r = subprocess.run(
+            cmd,
+            input=stdin_data,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    if not out:
+        return None
+    return _extract_command_reply(out)
+
+
+def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None, payload: Dict[str, Any] | None = None) -> str | None:
+    """Optional provider hook. Supports lightweight external agent command first-class."""
     config = config or {}
+    if config.get("enabled") is False:
+        return None
+    provider = str(config.get("provider") or "").lower()
+
+    # Product-friendly path: users keep their own agent app and LLM config;
+    # we only pass one task over stdin and read one reply from stdout.
+    if provider == "command":
+        cmd_reply = _call_command_provider(prompt, config, payload)
+        if cmd_reply:
+            return postcheck(cmd_reply)
+        return None
+
+    # Existing GA in-process adapter stays available as just another agent app.
     local = _call_local_llm_provider(prompt, config)
     if local:
         return local
@@ -935,18 +1037,10 @@ def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None) -> str 
         sub = _call_subagent_provider(prompt, config)
         if sub:
             return sub
-    cmd = config.get("llm_provider_cmd") or os.environ.get("WECHAT_REPLY_LLM_CMD")
-    if not cmd:
-        return None
-    if isinstance(cmd, str):
-        cmd = cmd.split()
-    try:
-        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=float(config.get("llm_timeout", 20)))
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
-    except Exception:
-        return None
+    # Legacy command fallback for older configs without provider="command".
+    cmd_reply = _call_command_provider(prompt, config, payload)
+    if cmd_reply:
+        return postcheck(cmd_reply)
     return None
 
 
@@ -1097,7 +1191,34 @@ def generate_reply(message: Dict[str, Any] | str,
         # No scene wiki hit: this is the normal small-talk path. Give the LLM a short,
         # bounded window so the monitor never blocks the whole chat loop for minutes.
         llm_config["llm_timeout"] = float(llm_config.get("chat_llm_timeout", 20))
-    llm_text = call_llm_provider(prompt, llm_config)
+    provider_payload = {
+        "prompt": prompt,
+        "raw_text": raw_text,
+        "clean_text": clean,
+        "wiki_hits": [
+            {
+                "label": h.label,
+                "source": h.source,
+                "kb_id": h.kb_id,
+                "scope": h.scope,
+                "rel_path": h.rel_path,
+                "score": h.score,
+                "content": h.content,
+            } if isinstance(h, KnowledgeHit) else {"label": h[0], "content": h[1]}
+            for h in wiki_hits
+        ],
+        "context_messages": context_messages,
+        "mention_name": mention_name,
+        "mode": mode,
+        "target": {
+            "id": target.get("id"),
+            "name": target.get("name"),
+            "username": target.get("username"),
+            "table": target.get("table"),
+        },
+        "retrieval_debug": retrieval_debug,
+    }
+    llm_text = call_llm_provider(prompt, llm_config, provider_payload)
     if llm_text:
         llm_text = _clean_agent_output(llm_text)
     if llm_text:
