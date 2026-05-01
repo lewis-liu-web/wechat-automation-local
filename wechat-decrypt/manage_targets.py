@@ -258,6 +258,15 @@ def main(argv=None):
     p.add_argument("key")
     p.add_argument("--json", action="store_true")
 
+    # trigger = manage per-target trigger keywords
+    p = sub.add_parser("trigger", aliases=["triggers", "kw", "keyword"], help="list/add/set/remove trigger keywords for a target")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("triggers", nargs="*", help="trigger keywords, e.g. #ask #穿越测试")
+    p.add_argument("--set", dest="replace", action="store_true", help="replace existing per-target triggers")
+    p.add_argument("--remove", "--rm", action="store_true", help="remove the given keywords")
+    p.add_argument("--clear", action="store_true", help="clear all per-target triggers")
+    p.add_argument("--json", action="store_true")
+
     # kb-list = list configured knowledge bases
     p = sub.add_parser("kb-list", aliases=["kbs", "wiki-list"], help="list configured knowledge base aliases")
     p.add_argument("--json", action="store_true")
@@ -452,6 +461,29 @@ def main(argv=None):
                     safe_print("监听进程运行中，变更会在下一轮轮询生效。")
                 else:
                     safe_print("监听进程未运行，请执行：python manage_targets.py start")
+            return 0
+
+        # -- trigger / triggers / kw --
+        if cmd in ("trigger", "triggers", "kw", "keyword"):
+            if args.clear or args.remove:
+                out = reg.remove_triggers(args.key, args.triggers, clear=args.clear)
+                action = "已清空触发词" if args.clear else "已删除触发词"
+            elif args.triggers:
+                out = reg.set_triggers(args.key, args.triggers, replace=args.replace)
+                action = "已替换触发词" if args.replace else "已添加触发词"
+            else:
+                out = reg.get_triggers(args.key)
+                action = "当前触发词"
+            if args.json:
+                print_json({"ok": True, "target": out, "action": action})
+            else:
+                safe_print("%s: %s (%s)" % (action, out.get("name"), out.get("username")))
+                safe_print("per-target triggers: %s" % (", ".join(out.get("triggers") or []) or "(empty; uses default_triggers)"))
+                safe_print("default_triggers: %s" % (", ".join(out.get("default_triggers") or []) or "(empty)"))
+                if _is_monitor_running():
+                    safe_print("监听进程运行中，变更会在下一轮轮询自动生效。")
+                else:
+                    safe_print("监听进程未运行；启动：python manage_targets.py start")
             return 0
 
         # -- kb-list / kbs --

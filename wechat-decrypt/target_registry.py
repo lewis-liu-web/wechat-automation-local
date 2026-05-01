@@ -347,6 +347,55 @@ def set_enabled(key, enabled, config_path=CONFIG_PATH):
     return t
 
 
+def get_triggers(key, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    return {
+        "name": t.get("name"),
+        "username": t.get("username"),
+        "triggers": list(t.get("triggers") or []),
+        "default_triggers": list(cfg.get("default_triggers") or []),
+    }
+
+
+def set_triggers(key, triggers, replace=False, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    clean = []
+    for item in triggers or []:
+        item = str(item).strip()
+        if item and item not in clean:
+            clean.append(item)
+    if replace:
+        t["triggers"] = clean
+    else:
+        cur = list(t.get("triggers") or [])
+        for item in clean:
+            if item not in cur:
+                cur.append(item)
+        t["triggers"] = cur
+    save_json_atomic(config_path, cfg)
+    return get_triggers(key, config_path=config_path)
+
+
+def remove_triggers(key, triggers, clear=False, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    if clear:
+        t["triggers"] = []
+    else:
+        rm = {str(x).strip() for x in (triggers or []) if str(x).strip()}
+        t["triggers"] = [x for x in list(t.get("triggers") or []) if x not in rm]
+    save_json_atomic(config_path, cfg)
+    return get_triggers(key, config_path=config_path)
+
+
 def list_knowledge_bases(config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     rows = []

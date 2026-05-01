@@ -1,26 +1,41 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
+rem Generic CLI launcher for wechat_bot_monitor.py.
+rem Usage: start_wechat_bot_monitor.bat [config_path]
+rem Default config: .\wechat_bot_targets.json
+rem Notes: avoid the Windows py launcher because it may point to a stale Python install.
+
 set "SCRIPT=%~dp0wechat_bot_monitor.py"
-set "PYTHONW=C:\Users\Lewis\AppData\Local\Programs\Python\Python312\pythonw.exe"
+set "CONFIG=%~1"
+if not defined CONFIG set "CONFIG=%~dp0wechat_bot_targets.json"
+set "STDOUT_LOG=%~dp0monitor_detached_stdout.log"
+set "STDERR_LOG=%~dp0monitor_detached_stderr.log"
 
-rem 单实例保护：已有 wechat_bot_monitor.py 监听进程则不重复启动
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -match 'wechat_bot_monitor\.py' -and $_.Name -match '^pythonw?\.exe$' };" ^
-  "if ($procs) { Write-Host ('微信自动监听已在运行，未重复启动。PID: ' + (($procs | ForEach-Object ProcessId) -join ',')); exit 10 } else { exit 0 }"
-
-if "%ERRORLEVEL%"=="10" (
-  timeout /t 2 /nobreak >nul
-  exit /b 0
+if not exist "%SCRIPT%" (
+  echo ERROR: script not found: "%SCRIPT%"
+  exit /b 2
+)
+if not exist "%CONFIG%" (
+  echo ERROR: config not found: "%CONFIG%"
+  exit /b 2
 )
 
-if exist wechat_bot_monitor.stop del /f /q wechat_bot_monitor.stop >nul 2>nul
+if exist "%~dp0wechat_bot_monitor.stop" del /q "%~dp0wechat_bot_monitor.stop" >nul 2>nul
 
-rem Load IMA credentials from user environment for non-interactive launchers.
-for /f "tokens=1,* delims==" %%A in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$names=@(''IMA_CLIENT_ID'',''IMA_API_KEY'',''IMA_SKILL_VERSION''); foreach($n in $names){ $v=[Environment]::GetEnvironmentVariable($n,''User''); if($v){ Write-Output ($n+''=''+$v) } }"') do set "%%A=%%B"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$procs=Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^pythonw?\.exe$' -and $_.CommandLine -and $_.CommandLine -like '*wechat_bot_monitor.py*' }; if($procs){ Write-Host ('wechat_bot_monitor already running. PID: ' + (($procs | ForEach-Object ProcessId) -join ',')); exit 10 }"
+if %ERRORLEVEL% EQU 10 goto :STATUS
 
-start "" "%PYTHONW%" "%SCRIPT%"
-echo 已启动微信自动监听。
-timeout /t 2 /nobreak >nul
-exit /b 0
+where pythonw >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+  start "wechat_bot_monitor" /min pythonw "%SCRIPT%" --config "%CONFIG%" 1>>"%STDOUT_LOG%" 2>>"%STDERR_LOG%"
+) else (
+  where python >nul 2>nul || (echo ERROR: python/pythonw not found in PATH.& exit /b 3)
+  start "wechat_bot_monitor" /min python "%SCRIPT%" --config "%CONFIG%" 1>>"%STDOUT_LOG%" 2>>"%STDERR_LOG%"
+)
+
+:STATUS
+powershell -NoProfile -Command "Start-Sleep -Seconds 3" >nul 2>nul
+call "%~dp0status_wechat_bot_monitor.bat"
+exit /b %ERRORLEVEL%
