@@ -1,1 +1,0 @@
-读取 temp/plan_wechat_native_bridge/context.json；只读调研微信Windows native bridge/Hook静默发送可落地方案，重点比较 WeChatFerry/wcferry、wxhelper、wechat-bot 等项目的发送能力、兼容微信版本、安全风险、Python集成方式；禁止执行注入/Hook，输出到 context.json 指定 findings。

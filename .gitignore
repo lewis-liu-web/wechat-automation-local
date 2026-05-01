@@ -63,7 +63,6 @@ tmp/
 update_backup_*/
 remote_update/
 pywechat_probe/
-plan_*/backups/
 
 # Private bot knowledge and chat-derived samples
 wechat-decrypt/wiki/groups/

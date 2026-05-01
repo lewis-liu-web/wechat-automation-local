@@ -24,5 +24,5 @@ This workspace is a local WeChat automation/research project. The current produc
 ## Workspace layout
 - `wechat-decrypt/`: main implementation and WeChat DB tooling.
 - `docs/`: project notes, status snapshots, design decisions.
-- `pywechat_probe/`, `plan_*`, `source_read/`: research/probe material; keep source-like notes, ignore generated artifacts.
+- `pywechat_probe/`, `source_read/`: research/probe material; keep source-like notes, ignore generated artifacts.
 - Runtime outputs, images, logs, DBs, temp replies, backups, caches should stay untracked.
