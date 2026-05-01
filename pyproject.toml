@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-auto"
+version = "0.1.0"
+description = "Generic WeChat automation CLI (decrypt + foreground + backend + MCP)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["wechat", "automation", "mcp", "bot"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+]
+# Core dependencies that are already vendored or pure-python
+dependencies = [
+    "pywin32",
+    "pyperclip",
+    "cryptography",
+    "sqlcipher3",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+# Windows GUI automation extras (ljqCtrl is GA-internal; downstream can inject)
+win = ["uiautomation", "pywinauto"]
+# LLM reply extras (if user wants cloud-based reply, not GA-local)
+llm = ["openai", "anthropic"]
+# Dev / test
+dev = ["pytest", "pytest-cov"]
+
+[project.scripts]
+wechat-auto = "wechat_auto.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wechat_auto*", "wechat-decrypt*"]
