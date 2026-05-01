@@ -137,6 +137,7 @@ def test_foreground_skips_search_when_uia_current_chat_verified(monkeypatch):
     monkeypatch.setitem(sys.modules, 'ljqCtrl', FakeLjq)
     monkeypatch.setitem(sys.modules, 'pyperclip', FakeClip)
     # UIA says current chat matches target, and UIA input/send succeeds
+    monkeypatch.setattr(wechat_sender, '_uia_is_effectively_available', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender, '_uia_current_chat_matches', lambda target=None, log=None: True)
     monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, cfg=None, log=None: True)
     # Make sure OCR/search are NOT called
@@ -157,6 +158,7 @@ def test_foreground_skips_search_when_uia_current_chat_verified(monkeypatch):
 
 def test_foreground_uia_search_then_uia_send(monkeypatch):
     monkeypatch.setattr(wechat_sender, 'find_wechat_hwnd', lambda: 123)
+    monkeypatch.setattr(wechat_sender, '_uia_is_effectively_available', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender.ctypes, 'windll', type('W', (), {'user32': type('U', (), {'SetProcessDPIAware': lambda self: None})()})(), raising=False)
 
     class FakeWin32Gui:
@@ -197,6 +199,7 @@ def test_foreground_uia_search_then_uia_send(monkeypatch):
 
 def test_foreground_full_fallback_to_physical_when_all_uia_fail(monkeypatch):
     monkeypatch.setattr(wechat_sender, 'find_wechat_hwnd', lambda: 123)
+    monkeypatch.setattr(wechat_sender, '_uia_is_effectively_available', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender.ctypes, 'windll', type('W', (), {'user32': type('U', (), {'SetProcessDPIAware': lambda self: None})()})(), raising=False)
 
     class FakeWin32Gui:

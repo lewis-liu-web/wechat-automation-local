@@ -31,38 +31,31 @@ WAL_FRAME_HEADER_SZ = 24
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("WECHAT_MCP_CONFIG") or os.path.join(SCRIPT_DIR, "config.json")
 
-_DEFAULT_CFG = {
-    "db_dir": os.path.join(SCRIPT_DIR, "db_storage"),
-    "keys_file": "all_keys.json",
-    "decrypted_dir": "decrypted",
-    "wechat_process": "Weixin.exe",
-}
 try:
-    with open(CONFIG_FILE, encoding="utf-8") as f:
-        _cfg = json.load(f)
-except FileNotFoundError:
-    # Keep the module importable in fresh clones and unit tests without private config.
-    _cfg = dict(_DEFAULT_CFG)
-for _key in ("keys_file", "decrypted_dir"):
-    if _key in _cfg and not os.path.isabs(_cfg[_key]):
-        _cfg[_key] = os.path.join(SCRIPT_DIR, _cfg[_key])
+    from config import load_config, default_config
+except Exception:  # keep importable for partial/vendor installs
+    load_config = None
+    default_config = None
 
-DB_DIR = _cfg.get("db_dir") or _DEFAULT_CFG["db_dir"]
-KEYS_FILE = _cfg.get("keys_file") or os.path.join(SCRIPT_DIR, _DEFAULT_CFG["keys_file"])
-DECRYPTED_DIR = _cfg.get("decrypted_dir") or os.path.join(SCRIPT_DIR, _DEFAULT_CFG["decrypted_dir"])
-
-# 图片相关路径
-_db_dir = DB_DIR
-if os.path.basename(_db_dir) == "db_storage":
-    WECHAT_BASE_DIR = os.path.dirname(_db_dir)
+if load_config is not None:
+    _cfg = load_config(CONFIG_FILE, exit_on_missing=False, write_missing=False)
+elif default_config is not None:
+    _cfg = default_config()
 else:
-    WECHAT_BASE_DIR = _db_dir
+    _cfg = {
+        "db_dir": os.path.join(SCRIPT_DIR, "db_storage"),
+        "keys_file": os.path.join(SCRIPT_DIR, "all_keys.json"),
+        "decrypted_dir": os.path.join(SCRIPT_DIR, "decrypted"),
+        "decoded_image_dir": os.path.join(SCRIPT_DIR, "decoded_images"),
+        "wechat_process": "Weixin.exe",
+        "wechat_base_dir": os.path.join(SCRIPT_DIR, "db_storage"),
+    }
 
-DECODED_IMAGE_DIR = _cfg.get("decoded_image_dir")
-if not DECODED_IMAGE_DIR:
-    DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, "decoded_images")
-elif not os.path.isabs(DECODED_IMAGE_DIR):
-    DECODED_IMAGE_DIR = os.path.join(SCRIPT_DIR, DECODED_IMAGE_DIR)
+DB_DIR = _cfg.get("db_dir") or os.path.join(SCRIPT_DIR, "db_storage")
+KEYS_FILE = _cfg.get("keys_file") or os.path.join(SCRIPT_DIR, "all_keys.json")
+DECRYPTED_DIR = _cfg.get("decrypted_dir") or os.path.join(SCRIPT_DIR, "decrypted")
+WECHAT_BASE_DIR = _cfg.get("wechat_base_dir") or (os.path.dirname(DB_DIR) if os.path.basename(DB_DIR) == "db_storage" else DB_DIR)
+DECODED_IMAGE_DIR = _cfg.get("decoded_image_dir") or os.path.join(SCRIPT_DIR, "decoded_images")
 
 try:
     with open(KEYS_FILE, encoding="utf-8") as f:

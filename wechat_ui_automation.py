@@ -36,13 +36,20 @@ except Exception as e:
 else:
     OCR_IMPORT_ERROR = None
 
-try:
-    import ljqCtrl
-except Exception as e:
-    ljqCtrl = None
-    LJQ_IMPORT_ERROR = repr(e)
-else:
-    LJQ_IMPORT_ERROR = None
+ljqCtrl = None
+LJQ_IMPORT_ERROR = None
+
+def _load_ljqctrl():
+    global ljqCtrl, LJQ_IMPORT_ERROR
+    if ljqCtrl is not None or LJQ_IMPORT_ERROR is None:
+        try:
+            import ljqCtrl as _lc
+            ljqCtrl = _lc
+            LJQ_IMPORT_ERROR = None
+        except Exception as e:
+            ljqCtrl = None
+            LJQ_IMPORT_ERROR = repr(e)
+    return ljqCtrl
 
 
 def find_wechat_window():

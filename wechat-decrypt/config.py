@@ -165,14 +165,44 @@ def auto_detect_db_dir():
     return None
 
 
-def load_config():
+def default_config():
+    """Return a fresh copy of the platform-specific default config."""
+    return dict(_DEFAULT)
+
+
+def _with_resolved_paths(cfg):
+    """Return cfg with project-relative paths resolved to absolute paths."""
+    resolved = dict(cfg)
+    base = os.path.dirname(os.path.abspath(__file__))
+    for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):
+        if key in resolved and not os.path.isabs(resolved[key]):
+            resolved[key] = os.path.join(base, resolved[key])
+
+    db_dir = resolved.get("db_dir", "")
+    if db_dir and os.path.basename(db_dir) == "db_storage":
+        resolved["wechat_base_dir"] = os.path.dirname(db_dir)
+    else:
+        resolved["wechat_base_dir"] = db_dir
+
+    if "decoded_image_dir" not in resolved:
+        resolved["decoded_image_dir"] = os.path.join(base, "decoded_images")
+    return resolved
+
+
+def load_config(config_file=CONFIG_FILE, *, exit_on_missing=True, write_missing=True):
+    """Load config.json and resolve relative paths.
+
+    The default behavior is kept CLI-friendly: missing/unresolved db_dir exits with
+    instructions. Tests and import-only tools can pass ``exit_on_missing=False`` to
+    inspect safe defaults without terminating the process.
+    """
     cfg = {}
-    if os.path.exists(CONFIG_FILE):
+    if os.path.exists(config_file):
         try:
-            with open(CONFIG_FILE, encoding="utf-8") as f:
+            with open(config_file, encoding="utf-8") as f:
                 cfg = json.load(f)
         except json.JSONDecodeError:
-            print(f"[!] {CONFIG_FILE} 格式损坏，将使用默认配置")
+            print(f"[!] {config_file} 格式损坏，将使用默认配置")
             cfg = {}
     # db_dir 缺失或仍为模板值时，尝试自动检测
     db_dir = cfg.get("db_dir", "")
@@ -181,40 +211,24 @@ def load_config():
         if detected:
             print(f"[+] 自动检测到微信数据目录: {detected}")
             cfg = {**_DEFAULT, **cfg, "db_dir": detected}
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=4, ensure_ascii=False)
-            print(f"[+] 已保存到: {CONFIG_FILE}")
+            if write_missing:
+                with open(config_file, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=4, ensure_ascii=False)
+                print(f"[+] 已保存到: {config_file}")
         else:
-            if not os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            cfg = {**_DEFAULT, **cfg}
+            if write_missing and not os.path.exists(config_file):
+                with open(config_file, "w", encoding="utf-8") as f:
                     json.dump(_DEFAULT, f, indent=4, ensure_ascii=False)
             print(f"[!] 未能自动检测微信数据目录")
-            print(f"    请手动编辑 {CONFIG_FILE} 中的 db_dir 字段")
+            print(f"    请手动编辑 {config_file} 中的 db_dir 字段")
             if _SYSTEM == "linux":
                 print("    Linux 默认路径类似: ~/Documents/xwechat_files/<wxid>/db_storage")
             else:
                 print(f"    路径可在 微信设置 → 文件管理 中找到")
-            sys.exit(1)
+            if exit_on_missing:
+                sys.exit(1)
     else:
         cfg = {**_DEFAULT, **cfg}
 
-    # 将相对路径转为绝对路径
-    base = os.path.dirname(os.path.abspath(__file__))
-    for key in ("keys_file", "decrypted_dir", "decoded_image_dir"):
-        if key in cfg and not os.path.isabs(cfg[key]):
-            cfg[key] = os.path.join(base, cfg[key])
-
-    # 自动推导微信数据根目录（db_dir 的上级目录）
-    # db_dir 格式: D:\xwechat_files\<wxid>\db_storage
-    # base_dir 格式: D:\xwechat_files\<wxid>
-    db_dir = cfg.get("db_dir", "")
-    if db_dir and os.path.basename(db_dir) == "db_storage":
-        cfg["wechat_base_dir"] = os.path.dirname(db_dir)
-    else:
-        cfg["wechat_base_dir"] = db_dir
-
-    # decoded_image_dir 默认值
-    if "decoded_image_dir" not in cfg:
-        cfg["decoded_image_dir"] = os.path.join(base, "decoded_images")
-
-    return cfg
+    return _with_resolved_paths(cfg)

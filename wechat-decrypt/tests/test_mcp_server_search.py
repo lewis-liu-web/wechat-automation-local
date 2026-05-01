@@ -681,6 +681,53 @@ class SearchMessagesTests(unittest.TestCase):
 
         self.assertTrue(fake_conn.closed)
 
+class ConfigLoadTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp_dir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_load_config_can_return_safe_defaults_without_exit_or_write(self):
+        import config
+
+        missing_path = os.path.join(self.temp_dir.name, "missing-config.json")
+        with patch.object(config, "auto_detect_db_dir", return_value=None):
+            cfg = config.load_config(
+                missing_path,
+                exit_on_missing=False,
+                write_missing=False,
+            )
+
+        self.assertFalse(os.path.exists(missing_path))
+        self.assertIn("your_wxid", cfg["db_dir"])
+        self.assertTrue(os.path.isabs(cfg["keys_file"]))
+        self.assertTrue(os.path.isabs(cfg["decrypted_dir"]))
+        self.assertIn("wechat_base_dir", cfg)
+
+    def test_load_config_resolves_relative_paths_from_custom_file(self):
+        import config
+
+        config_path = os.path.join(self.temp_dir.name, "config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            import json
+
+            json.dump(
+                {
+                    "db_dir": os.path.join(self.temp_dir.name, "wxid", "db_storage"),
+                    "keys_file": "keys.json",
+                    "decrypted_dir": "out",
+                },
+                f,
+            )
+
+        cfg = config.load_config(config_path, exit_on_missing=False)
+
+        self.assertTrue(os.path.isabs(cfg["keys_file"]))
+        self.assertTrue(os.path.isabs(cfg["decrypted_dir"]))
+        self.assertEqual(cfg["wechat_base_dir"], os.path.join(self.temp_dir.name, "wxid"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,11 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import ctypes
+import os
 import sys
 import time
 
 ROOT = Path(__file__).resolve().parent
-MEMORY = (ROOT.parent.parent / 'memory').resolve()
 PYWECHAT_SRC = (ROOT.parent / 'pywechat_src').resolve()
 WECHAT_HWND_HINT = 67810
 
@@ -399,6 +399,55 @@ def _find_uia_search_box(hwnd, log: Optional[LogFn] = None):
     return None
 
 
+
+def _load_ljqctrl(cfg: Optional[dict] = None):
+    """Load ljqCtrl from environment/config or import path; avoids hard GA dependency."""
+    candidates = []
+    if cfg and cfg.get('ljqctrl_path'):
+        candidates.append(str(cfg.get('ljqctrl_path')))
+    env_path = os.environ.get('WECHAT_AUTO_LJQCTRL_PATH')
+    if env_path:
+        candidates.append(env_path)
+    for custom in candidates:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('ljqCtrl', custom)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+        except Exception:
+            continue
+    try:
+        import ljqCtrl  # type: ignore
+        return ljqCtrl
+    except Exception:
+        return None
+
+def _load_ocr_utils(cfg: Optional[dict] = None):
+    """Load ocr_utils from environment/config or import path; avoids hard GA dependency."""
+    candidates = []
+    if cfg and cfg.get('ocr_utils_path'):
+        candidates.append(str(cfg.get('ocr_utils_path')))
+    env_path = os.environ.get('WECHAT_AUTO_OCR_UTILS_PATH')
+    if env_path:
+        candidates.append(env_path)
+    for custom in candidates:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('ocr_utils', custom)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+        except Exception:
+            continue
+    try:
+        import ocr_utils  # type: ignore
+        return ocr_utils
+    except Exception:
+        return None
+
 def _uia_open_chat_by_search(target: Optional[dict] = None, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
     aliases = target_aliases(target)
     target_name = aliases[0] if aliases else ''
@@ -406,7 +455,10 @@ def _uia_open_chat_by_search(target: Optional[dict] = None, cfg: Optional[dict] 
         return False
     t0 = time.time()
     try:
-        import ljqCtrl
+        ljqCtrl = _load_ljqctrl(cfg)
+        if ljqCtrl is None:
+            _log(log, 'UIA open-chat failed reason=ljqCtrl_unavailable')
+            return False
         import pyperclip
         hwnd = find_wechat_hwnd()
         search = _find_uia_search_box(hwnd, log=log)
@@ -506,7 +558,10 @@ def _find_uia_send_button(hwnd, log: Optional[LogFn] = None):
 def _uia_input_and_send(text: str, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
     t0 = time.time()
     try:
-        import ljqCtrl
+        ljqCtrl = _load_ljqctrl(cfg)
+        if ljqCtrl is None:
+            _log(log, 'UIA input-send failed reason=ljqCtrl_unavailable')
+            return False
         import pyperclip
         hwnd = find_wechat_hwnd()
         edit = _find_uia_message_input(hwnd, log=log)
@@ -583,12 +638,16 @@ def open_chat_from_visible_list(target: Optional[dict] = None, cfg: Optional[dic
     if not target_name:
         return False
     t0 = time.time()
+    ljqCtrl = _load_ljqctrl(cfg)
+    if ljqCtrl is None:
+        _log(log, 'UI list-ocr failed reason=ljqCtrl_unavailable')
+        return False
+    ocr_utils = _load_ocr_utils(cfg)
+    if ocr_utils is None:
+        _log(log, 'UI list-ocr failed reason=ocr_utils_unavailable')
+        return False
     try:
-        import ljqCtrl
         from PIL import ImageGrab
-        if str(MEMORY) not in sys.path:
-            sys.path.insert(0, str(MEMORY))
-        import ocr_utils
         import win32gui
         hwnd = find_wechat_hwnd()
         client = win32gui.GetClientRect(hwnd)
@@ -682,11 +741,13 @@ def send_reply_foreground(text: str, target: Optional[dict] = None, cfg: Optiona
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
-    if str(MEMORY) not in sys.path:
-        sys.path.insert(0, str(MEMORY))
     import win32gui, win32con
     import pyperclip
-    import ljqCtrl
+    ljqCtrl = _load_ljqctrl(cfg)
+    if ljqCtrl is None:
+        _log(log, 'send_reply_foreground failed reason=ljqCtrl_unavailable')
+        result.reason = 'ljqCtrl_unavailable'
+        return result
     hwnd = find_wechat_hwnd()
     win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     time.sleep(0.15)

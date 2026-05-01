@@ -20,6 +20,8 @@ import sys
 import threading
 import time
 import uuid
+import argparse
+import shlex
 from typing import Any, Dict, Iterable, List, Tuple
 
 
@@ -166,11 +168,20 @@ def _strong_scene_hits(query: str, hits: List[KnowledgeHit], min_score: int = 2)
     knowledge-bound question.  Use our local token-overlap scorer as a provider
     agnostic quality gate; any surviving hit means the message should be treated
     as KB-grounded rather than casual chat.
+
+    Local KBs already use the same token scorer during retrieval, so we trust
+    their computed score with a relaxed threshold.  External providers are
+    re-scored against the cleaned query to filter broad default results.
     """
     strong: List[KnowledgeHit] = []
     for h in hits or []:
-        score = _score_doc(query, h.rel_path, h.content)
-        if score >= min_score:
+        if h.source == "local":
+            score = getattr(h, "score", 0) or 0
+            effective_min = 1
+        else:
+            score = _score_doc(query, h.rel_path, h.content)
+            effective_min = min_score
+        if score >= effective_min:
             strong.append(h)
     return strong
 
@@ -749,6 +760,18 @@ def _resolve_code_root(config: Dict[str, Any]) -> Path | None:
     if cfg_root:
         p = Path(cfg_root).expanduser().resolve()
         return p if p.exists() else None
+    # Attempt to locate via the wechat-auto CLI entry point (pip-installed)
+    try:
+        import shutil
+        exe = shutil.which("wechat-auto")
+        if exe:
+            p = Path(exe).resolve().parent
+            # If installed in Scripts/ or bin/, go up one level
+            if p.name.lower() in ("scripts", "bin"):
+                p = p.parent
+            return p if p.exists() else None
+    except Exception:
+        pass
     # Project root detection fallback: two levels up from this file.
     p = Path(__file__).resolve().parents[2]
     return p if p.exists() else None
