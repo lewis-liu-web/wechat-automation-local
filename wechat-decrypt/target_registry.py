@@ -535,7 +535,7 @@ def get_kb_info(kb_id, config_path=CONFIG_PATH):
             info["exists"] = False
         else:
             files = list(p.rglob("*"))
-            docs = [f for f in files if f.is_file() and f.suffix.lower() in {".md", ".txt", ".pdf", ".docx", ".csv", ".json"}]
+            docs = [f for f in files if f.is_file() and f.suffix.lower() == ".md"]
             info["file_count"] = len(docs)
             info["total_files"] = len([f for f in files if f.is_file()])
             info["exists"] = True
@@ -558,17 +558,25 @@ def import_kb_file(kb_id, source_path, config_path=CONFIG_PATH):
         raise ValueError("源路径不存在: %s" % source_path)
     copied = []
     if src.is_file():
+        if src.suffix.lower() != ".md":
+            raise ValueError("本地知识库暂时只支持 markdown 格式内容（.md）: %s" % source_path)
         tgt = dst / src.name
         shutil.copy2(str(src), str(tgt))
         copied.append(str(tgt))
     elif src.is_dir():
+        skipped = 0
         for item in src.rglob("*"):
             if item.is_file():
+                if item.suffix.lower() != ".md":
+                    skipped += 1
+                    continue
                 rel = item.relative_to(src)
                 tgt = dst / rel
                 tgt.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(item), str(tgt))
                 copied.append(str(tgt))
+        if not copied and skipped:
+            raise ValueError("本地知识库暂时只支持 markdown 格式内容（.md）；目录中没有可导入的 .md 文件")
     else:
         raise ValueError("不支持的源路径类型: %s" % source_path)
     return copied

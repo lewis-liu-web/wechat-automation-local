@@ -535,7 +535,7 @@ def main(argv=None):
                 safe_print("已创建本地知识库: %s" % out.get("id"))
                 safe_print("目录: %s" % out.get("path"))
                 safe_print("\n接下来你可以:")
-                safe_print("  1. 把 .md/.txt/.pdf/.docx 文件放入该目录")
+                safe_print("  1. 把 .md markdown 文件放入该目录（本地知识库暂时只支持 markdown 格式内容）")
                 safe_print("  2. python manage_targets.py kb-import %s <文件或目录>" % out.get("id"))
                 safe_print("  3. python manage_targets.py kb \"群名\" %s --replace" % out.get("id"))
                 safe_print("\n或打开目录手动管理:")
