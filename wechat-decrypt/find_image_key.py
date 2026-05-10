@@ -19,9 +19,17 @@ import glob
 import json
 import time
 import ctypes
+import traceback
 from ctypes import wintypes
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
+
+# Fix stdout encoding for pipe environments
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
 
 # Windows API constants
 PROCESS_ALL_ACCESS = 0x1F0FFF
@@ -380,9 +388,13 @@ def main():
     aes_key = None
     for pid in pids:
         print(f"Scanning PID {pid}...", flush=True)
-        aes_key = scan_memory_for_aes_key(pid, ciphertext)
-        if aes_key:
-            break
+        try:
+            aes_key = scan_memory_for_aes_key(pid, ciphertext)
+            if aes_key:
+                break
+        except Exception as e:
+            print(f"Error scanning PID {pid}: {e}", flush=True)
+            traceback.print_exc()
 
     if aes_key:
         print(f"\n=== Result ===", flush=True)

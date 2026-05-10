@@ -60,6 +60,37 @@ def cmd_init(json_mode=False):
     return 0
 
 
+def cmd_where(json_mode=False):
+    """Show current active WeChat data directory (auto-detected by message mtime)."""
+    from config import _auto_detect_db_dir_windows, _SYSTEM
+    detected = None
+    if _SYSTEM == "windows":
+        detected = _auto_detect_db_dir_windows()
+    if detected:
+        mtime = None
+        msg_dir = os.path.join(detected, "message")
+        if os.path.isdir(msg_dir):
+            try:
+                mtime = os.path.getmtime(msg_dir)
+                from datetime import datetime
+                mtime = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                pass
+        if json_mode:
+            print_json({"ok": True, "active_db_dir": detected, "reason": "latest_message_mtime", "message_mtime": mtime})
+        else:
+            safe_print(f"[+] 当前活跃微信数据目录: {detected}")
+            if mtime:
+                safe_print(f"    message 目录最后活跃: {mtime}")
+            safe_print("    -> 用于 init / key / setup 等后续命令")
+    else:
+        if json_mode:
+            print_json({"ok": False, "error": "no_active_account_found"})
+        else:
+            safe_print("[!] 未检测到活跃微信账号（请确保微信已启动并登录）")
+    return 0
+
+
 def cmd_key(json_mode=False):
     if json_mode:
         safe_print(json.dumps({"ok": True, "action": "extract_keys", "script": str(KEY_SCRIPT)}, ensure_ascii=False))
@@ -232,6 +263,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Manage WeChat bot monitored targets.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # where = show current active WeChat data directory
+    p = sub.add_parser("where", aliases=["detect", "active"], help="show current active WeChat account data directory")
+    p.add_argument("--json", action="store_true")
+
     # scan = discover
     p = sub.add_parser("scan", aliases=["discover"], help="scan new chats into pending candidates")
     p.add_argument("--include-contacts", action="store_true", help="also add 1:1 contacts; default groups only")
@@ -350,6 +385,8 @@ def main(argv=None):
 
     try:
         # -- db decrypt lifecycle --
+        if cmd in ("where", "detect", "active"):
+            return cmd_where(json_mode=args.json)
         if cmd in ("init", "cfg"):
             return cmd_init(json_mode=args.json)
         if cmd in ("key", "keys"):

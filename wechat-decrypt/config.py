@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import sys
+from datetime import datetime
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
@@ -57,49 +58,108 @@ def _choose_candidate(candidates):
     return None
 
 
-def _auto_detect_db_dir_windows():
-    """从微信本地配置自动检测 Windows db_storage 路径。
 
-    读取 %APPDATA%\\Tencent\\xwechat\\config\\*.ini，
-    找到数据存储根目录，然后匹配 xwechat_files\\*\\db_storage。
+def _auto_detect_db_dir_windows():
+    r"""从微信本地配置自动检测 Windows db_storage 路径。
+
+    策略：
+      1. 读取 %APPDATA%\\Tencent\\xwechat\\config\\*.ini 获取数据根目录。
+      2. 在根目录下搜索所有 xwechat_files\\*\\db_storage。
+      3. 如果 ini 未命中，回退扫描常见盘符（C/D/E）下可能路径。
+      4. 对每个候选目录计算活跃度得分（按最近活动时间 + V2图片文件数排序）。
+      5. 若只有一个高活跃候选，直接选中；若多个，列表供用户选择。
     """
     appdata = os.environ.get("APPDATA", "")
     config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
-    if not os.path.isdir(config_dir):
-        return None
-
-    # 从 ini 文件中找到有效的目录路径
-    data_roots = []
-    for ini_file in glob.glob(os.path.join(config_dir, "*.ini")):
-        try:
-            # 微信 ini 可能是 utf-8 或 gbk 编码（中文路径）
-            content = None
-            for enc in ("utf-8", "gbk"):
-                try:
-                    with open(ini_file, "r", encoding=enc) as f:
-                        content = f.read(1024).strip()
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if not content or any(c in content for c in "\n\r\x00"):
-                continue
-            if os.path.isdir(content):
-                data_roots.append(content)
-        except OSError:
-            continue
-
-    # 在每个根目录下搜索 xwechat_files\*\db_storage
     seen = set()
     candidates = []
-    for root in data_roots:
-        pattern = os.path.join(root, "xwechat_files", "*", "db_storage")
-        for match in glob.glob(pattern):
-            normalized = os.path.normcase(os.path.normpath(match))
-            if os.path.isdir(match) and normalized not in seen:
-                seen.add(normalized)
-                candidates.append(match)
 
-    return _choose_candidate(candidates)
+    # 1) 从 ini 读取
+    if os.path.isdir(config_dir):
+        for ini_file in glob.glob(os.path.join(config_dir, "*.ini")):
+            try:
+                content = None
+                for enc in ("utf-8", "gbk"):
+                    try:
+                        with open(ini_file, "r", encoding=enc) as f:
+                            content = f.read(1024).strip()
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if not content or any(c in content for c in "\n\r\x00"):
+                    continue
+                if os.path.isdir(content):
+                    pattern = os.path.join(content, "xwechat_files", "*", "db_storage")
+                    for match in glob.glob(pattern):
+                        normalized = os.path.normcase(os.path.normpath(match))
+                        if os.path.isdir(match) and normalized not in seen:
+                            seen.add(normalized)
+                            candidates.append(match)
+            except OSError:
+                continue
+
+    # 2) 回退扫描常见路径
+    if not candidates:
+        fallback_roots = []
+        for drive in ["C:", "D:", "E:", os.path.splitdrive(os.getcwd())[0] + ":"]:
+            for rel in [
+                r"Users\*\Documents\WeChat Files",
+                r"Users\*\Documents\xwechat_files",
+                r"WeChat Files",
+                r"xwechat_files",
+                r"document\wechat\xwechat_files",
+            ]:
+                pattern = os.path.join(drive, rel, "*", "db_storage")
+                for match in glob.glob(pattern):
+                    normalized = os.path.normcase(os.path.normpath(match))
+                    if os.path.isdir(match) and normalized not in seen:
+                        seen.add(normalized)
+                        candidates.append(match)
+
+    if not candidates:
+        return None
+
+    # 4) 按 message 目录 mtime 降序（活跃账号优先）
+    def _mtime(path):
+        msg_dir = os.path.join(path, "message")
+        target = msg_dir if os.path.isdir(msg_dir) else path
+        try:
+            return os.path.getmtime(target)
+        except OSError:
+            return 0
+
+    candidates.sort(key=_mtime, reverse=True)
+
+    # 单一候选直接返回
+    if len(candidates) == 1:
+        mtime_str = datetime.fromtimestamp(_mtime(candidates[0])).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[+] 自动检测到微信数据目录: {candidates[0]} (message 目录最近修改: {mtime_str})")
+        return candidates[0]
+
+    # 非交互环境直接选最活跃的
+    if not sys.stdin.isatty():
+        mtime_str = datetime.fromtimestamp(_mtime(candidates[0])).strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[+] 自动选择最活跃目录: {candidates[0]} (message 目录最近修改: {mtime_str})")
+        return candidates[0]
+
+    # 交互环境展示候选列表
+    print("[!] 检测到多个微信数据目录（按 message 目录最近修改时间排序）:")
+    for i, c in enumerate(candidates, 1):
+        mtime_str = datetime.fromtimestamp(_mtime(c)).strftime('%Y-%m-%d %H:%M:%S')
+        marker = " ← 推荐" if i == 1 else ""
+        print(f"    {i}. {c}  (message 修改: {mtime_str}){marker}")
+    print("    0. 跳过，稍后手动配置")
+    try:
+        while True:
+            choice = input("请选择 [0-{}]: ".format(len(candidates))).strip()
+            if choice == "0":
+                return None
+            if choice.isdigit() and 1 <= int(choice) <= len(candidates):
+                return candidates[int(choice) - 1]
+            print("    无效输入，请重新选择")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
 
 
 def _auto_detect_db_dir_linux():

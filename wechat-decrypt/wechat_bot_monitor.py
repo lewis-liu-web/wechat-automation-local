@@ -109,6 +109,9 @@ def clean_value(v):
 
 def row_to_dict(row):
     d = {k: clean_value(row[k]) for k in row.keys()}
+    # Keep raw bytes for packed_info_data so image handler can extract MD5
+    if 'packed_info_data' in row.keys():
+        d['packed_info_data'] = row['packed_info_data']
     ts = d.get('create_time') or 0
     try:
         d['create_time_local'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ts))) if int(ts) else ''
@@ -194,7 +197,7 @@ def fetch_new_for_db(db_name, targets):
                 continue
             last_id = int(t.get('last_local_id') or 0)
             sql = f'''select local_id, server_id, local_type, sort_seq, real_sender_id,
-                             create_time, status, message_content, source
+                             create_time, status, message_content, source, packed_info_data
                       from "{table}"
                       where local_id > ?
                       order by local_id asc
@@ -216,7 +219,7 @@ def fetch_latest_for_target(t):
     try:
         if not table_exists(con, table):
             return None
-        row = con.execute(f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source from "{table}" order by local_id desc limit 1').fetchone()
+        row = con.execute(f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data from "{table}" order by local_id desc limit 1').fetchone()
         return row_to_dict(row) if row else None
     finally:
         con.close()
@@ -242,7 +245,7 @@ def has_self_sent_after(t, after_local_id, text_hint=None):
         if not table_exists(con, table):
             return None
         rows = con.execute(
-            f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source from "{table}" where local_id > ? and status = 2 order by local_id asc limit 8',
+            f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data from "{table}" where local_id > ? and status = 2 order by local_id asc limit 8',
             (int(after_local_id or 0),)
         ).fetchall()
         hint = (text_hint or '').strip()
@@ -468,7 +471,23 @@ def main():
                 new_count += 1
                 lid = int(m.get('local_id') or 0)
                 advance_state = True
-                log('new msg target=%s local_id=%s content=%r' % (t.get('name'), lid, m.get('message_content')))
+                # Image message: decrypt and attach image_path
+                if int(m.get('local_type') or 0) == 3:
+                    try:
+                        from image_handler import process_image_message
+                        img_path = process_image_message(
+                            m, t, cfg,
+                            packed_info_data_bytes=m.get('packed_info_data'),
+                        )
+                        if img_path:
+                            m['image_path'] = img_path
+                            log('image decrypted target=%s local_id=%s path=%s' % (t.get('name'), lid, img_path))
+                        else:
+                            log('image decrypt failed target=%s local_id=%s' % (t.get('name'), lid))
+                    except Exception as e:
+                        log('image decrypt exception target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
+                log('new msg target=%s local_id=%s type=%s content=%r image=%s' % (
+                    t.get('name'), lid, m.get('local_type'), m.get('message_content'), m.get('image_path')))
                 if is_trigger(cfg, t, m):
                     hit_count += 1
                     context_limit = int(cfg.get('context_limit') or 12)

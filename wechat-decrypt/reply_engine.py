@@ -545,6 +545,20 @@ def _retrieve_ima_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Knowl
 
 
 
+
+import re as _re
+
+def _sanitize_secrets(text: str) -> str:
+    """Redact Feishu App IDs, secrets, and tokens from knowledge content."""
+    # Feishu/Lark App ID: cli_ + 16-32 hex chars
+    text = _re.sub(r'cli_[a-z0-9]{16,32}', 'cli_***', text)
+    # Secrets following "Secret" label (Chinese colon or ASCII colon)
+    text = _re.sub(r'(?i)secret[：:\s]*[A-Za-z0-9+/=_-]{24,64}', 'Secret：***', text)
+    # Generic token-like strings (32+ alphanumeric without spaces)
+    text = _re.sub(r'(?i)(api_key|app_secret|access_token|refresh_token|auth_key)[=：:\s]*[\'"]?[A-Za-z0-9+/=_-]{24,}', r'\1=***', text)
+    return text
+
+
 def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
     """Retrieve hits from Get笔记 CLI knowledge base.
 
@@ -595,7 +609,7 @@ def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[K
         title = str(item.get("title") or "").strip()
         content = str(item.get("content") or item.get("summary") or "").strip()
         created = str(item.get("created_at") or "").strip()
-        body = "\n".join(x for x in [title, created, content] if x).strip()
+        body = _sanitize_secrets("\n".join(x for x in [title, created, content] if x).strip())
         if not body:
             continue
         rel = note_id if not title else f"{note_id}/{title[:80]}"

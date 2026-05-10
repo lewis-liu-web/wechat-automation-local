@@ -299,17 +299,21 @@ def extract_md5_from_packed_info(blob):
 class ImageResolver:
     """封装从 local_id 到图片文件的完整解析链"""
 
-    def __init__(self, wechat_base_dir, decoded_image_dir, cache):
+    def __init__(self, wechat_base_dir, decoded_image_dir, cache, aes_key=None, xor_key=None):
         """
         Args:
             wechat_base_dir: 微信数据根目录 (如 D:\\xwechat_files\\<wxid>)
             decoded_image_dir: 解密图片输出目录
             cache: DBCache 实例，用于解密 message_resource.db
+            aes_key: V2格式AES密钥 (hex字符串或bytes)，可选
+            xor_key: V2/V1格式XOR密钥 (整数)，可选
         """
         self.base_dir = wechat_base_dir
         self.attach_dir = os.path.join(wechat_base_dir, "msg", "attach")
         self.out_dir = decoded_image_dir
         self.cache = cache
+        self.aes_key = aes_key
+        self.xor_key = xor_key
 
     def get_image_md5(self, local_id):
         """通过 local_id 查 message_resource.db 获取图片文件 MD5"""
@@ -379,13 +383,16 @@ class ImageResolver:
                 selected = f
                 break
 
-        # 3. 解密
+        # 3. 解密 (支持 V2/V1/XOR 多格式)
         out_name = f"{file_md5}"
         out_path_base = os.path.join(self.out_dir, out_name)
 
-        result_path, fmt = xor_decrypt_file(selected, f"{out_path_base}.tmp")
+        result_path, fmt = decrypt_dat_file(
+            selected, f"{out_path_base}.tmp",
+            aes_key=self.aes_key, xor_key=self.xor_key
+        )
         if not result_path:
-            return {'success': False, 'error': f'无法检测 XOR key (文件: {selected})', 'md5': file_md5}
+            return {'success': False, 'error': f'无法解密图片 (文件: {selected})', 'md5': file_md5}
 
         # 重命名为正确扩展名
         final_path = f"{out_path_base}.{fmt}"
