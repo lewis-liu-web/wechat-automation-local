@@ -11,12 +11,16 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+# Windows: suppress console window for subprocess calls
+_NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "wechat_bot_targets.json"
@@ -67,7 +71,8 @@ def refresh_metadata_dbs(metadata_dbs=METADATA_DBS):
             continue
         cmd = [sys.executable, str(ROOT / "decrypt_db.py"), "--db", rel]
         try:
-            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=180)
+            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=180,
+                               creationflags=_NO_WINDOW_FLAGS)
             item["refreshed"] = (r.returncode == 0)
             item["ok"] = (r.returncode == 0)
             tail = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[-1000:]
@@ -81,6 +86,27 @@ def refresh_metadata_dbs(metadata_dbs=METADATA_DBS):
 
 def now_text():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+VALID_CATEGORIES = ("user", "admin")
+
+
+def _normalize_category(value, default="user"):
+    """Coerce a category string to one of the supported values.
+
+    Anything not in ``VALID_CATEGORIES`` (including empty / None) falls
+    back to ``default``. Used both when writing a new target and when
+    reading legacy rows that were saved before the field existed.
+    """
+    v = str(value or "").strip().lower()
+    if v in VALID_CATEGORIES:
+        return v
+    return default
+
+
+def get_target_category(target):
+    """Return the effective category for a target dict (legacy rows = 'user')."""
+    return _normalize_category((target or {}).get("category"))
 
 
 def msg_table(username):
@@ -115,6 +141,12 @@ def load_config(path=CONFIG_PATH):
     cfg.setdefault("targets", [])
     cfg.setdefault("default_triggers", [])
     cfg.setdefault("default_reply_template", "")
+    cfg.setdefault("reply_engine", {})
+    # Default to raw-agent mode so deep tasks are pre-acked and queued asynchronously.
+    reply_engine = cfg.get("reply_engine") or {}
+    if isinstance(reply_engine, dict) and not reply_engine.get("mode"):
+        reply_engine["mode"] = "raw_agent"
+        cfg["reply_engine"] = reply_engine
     return cfg
 
 
@@ -275,18 +307,20 @@ def find_candidate(data, key):
     return None
 
 
-def enable_candidate(key, knowledge_bases=None, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
+def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
     cfg = load_config(config_path)
     data = load_candidates(candidates_path)
 
     existing = find_target(cfg, key)
     if existing:
         existing["enabled"] = True
+        existing["category"] = _normalize_category(category, default=existing.get("category"))
         if knowledge_bases:
             cur = list(existing.get("knowledge_bases") or [])
             for kb in knowledge_bases:
                 if kb not in cur:
                     cur.append(kb)
+            validate_knowledge_bases(cur, cfg=cfg)
             existing["knowledge_bases"] = cur
         cand = find_candidate(data, existing.get("username") or key)
         if cand:
@@ -304,11 +338,13 @@ def enable_candidate(key, knowledge_bases=None, config_path=CONFIG_PATH, candida
     existing = find_target(cfg, username)
     if existing:
         existing["enabled"] = True
+        existing["category"] = _normalize_category(category, default=existing.get("category"))
         if knowledge_bases:
             cur = list(existing.get("knowledge_bases") or [])
             for kb in knowledge_bases:
                 if kb not in cur:
                     cur.append(kb)
+            validate_knowledge_bases(cur, cfg=cfg)
             existing["knowledge_bases"] = cur
         cand["status"] = "enabled"
         cand["updated_at"] = now_text()
@@ -316,6 +352,8 @@ def enable_candidate(key, knowledge_bases=None, config_path=CONFIG_PATH, candida
         save_json_atomic(config_path, cfg)
         save_json_atomic(candidates_path, data)
         return existing
+    selected_kbs = knowledge_bases or cand.get("suggested_knowledge_bases") or []
+    validate_knowledge_bases(selected_kbs, cfg=cfg)
     target = {
         "name": cand.get("name") or username,
         "username": username,
@@ -325,7 +363,8 @@ def enable_candidate(key, knowledge_bases=None, config_path=CONFIG_PATH, candida
         "enabled": True,
         "triggers": [],
         "reply_template": "",
-        "knowledge_bases": knowledge_bases or cand.get("suggested_knowledge_bases") or [],
+        "knowledge_bases": selected_kbs,
+        "category": _normalize_category(category),
     }
     cfg.setdefault("targets", []).append(target)
     cand["status"] = "enabled"
@@ -347,6 +386,27 @@ def set_enabled(key, enabled, config_path=CONFIG_PATH):
     return t
 
 
+def set_category(key, category, config_path=CONFIG_PATH):
+    """Update the business category of an existing target (admin / user)."""
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    t["category"] = _normalize_category(category)
+    save_json_atomic(config_path, cfg)
+    return t
+
+def set_target_field(key, field, value, config_path=CONFIG_PATH):
+    """Update an arbitrary scalar field on an existing target."""
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    t[field] = value
+    save_json_atomic(config_path, cfg)
+    return t
+
+
 def get_triggers(key, config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     t = find_target(cfg, key)
@@ -358,6 +418,23 @@ def get_triggers(key, config_path=CONFIG_PATH):
         "triggers": list(t.get("triggers") or []),
         "default_triggers": list(cfg.get("default_triggers") or []),
     }
+
+
+def get_default_triggers(config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    return list(cfg.get("default_triggers") or [])
+
+
+def set_default_triggers(words, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    clean = []
+    for item in words or []:
+        item = str(item).strip()
+        if item and item not in clean:
+            clean.append(item)
+    cfg["default_triggers"] = clean
+    save_json_atomic(config_path, cfg)
+    return clean
 
 
 def set_triggers(key, triggers, replace=False, config_path=CONFIG_PATH):
@@ -407,19 +484,25 @@ def list_knowledge_bases(config_path=CONFIG_PATH):
             "enabled": spec.get("enabled", True),
             "knowledge_base_id": spec.get("knowledge_base_id") or "",
             "path": spec.get("path") or spec.get("dir") or "",
+            "source": _kb_source(spec),
+            "scope": spec.get("scope") or "scene",
+            "limit": spec.get("limit"),
+            "timeout": spec.get("timeout"),
             "description": spec.get("description") or "",
         })
     return rows
 
 
 def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=None, description="",
-                       executable=None, scope="scene", limit=None, timeout=None,
-                       enabled=True, replace=False, config_path=CONFIG_PATH):
+                        executable=None, scope="scene", limit=None, timeout=None,
+                       enabled=True, replace=False, source=None, config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     cfg.setdefault("knowledge_bases", {})
     if kb_id in cfg["knowledge_bases"] and not replace:
         raise ValueError("knowledge base already exists: %s (use --replace to update)" % kb_id)
     spec = {"type": kb_type, "enabled": bool(enabled)}
+    if source:
+        spec["source"] = str(source).strip()
     if kb_type == "getnote":
         if not knowledge_base_id:
             raise ValueError("--kid/--knowledge-base-id is required for getnote knowledge base")
@@ -458,6 +541,37 @@ def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=No
     return out
 
 
+def set_knowledge_base_enabled(kb_id, enabled=True, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    spec["enabled"] = bool(enabled)
+    save_json_atomic(config_path, cfg)
+    out = dict(spec)
+    out["id"] = kb_id
+    return out
+
+
+def delete_knowledge_base(kb_id, remove_files=False, config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    kbs = cfg.setdefault("knowledge_bases", {})
+    spec = kbs.get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    for t in cfg.get("targets") or []:
+        t["knowledge_bases"] = [x for x in (t.get("knowledge_bases") or []) if x != kb_id]
+    removed = kbs.pop(kb_id)
+    save_json_atomic(config_path, cfg)
+    if remove_files and (removed or {}).get("type") == "local":
+        p = Path((removed or {}).get("path") or "")
+        if p.exists() and p.is_dir() and _wiki_root() in p.resolve().parents:
+            shutil.rmtree(str(p), ignore_errors=True)
+    out = dict(removed or {})
+    out["id"] = kb_id
+    return out
+
+
 def _unknown_kb_message(kb, cfg):
     for known_id, spec in (cfg.get("knowledge_bases") or {}).items():
         if str((spec or {}).get("knowledge_base_id") or "") == str(kb):
@@ -465,14 +579,29 @@ def _unknown_kb_message(kb, cfg):
     return "unknown knowledge base id: %s. Run 'python manage_targets.py kb-list' or create one with 'python manage_targets.py kb-add <别名> --kid <外部知识库ID>'" % kb
 
 
-def validate_knowledge_bases(knowledge_bases, config_path=CONFIG_PATH):
-    cfg = load_config(config_path)
+def _kb_source(spec):
+    spec = spec or {}
+    explicit = str(spec.get("source") or "").strip().lower()
+    if explicit:
+        return explicit
+    typ = str(spec.get("type") or "local").strip().lower()
+    if typ == "local":
+        return "local_folder"
+    return typ
+
+
+def validate_knowledge_bases(knowledge_bases, config_path=CONFIG_PATH, cfg=None):
+    cfg = cfg or load_config(config_path)
     known = cfg.get("knowledge_bases") or {}
+    sources = set()
     for kb in knowledge_bases or []:
         if str(kb).startswith("legacy:"):
             continue
         if kb not in known:
             raise ValueError(_unknown_kb_message(kb, cfg))
+        sources.add(_kb_source(known.get(kb) or {}))
+    if len(sources) > 1:
+        raise ValueError("一个监听目标只能绑定同源知识库，当前混用了: %s。请只选择 obsidian/local_folder/getnote/ima/hook 中的一种。" % ", ".join(sorted(sources)))
     return True
 
 
@@ -481,15 +610,16 @@ def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
     t = find_target(cfg, key)
     if not t:
         raise ValueError("target not found: %s" % key)
-    validate_knowledge_bases(knowledge_bases, config_path=config_path)
     if replace:
-        t["knowledge_bases"] = list(knowledge_bases)
+        final_kbs = list(knowledge_bases)
     else:
         cur = list(t.get("knowledge_bases") or [])
         for kb in knowledge_bases:
             if kb not in cur:
                 cur.append(kb)
-        t["knowledge_bases"] = cur
+        final_kbs = cur
+    validate_knowledge_bases(final_kbs, cfg=cfg)
+    t["knowledge_bases"] = final_kbs
     save_json_atomic(config_path, cfg)
     return t
 
@@ -498,7 +628,7 @@ def _wiki_root():
     return ROOT / "wiki"
 
 
-def create_local_kb_dir(kb_id, description="", replace=False, config_path=CONFIG_PATH):
+def create_local_kb_dir(kb_id, description="", replace=False, source="local_folder", config_path=CONFIG_PATH):
     """Create a local directory-based knowledge base and register it."""
     if not kb_id:
         raise ValueError("知识库名称不能为空")
@@ -512,6 +642,7 @@ def create_local_kb_dir(kb_id, description="", replace=False, config_path=CONFIG
     spec = {
         "id": kb_id,
         "type": "local",
+        "source": source or "local_folder",
         "path": str(base_dir.resolve()),
         "description": description or "本地知识库: %s" % kb_id,
         "enabled": True,
@@ -522,7 +653,8 @@ def create_local_kb_dir(kb_id, description="", replace=False, config_path=CONFIG
 
 
 def get_kb_info(kb_id, config_path=CONFIG_PATH):
-    """Return knowledge base info including file stats for local dirs."""
+    """Return knowledge base info including file stats for local dirs
+    and resolved name/counts for online providers (getnote, ima)."""
     cfg = load_config(config_path)
     spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
     if not spec:
@@ -539,11 +671,101 @@ def get_kb_info(kb_id, config_path=CONFIG_PATH):
             info["file_count"] = len(docs)
             info["total_files"] = len([f for f in files if f.is_file()])
             info["exists"] = True
+    elif spec.get("type") == "getnote":
+        info.update(_resolve_getnote_kb_info(spec))
+    elif spec.get("type") == "ima":
+        info.update(_resolve_ima_kb_info(spec))
     return info
 
 
-def import_kb_file(kb_id, source_path, config_path=CONFIG_PATH):
-    """Copy a file or directory into a local knowledge base."""
+def _getnote_exe(spec):
+    return str(spec.get("executable") or spec.get("cli") or "getnote").strip() or "getnote"
+
+
+def _resolve_getnote_kb_info(spec):
+    """Call `getnote kbs -o json` once and return the matching entry's name and counts."""
+    out = {"online_name": "", "online_note_count": None, "online_file_count": None, "online_error": ""}
+    kb_id = str(spec.get("knowledge_base_id") or spec.get("kb_id") or "").strip()
+    if not kb_id:
+        out["online_error"] = "未配置 knowledge_base_id"
+        return out
+    exe = _getnote_exe(spec)
+    try:
+        proc = subprocess.run([exe, "kbs", "-o", "json"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=20,
+                              creationflags=_NO_WINDOW_FLAGS)
+    except Exception as e:
+        out["online_error"] = "调用 getnote 失败: %s" % (e,)
+        return out
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        out["online_error"] = "getnote 退出码 %s: %s" % (proc.returncode, (proc.stderr or "").strip()[:200])
+        return out
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception as e:
+        out["online_error"] = "getnote 返回非 JSON: %s" % (e,)
+        return out
+    items = ((payload.get("data") or {}).get("topics") or [])
+    if not isinstance(items, list):
+        items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("id") or item.get("topic_id") or "") == kb_id:
+            out["online_name"] = str(item.get("name") or "").strip()
+            stats = item.get("stats") or {}
+            try:
+                out["online_note_count"] = int(stats.get("note_count") or 0)
+            except Exception:
+                pass
+            try:
+                out["online_file_count"] = int(stats.get("file_count") or 0)
+            except Exception:
+                pass
+            out["online_description"] = str(item.get("description") or "").strip()
+            return out
+    out["online_error"] = "未在 getnote 列表中找到 ID %s" % kb_id
+    return out
+
+
+def _resolve_ima_kb_info(spec):
+    """Placeholder for IMA. Currently the user has IMA disabled, so this returns
+    a stub without making any network call."""
+    return {
+        "online_name": "",
+        "online_note_count": None,
+        "online_file_count": None,
+        "online_error": "IMA 在线名称解析未实现，可在 wechat_bot_targets.json 手动填 description。",
+    }
+
+
+def list_kbs_extended(config_path=CONFIG_PATH):
+    """List KBs with extended info (file count, online name) per entry."""
+    rows = list_knowledge_bases(config_path=config_path)
+    for row in rows:
+        try:
+            info = get_kb_info(row.get("id"), config_path=config_path) or {}
+        except Exception:
+            info = {}
+        row["file_count"] = int(info.get("file_count") or 0) if row.get("type") == "local" else None
+        row["online_name"] = info.get("online_name") or ""
+        row["online_note_count"] = info.get("online_note_count")
+        row["online_file_count"] = info.get("online_file_count")
+        row["online_error"] = info.get("online_error") or ""
+    return rows
+
+
+def import_kb_file(kb_id, source_path, config_path=CONFIG_PATH, allow_empty=False):
+    """Copy a file or directory into a local knowledge base.
+
+    Non-Markdown files are converted to Markdown with Microsoft MarkItDown when
+    available.  The local KB stays Markdown-only as the source of truth, which
+    keeps Obsidian and the retrieval layer simple.
+
+    Files that fail to convert are skipped by default and reported in the
+    ``failed`` list.  Set ``allow_empty=True`` only for the legacy behavior
+    (write a stub markdown) and the result is still non-fatal either way.
+    """
     cfg = load_config(config_path)
     spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
     if not spec:
@@ -557,29 +779,164 @@ def import_kb_file(kb_id, source_path, config_path=CONFIG_PATH):
     if not src.exists():
         raise ValueError("源路径不存在: %s" % source_path)
     copied = []
+    failed = []
+
+    def safe_stem(name):
+        stem = Path(name).stem.strip() or "document"
+        stem = re.sub(r"[<>:\\|?*\x00-\x1f]+", "_", stem)
+        return stem[:120] or "document"
+
+    def copy_or_convert_file(file_path, rel_parent=Path("")):
+        file_path = Path(file_path)
+        if file_path.suffix.lower() == ".md":
+            tgt = dst / rel_parent / file_path.name
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(file_path), str(tgt))
+            return str(tgt)
+        tgt = dst / rel_parent / (safe_stem(file_path.name) + ".md")
+        if tgt.exists():
+            digest = hashlib.sha1(str(file_path).encode("utf-8", errors="ignore")).hexdigest()[:8]
+            tgt = dst / rel_parent / (safe_stem(file_path.name) + "-" + digest + ".md")
+        tgt.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            text = _convert_file_to_markdown(file_path)
+        except ValueError as e:
+            # Default: skip the file and report. No placeholder is written so
+            # the KB directory stays clean of unusable markdown.
+            return {"skipped": True, "path": str(file_path), "error": str(e)}
+        if allow_empty and not text.strip():
+            tgt.write_text(
+                "# %s\n\n无法用 MarkItDown 提取正文：empty content\n" % safe_stem(file_path.name),
+                encoding="utf-8",
+            )
+            return str(tgt)
+        if not text.strip():
+            return {"skipped": True, "path": str(file_path),
+                    "error": "MarkItDown returned empty content"}
+        tgt.write_text(text, encoding="utf-8")
+        return str(tgt)
+
+    def _process(item, rel_parent):
+        result = copy_or_convert_file(item, rel_parent)
+        if isinstance(result, dict) and result.get("skipped"):
+            failed.append({"path": result["path"], "error": result["error"]})
+        else:
+            copied.append(result)
+
     if src.is_file():
-        if src.suffix.lower() != ".md":
-            raise ValueError("本地知识库暂时只支持 markdown 格式内容（.md）: %s" % source_path)
-        tgt = dst / src.name
-        shutil.copy2(str(src), str(tgt))
-        copied.append(str(tgt))
+        _process(src, Path(""))
     elif src.is_dir():
-        skipped = 0
         for item in src.rglob("*"):
             if item.is_file():
-                if item.suffix.lower() != ".md":
-                    skipped += 1
-                    continue
-                rel = item.relative_to(src)
-                tgt = dst / rel
-                tgt.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(item), str(tgt))
-                copied.append(str(tgt))
-        if not copied and skipped:
-            raise ValueError("本地知识库暂时只支持 markdown 格式内容（.md）；目录中没有可导入的 .md 文件")
+                _process(item, item.relative_to(src).parent)
     else:
         raise ValueError("不支持的源路径类型: %s" % source_path)
-    return copied
+    return {"copied": copied, "failed": failed, "skipped": []}
+
+
+def search_local_kb(kb_id, query, limit=5, config_path=CONFIG_PATH):
+    """Lightweight local-KB retrieval for the UI test-search button.
+
+    Walks the KB directory, scores each .md file by query-token overlap, and
+    returns the top ``limit`` matches.  This intentionally bypasses the FTS5
+    index in reply_engine so the UI can preview results without a full
+    monitor setup.
+    """
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("type") != "local":
+        raise ValueError("仅支持检索本地知识库: %s" % kb_id)
+    base = Path(spec.get("path") or "")
+    if not base.exists() or not base.is_dir():
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query}
+    toks = re.findall(r"[\u4e00-\u9fff]{2,}|\w+", query or "")
+    toks = [t for t in toks if len(t) >= 1]
+    if not toks:
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query}
+    scored = []
+    total = 0
+    for p in base.rglob("*.md"):
+        if p.name == ".kb_index.sqlite":
+            continue
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        total += 1
+        rel = str(p.relative_to(base)).replace("\\", "/")
+        score = 0
+        for tok in toks:
+            tl = tok.lower()
+            score += body.lower().count(tl)
+            score += rel.lower().count(tl) * 3
+        if score:
+            snippet = body.strip().splitlines()
+            preview = " ".join(snippet)[:240]
+            scored.append({
+                "rel_path": rel,
+                "score": score,
+                "snippet": preview,
+            })
+    scored.sort(key=lambda x: (-x["score"], x["rel_path"]))
+    return {
+        "hits": scored[:max(1, int(limit))],
+        "matched_files": len(scored),
+        "total_files": total,
+        "query": query,
+    }
+
+
+def _convert_file_to_markdown(path):
+    path = Path(path)
+    notes = []
+    text = ""
+    try:
+        from markitdown import MarkItDown  # type: ignore
+        result = MarkItDown().convert(str(path))
+        text = getattr(result, "text_content", "") or ""
+        if text.strip():
+            return text
+        notes.append("python_markitdown_returned_empty")
+    except Exception as e:
+        notes.append("python_markitdown_error: %s: %s" % (type(e).__name__, e or "no_message"))
+    markitdown_cmd = _find_markitdown_exe()
+    try:
+        proc = subprocess.run([markitdown_cmd, str(path)], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=120,
+                              creationflags=_NO_WINDOW_FLAGS)
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            return proc.stdout
+        stderr_tail = ((proc.stderr or "").strip().splitlines() or [""])[-1][:400]
+        stdout_head = (proc.stdout or "")[:400]
+        notes.append("cli_exit=%s stderr_tail=%r stdout_head=%r" % (
+            proc.returncode, stderr_tail, stdout_head,
+        ))
+    except Exception as e:
+        notes.append("cli_markitdown_error: %s: %s" % (type(e).__name__, e or "no_message"))
+    try:
+        size = path.stat().st_size
+        notes.append("file_size=%d" % size)
+    except Exception:
+        pass
+    raise ValueError(
+        "非 Markdown 文件需要 MarkItDown 转换，但转换失败: %s [%s]" % (path, " | ".join(notes))
+    )
+
+
+def _find_markitdown_exe():
+    env = os.environ.get("MARKITDOWN_EXE")
+    if env and Path(env).exists():
+        return env
+    candidates = [
+        Path(r"D:\programs\wechat-kb-tools\Scripts\markitdown.exe"),
+        ROOT / ".venv" / "Scripts" / "markitdown.exe",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return "markitdown"
 
 
 def open_kb_dir(kb_id, config_path=CONFIG_PATH):
@@ -597,12 +954,43 @@ def open_kb_dir(kb_id, config_path=CONFIG_PATH):
     import subprocess
     system = platform.system()
     if system == "Windows":
-        subprocess.Popen(["explorer", str(p)])
+        subprocess.Popen(["explorer", str(p)], creationflags=_NO_WINDOW_FLAGS)
     elif system == "Darwin":
         subprocess.Popen(["open", str(p)])
     else:
         subprocess.Popen(["xdg-open", str(p)])
     return str(p)
+
+
+def open_kb_obsidian(kb_id, config_path=CONFIG_PATH):
+    """Open a local knowledge base directory as an Obsidian vault."""
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("type") != "local":
+        raise ValueError("仅支持用 Obsidian 打开本地知识库: %s" % kb_id)
+    p = Path(spec.get("path") or "")
+    if not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+    exe = _find_obsidian_exe()
+    subprocess.Popen([exe, str(p)], creationflags=_NO_WINDOW_FLAGS)
+    return {"path": str(p), "executable": exe}
+
+
+def _find_obsidian_exe():
+    env = os.environ.get("OBSIDIAN_EXE")
+    if env and Path(env).exists():
+        return env
+    candidates = [
+        Path(r"D:\programs\Obsidian\Obsidian.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Obsidian" / "Obsidian.exe",
+        Path(r"C:\Program Files\Obsidian\Obsidian.exe"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return "Obsidian.exe"
 
 
 def list_items(kind="all", config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
@@ -665,4 +1053,3 @@ def list_groups(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
     rows = list(by_user.values())
     rows.sort(key=lambda r: (0 if r.get("status") == "pending" else 1, str(r.get("last_message_time") or "")), reverse=False)
     return rows
-

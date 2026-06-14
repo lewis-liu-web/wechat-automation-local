@@ -21,11 +21,175 @@ import threading
 import time
 import uuid
 import argparse
+import sqlite3
 import shlex
 from typing import Any, Dict, Iterable, List, Tuple
+import base64
+import urllib.request
+import urllib.error
+import urllib.request
+
+try:
+    import task_router as _task_router
+    import agent_jobs as _agent_jobs
+    _HAS_TASK_ROUTER = True
+except Exception:
+    _task_router = None  # type: ignore
+    _agent_jobs = None  # type: ignore
+    _HAS_TASK_ROUTER = False
+
+try:
+    from message_aggregator import get_capabilities, CapabilityRegistry
+except Exception:
+    get_capabilities = None  # type: ignore
+    CapabilityRegistry = None  # type: ignore
 
 
-DEFAULT_TRIGGERS = ["@群聊小助手", "群聊小助手", "小助理", "小助手"]
+def _extract_image_md5_from_xml(content: str) -> str | None:
+    """从微信图片消息XML中提取图片md5或aeskey用于解码。"""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(content.strip())
+        # 处理 <msg><img .../></msg> 格式
+        if root.tag == 'msg':
+            img = root.find('img')
+            if img is not None:
+                md5 = img.get('md5')
+                if md5:
+                    return md5
+                aeskey = img.get('aeskey')
+                if aeskey:
+                    return aeskey
+        # 处理 <img .../> 根格式
+        if root.tag == 'img':
+            md5 = root.get('md5')
+            if md5:
+                return md5
+            aeskey = root.get('aeskey')
+            if aeskey:
+                return aeskey
+    except Exception:
+        pass
+    # 兜底: 正则提取md5
+    m = re.search(r'md5="([a-fA-F0-9]{32})"', content)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _call_minimax_vlm(image_path: str, user_prompt: str = "简要的描述一下图片内容") -> str | None:
+    """调用 MiniMax VLM CLI 理解图片内容（通过 mmx cli 避免直接 API 余额限制）。"""
+    try:
+        from image_handler import mmx_recognize_image
+        desc = mmx_recognize_image(image_path, prompt=user_prompt)
+        if desc and not desc.startswith("[VLM Error]"):
+            return desc
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_image_for_message(message: Dict[str, Any], config: Dict[str, Any]) -> str | None:
+    """对图片消息解码并调用VLM理解，返回图片描述文本。
+
+    优先使用主循环已解码的 image_path（由 image_handler.process_image_message 设置），
+    失败后再走备用路径: message local_id → message_resource.db packed_info → md5 →
+          attach/{md5(username)}/*/Img/{md5}.dat → decrypt → VLM
+    """
+    # ---- 路径A: 优先使用主循环已解码图片 ----
+    image_path = message.get("image_path")
+    if image_path and os.path.isfile(str(image_path)):
+        desc = _call_minimax_vlm(str(image_path))
+        if desc:
+            return f"[图片内容: {desc}]"
+
+    # ---- 路径B: 备用复杂路径 ----
+    import sqlite3
+    import hashlib
+    import glob as glob_mod
+
+    local_id = message.get("local_id") or message.get("msg_local_id")
+    if not local_id:
+        return None
+
+    decrypted_dir = config.get("decrypted_dir")
+    db_dir = config.get("db_dir")
+    if not decrypted_dir or not db_dir:
+        return None
+
+    wechat_base_dir = str(Path(db_dir).parent)
+    resource_path = os.path.join(decrypted_dir, "message", "message_resource.db")
+
+    if not os.path.isfile(resource_path):
+        return None
+
+    md5_hex = None
+    try:
+        conn = sqlite3.connect(resource_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT packed_info FROM MessageResourceInfo WHERE message_local_id=?",
+            (local_id,)
+        ).fetchall()
+        for row in rows:
+            blob = row["packed_info"]
+            if blob:
+                try:
+                    from decode_image import extract_md5_from_packed_info
+                    extracted = extract_md5_from_packed_info(blob)
+                except Exception:
+                    extracted = None
+                if extracted:
+                    md5_hex = extracted
+                    break
+        conn.close()
+    except Exception:
+        return None
+
+    if not md5_hex:
+        return None
+
+    username = message.get("username") or message.get("talker") or ""
+    if username:
+        attach_user_dir = hashlib.md5(username.encode("utf-8")).hexdigest()
+    else:
+        attach_user_dir = "*"
+
+    attach_dir = os.path.join(wechat_base_dir, "msg", "attach")
+    if not os.path.isdir(attach_dir):
+        return None
+
+    dat_file = None
+    for sub in ([attach_user_dir] if attach_user_dir != "*" else sorted(os.listdir(attach_dir), reverse=True)):
+        sub_path = os.path.join(attach_dir, sub)
+        if not os.path.isdir(sub_path):
+            continue
+        pattern = os.path.join(sub_path, "*", "Img", f"{md5_hex}*.dat")
+        matches = glob_mod.glob(pattern, recursive=False)
+        if matches:
+            dat_file = matches[0]
+            break
+
+    if not dat_file or not os.path.isfile(dat_file):
+        return None
+
+    try:
+        from decode_image import decrypt_dat_file
+        decoded_path, fmt = decrypt_dat_file(dat_file)
+    except Exception:
+        return None
+
+    if not decoded_path or not os.path.isfile(decoded_path):
+        return None
+
+    desc = _call_minimax_vlm(decoded_path)
+    if desc:
+        return f"[图片内容: {desc}]"
+    return None
+
+
+
+DEFAULT_TRIGGERS = []
 MAX_REPLY_CHARS = 300
 
 HIGH_RISK_PATTERNS = [
@@ -81,7 +245,7 @@ def strip_group_sender_prefix(text: str) -> str:
 
 def strip_triggers(text: str, triggers: Iterable[str] | None = None) -> str:
     text = strip_group_sender_prefix(text or "")
-    triggers = list(triggers or DEFAULT_TRIGGERS)
+    triggers = list(triggers if triggers is not None else DEFAULT_TRIGGERS)
     for trig in sorted(triggers, key=len, reverse=True):
         text = text.replace(trig, " ")
     text = re.sub(r"@[^\s\u2005]+", " ", text)
@@ -105,12 +269,55 @@ def _looks_like_smalltalk(text: str) -> bool:
     if not t:
         return True
     if len(t) <= 18 and not _contains_any(t, [
-        "资料", "知识库", "产品", "业务", "方案", "套餐", "认证", "实名", "真实号", "工作号", "权益", "重庆", "移动", "中移", "介绍", "是什么", "怎么", "如何", "多少", "价格", "报价", "合同", "授权", "审批", "记录", "笔记"
+        "资料", "知识库", "产品", "业务", "方案", "套餐", "认证", "实名", "真实号", "工作号", "权益", "重庆", "移动", "中移", "介绍", "是什么", "怎么", "如何", "多少", "价格", "报价", "合同", "授权", "审批", "记录", "笔记",
+        "分析", "图片", "看图", "识别", "截图", "提取", "总结", "对比", "整理", "生成", "写",
     ]):
         return True
     return _contains_any(t, [
         "哈哈", "笑死", "讲个笑话", "开个玩笑", "在吗", "在不在", "早上好", "下午好", "晚上好", "无聊", "天气不错", "吃饭了吗", "你觉得呢", "咋样啊", "聊聊"
     ])
+
+
+def _is_image_followup_request(text: str) -> bool:
+    t = strip_triggers(text or "")
+    if not t:
+        return False
+    return _contains_any(t, ["图", "图片", "照片", "截图", "看图", "识别", "分析", "看看", "描述", "提取", "总结"])
+
+
+def _recent_image_prompt_from_context(context_messages: Any, current_local_id: int | None = None) -> str:
+    if not isinstance(context_messages, list):
+        return ""
+    for msg in reversed(context_messages[-12:]):
+        if not isinstance(msg, dict):
+            continue
+        try:
+            local_id = int(msg.get("local_id") or 0)
+        except Exception:
+            local_id = 0
+        if current_local_id and local_id >= current_local_id:
+            continue
+        text = str(msg.get("content") or msg.get("str_content") or msg.get("message") or msg.get("message_content") or "")
+        if not _is_image_followup_request(text):
+            continue
+        clean = strip_triggers(text)
+        if clean:
+            return clean
+    return ""
+
+
+def _describe_images_for_agent(image_paths: List[str], prompt: str) -> List[Dict[str, str]]:
+    descriptions: List[Dict[str, str]] = []
+    if not image_paths:
+        return descriptions
+    user_prompt = prompt or "请简要描述图片内容，并提取对用户请求有用的信息"
+    for p in image_paths[:3]:
+        desc = _call_minimax_vlm(p, user_prompt=user_prompt)
+        if desc:
+            descriptions.append({"path": p, "description": desc})
+        else:
+            descriptions.append({"path": p, "description": ""})
+    return descriptions
 
 
 def load_wiki(base_dir: str | Path | None = None) -> List[Tuple[str, str]]:
@@ -281,6 +488,9 @@ def _load_local_kb_docs(root: Path, spec: Dict[str, Any]) -> List[Tuple[str, str
 
 
 def _retrieve_local_kb(query: str, root: Path, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
+    indexed = _retrieve_local_kb_fts(query, root, spec, limit)
+    if indexed:
+        return indexed
     docs = _load_local_kb_docs(root, spec)
     scored = []
     for rel, body in docs:
@@ -292,6 +502,97 @@ def _retrieve_local_kb(query: str, root: Path, spec: Dict[str, Any], limit: int)
     for score, rel, body in scored[:limit]:
         out.append(KnowledgeHit("local", str(spec.get("id") or spec.get("path")), str(spec.get("scope") or "scene"), rel, body[:1200], score))
     return out
+
+
+def _local_kb_path(root: Path, spec: Dict[str, Any]) -> Path | None:
+    path_value = spec.get("path") or spec.get("dir")
+    if not path_value:
+        return None
+    p = Path(path_value)
+    if not p.is_absolute():
+        p = root / p
+    return p
+
+
+def _fts_query(query: str) -> str:
+    toks = _query_tokens(query)
+    if not toks:
+        return ""
+    return " OR ".join('"%s"' % t.replace('"', ' ') for t in toks[:12])
+
+
+def _ensure_local_kb_fts(root: Path, spec: Dict[str, Any]) -> sqlite3.Connection | None:
+    base = _local_kb_path(root, spec)
+    if not base or not base.exists() or not base.is_dir():
+        return None
+    db_path = base / ".kb_index.sqlite"
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE IF NOT EXISTS docs (rel_path TEXT PRIMARY KEY, mtime REAL NOT NULL, body TEXT NOT NULL)")
+    con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(rel_path, body, content='docs', content_rowid='rowid')")
+    known = {row["rel_path"]: float(row["mtime"] or 0) for row in con.execute("SELECT rel_path, mtime FROM docs")}
+    seen = set()
+    changed = False
+    for p in sorted(base.rglob("*.md")):
+        if p.name == ".kb_index.sqlite":
+            continue
+        try:
+            rel = str(p.relative_to(base)).replace("\\", "/")
+            mtime = p.stat().st_mtime
+            seen.add(rel)
+            if known.get(rel) == mtime:
+                continue
+            body = p.read_text(encoding="utf-8", errors="replace")
+            row = con.execute("SELECT rowid FROM docs WHERE rel_path=?", (rel,)).fetchone()
+            if row:
+                con.execute("UPDATE docs SET mtime=?, body=? WHERE rel_path=?", (mtime, body, rel))
+                con.execute("DELETE FROM docs_fts WHERE rowid=?", (row["rowid"],))
+                con.execute("INSERT INTO docs_fts(rowid, rel_path, body) VALUES (?, ?, ?)", (row["rowid"], rel, body))
+            else:
+                cur = con.execute("INSERT INTO docs(rel_path, mtime, body) VALUES (?, ?, ?)", (rel, mtime, body))
+                con.execute("INSERT INTO docs_fts(rowid, rel_path, body) VALUES (?, ?, ?)", (cur.lastrowid, rel, body))
+            changed = True
+        except Exception:
+            continue
+    for rel in set(known) - seen:
+        row = con.execute("SELECT rowid FROM docs WHERE rel_path=?", (rel,)).fetchone()
+        if row:
+            con.execute("DELETE FROM docs_fts WHERE rowid=?", (row["rowid"],))
+        con.execute("DELETE FROM docs WHERE rel_path=?", (rel,))
+        changed = True
+    if changed:
+        con.commit()
+    return con
+
+
+def _retrieve_local_kb_fts(query: str, root: Path, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
+    q = _fts_query(query)
+    if not q:
+        return []
+    con = None
+    try:
+        con = _ensure_local_kb_fts(root, spec)
+        if not con:
+            return []
+        rows = con.execute(
+            "SELECT rel_path, body, bm25(docs_fts) AS rank FROM docs_fts WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?",
+            (q, max(1, int(limit or spec.get("limit") or 5))),
+        ).fetchall()
+        out: List[KnowledgeHit] = []
+        for row in rows:
+            rel = str(row["rel_path"])
+            body = str(row["body"] or "")
+            score = _score_doc(query, rel, body) or max(1, len(out) + 1)
+            out.append(KnowledgeHit("local", str(spec.get("id") or spec.get("path")), str(spec.get("scope") or "scene"), rel, body[:1200], score))
+        return out
+    except Exception:
+        return []
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
 
 
 def _ima_query_variants(query: str, limit: int = 8) -> List[str]:
@@ -757,11 +1058,23 @@ def _clean_agent_output(text: str) -> str:
     text = text or ""
     text = text.replace("[ROUND END]", "")
     text = re.sub(r"<summary>[\s\S]*?</summary>", "", text).strip()
+    # GenericAgent may include planning/prose before the final WeChat reply,
+    # e.g. "Since ... I'll give ... @张三 正文". Prefer the last @-reply span.
+    mention_spans = list(re.finditer(r"@[\w\-\u4e00-\u9fff]+\s+[^\n]+", text))
+    from_mention = False
+    if mention_spans:
+        text = text[mention_spans[-1].start():].strip()
+        from_mention = True
     # Prefer the final non-empty prose line; discard obvious tool/code noise.
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    bad_prefix = ("LLM Running", "🛠️", "```", "<thinking>", "</thinking>", "<summary>")
-    useful = [ln for ln in lines if not ln.startswith(bad_prefix) and not ln.startswith("{") and not ln.startswith("}")]
-    return " ".join(useful[-3:]).strip() if useful else text.strip()
+    bad_prefix = ("🛠️", "```", "<thinking>", "</thinking>", "<summary>")
+    useful = [
+        ln for ln in lines
+        if "LLM Running" not in ln and not ln.startswith(bad_prefix) and not ln.startswith("{") and not ln.startswith("}")
+    ]
+    if not useful:
+        return text.strip()
+    return " ".join(useful).strip() if from_mention else " ".join(useful[-3:]).strip()
 
 
 _LOCAL_LLM_CLIENTS: Dict[str, Any] = {}
@@ -864,15 +1177,32 @@ def _call_local_llm_provider(prompt: str, config: Dict[str, Any]) -> str | None:
         + prompt
     )
     messages = [{"role": "user", "content": input_text}]
-    try:
-        gen = client.chat(messages, tools=[])
+    timeout = float(config.get("llm_timeout", 120))
+    result = {"resp": None, "done": False, "error": None}
+
+    def _consume():
         try:
-            while True:
-                next(gen)
-        except StopIteration as e:
-            resp = e.value
-    except Exception:
+            gen = client.chat(messages, tools=[])
+            try:
+                while True:
+                    next(gen)
+            except StopIteration as e:
+                result["resp"] = e.value
+            except Exception as e:
+                result["error"] = e
+        except Exception as e:
+            result["error"] = e
+        result["done"] = True
+
+    t = threading.Thread(target=_consume, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if not result["done"]:
         return None
+    if result["error"]:
+        return None
+    resp = result.get("resp")
     if resp is not None and getattr(resp, "content", None):
         return postcheck(str(resp.content).strip())
     return None
@@ -1027,6 +1357,232 @@ def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[st
     return _extract_command_reply(out)
 
 
+def _post_http_agent_body(config: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any] | None:
+    agent_url = config.get("agent_url")
+    if not agent_url:
+        return None
+
+    timeout = float(config.get("agent_timeout", 30))
+    api_key = config.get("agent_api_key", "")
+    extra_headers = config.get("agent_headers") or {}
+
+    req_data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        **extra_headers,
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(
+        agent_url,
+        data=req_data,
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            if not resp_body:
+                return None
+            try:
+                data = json.loads(resp_body)
+                return data if isinstance(data, dict) else {"reply_text": str(data)}
+            except (json.JSONDecodeError, ValueError):
+                return {"reply_text": resp_body.strip()} if resp_body.strip() else None
+    except urllib.error.URLError as e:
+        import logging
+        logging.getLogger("reply_engine").warning("http_agent URL error: %r", e)
+        return None
+    except Exception as e:
+        import logging
+        logging.getLogger("reply_engine").warning("http_agent exception: %r", e)
+        return None
+
+
+def _genericagent_bridge_request(method: str, url: str, body: Dict[str, Any] | None = None, timeout: float = 30) -> Dict[str, Any] | None:
+    data = json.dumps(body or {}, ensure_ascii=False).encode("utf-8") if body is not None else None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            if not resp_body:
+                return {}
+            parsed = json.loads(resp_body)
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+    except Exception as e:
+        import logging
+        logging.getLogger("reply_engine").warning("genericagent_bridge request failed %s %s: %r", method, url, e)
+        return None
+
+
+def _last_assistant_message(messages: List[Dict[str, Any]], min_id: int = 0) -> Dict[str, Any] | None:
+    for msg in reversed(messages or []):
+        try:
+            msg_id = int(msg.get("id") or 0)
+        except Exception:
+            msg_id = 0
+        if msg.get("role") == "assistant" and msg_id > min_id:
+            return msg
+    return None
+
+
+def _json_safe(value: Any) -> Any:
+    seen: set[int] = set()
+
+    def _convert(item: Any) -> Any:
+        if isinstance(item, (bytes, bytearray)):
+            return f"<bytes {len(item)}>"
+        if isinstance(item, dict):
+            oid = id(item)
+            if oid in seen:
+                return "<circular>"
+            seen.add(oid)
+            try:
+                return {str(k): _convert(v) for k, v in item.items()}
+            finally:
+                seen.discard(oid)
+        if isinstance(item, (list, tuple)):
+            oid = id(item)
+            if oid in seen:
+                return ["<circular>"]
+            seen.add(oid)
+            try:
+                return [_convert(v) for v in item]
+            finally:
+                seen.discard(oid)
+        return item
+
+    return _convert(value)
+
+
+def _call_genericagent_bridge(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
+    """Use GenericAgent's existing frontends/desktop_bridge.py HTTP API.
+
+    Bridge contract:
+      POST /session/new -> {sessionId}
+      POST /session/{sid}/prompt -> {accepted, userMessageId}
+      GET  /session/{sid}/messages -> assistant message list
+    """
+    base_url = str(config.get("bridge_url") or config.get("agent_url") or "http://127.0.0.1:14168").rstrip("/")
+    timeout = float(config.get("agent_timeout", config.get("bridge_timeout", 60)))
+    poll_interval = float(config.get("bridge_poll_interval", 1.0))
+    max_wait = float(config.get("bridge_max_wait", timeout))
+    cwd = config.get("bridge_cwd") or config.get("cwd")
+
+    session_id = str(config.get("bridge_session_id") or "").strip()
+    if not session_id:
+        session_body = {"cwd": cwd} if cwd else {}
+        created = _genericagent_bridge_request("POST", f"{base_url}/session/new", session_body, timeout=timeout)
+        session_id = str((created or {}).get("sessionId") or "")
+    if not session_id:
+        return None
+
+    rich_prompt = prompt
+    if payload:
+        payload = _json_safe(payload)
+        rich_prompt = (
+            f"{prompt}\n\n"
+            "[WECHAT_RAW_PAYLOAD_JSON]\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+            "[/WECHAT_RAW_PAYLOAD_JSON]"
+        )
+
+    submitted = _genericagent_bridge_request(
+        "POST",
+        f"{base_url}/session/{session_id}/prompt",
+        {"prompt": rich_prompt},
+        timeout=timeout,
+    )
+    if not submitted or submitted.get("accepted") is not True:
+        return None
+    try:
+        user_msg_id = int(submitted.get("userMessageId") or submitted.get("seq") or 0)
+    except Exception:
+        user_msg_id = 0
+
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        time.sleep(max(0.2, poll_interval))
+        data = _genericagent_bridge_request(
+            "GET",
+            f"{base_url}/session/{session_id}/messages?after={user_msg_id}&limit=20",
+            None,
+            timeout=min(timeout, 10),
+        )
+        assistant_msg = _last_assistant_message((data or {}).get("messages") or [], min_id=user_msg_id)
+        if assistant_msg:
+            content = str(assistant_msg.get("content") or "").strip()
+            return content or None
+    return None
+
+
+def _call_http_agent(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
+    """Call an external agent via HTTP POST.
+
+    This is the product-friendly path for users who already have
+    OpenClaw, Hermes, GenericAgent, or any other agent app running
+    with an HTTP endpoint.
+
+    Supported config:
+      provider: "http_agent"
+      agent_url: "http://localhost:8000/chat"
+      agent_api_key: "sk-xxx" (optional)
+      agent_timeout: 30 (seconds, default 30)
+      agent_headers: {"x-custom": "value"} (optional extra headers)
+
+    Request body (JSON):
+      {
+        "task": "wechat_reply",
+        "mode": "standard" | "raw_agent",
+        "messages": [
+          {"role": "system", "content": "..."},
+          {"role": "user", "content": "..."}
+        ],
+        "payload": {...},
+        "context": {
+          "target_name": "...",
+          "sender": "...",
+          "wiki_hits": [...],
+          "image_paths": [...]
+        }
+      }
+
+    Expected response (JSON):
+      {"reply_text": "..."}
+    """
+    # Build request body
+    body = {
+        "task": "wechat_reply",
+        "mode": (payload or {}).get("mode") or "standard",
+        "messages": [
+            {"role": "system", "content": "你是群聊小助手。请根据用户问题和提供的知识库内容生成简洁、自然的回复。"},
+            {"role": "user", "content": prompt},
+        ],
+        "payload": payload or {},
+        "context": {},
+    }
+    if payload:
+        body["context"] = {
+            "target_name": payload.get("target", {}).get("name"),
+            "sender": payload.get("mention_name"),
+            "wiki_hits": payload.get("wiki_hits", []),
+            "image_paths": payload.get("image_paths", []),
+            "mode": payload.get("mode"),
+        }
+
+    data = _post_http_agent_body(config, body)
+    if not data or data.get("should_reply") is False:
+        return None
+    reply = data.get("reply_text") or data.get("text") or data.get("content") or data.get("output") or data.get("response") or data.get("reply")
+    return str(reply).strip() if reply else None
+
+
 def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None, payload: Dict[str, Any] | None = None) -> str | None:
     """Optional provider hook. Supports lightweight external agent command first-class."""
     config = config or {}
@@ -1040,6 +1596,19 @@ def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None, payload
         cmd_reply = _call_command_provider(prompt, config, payload)
         if cmd_reply:
             return postcheck(cmd_reply)
+        return None
+
+    # HTTP agent path: connect to any local or remote agent via HTTP POST.
+    if provider == "http_agent":
+        http_reply = _call_http_agent(prompt, config, payload)
+        if http_reply:
+            return postcheck(http_reply)
+        return None
+
+    if provider == "genericagent_bridge":
+        bridge_reply = _call_genericagent_bridge(prompt, config, payload)
+        if bridge_reply:
+            return postcheck(_clean_agent_output(bridge_reply))
         return None
 
     # Existing GA in-process adapter stays available as just another agent app.
@@ -1058,7 +1627,7 @@ def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None, payload
     return None
 
 
-def fallback_reply(clean_text: str, wiki_hits: List[Tuple[str, str]], mode: str = "scene") -> Tuple[str, str, bool]:
+def fallback_reply(clean_text: str, wiki_hits: List[Any], mode: str = "scene") -> Tuple[str, str, bool]:
     text = clean_text or ""
     if not text:
         return "我在，有事可以直接说，我会尽量基于已有信息帮你整理或转达。", "smalltalk", False
@@ -1113,6 +1682,86 @@ def _extract_mention_name(message: Dict[str, Any] | str) -> str:
     return ""
 
 
+def _is_raw_agent_mode(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    """Whether reply work is delegated fully to the external agent.
+
+    In this mode the Python process only keeps the WeChat-side responsibilities:
+    listen, trigger/session decision, image file extraction, and sending.  It does
+    not retrieve wiki, run local vision, build grounded prompts, or fallback with
+    canned replies.
+    """
+    raw_engine_cfg = config.get("reply_engine")
+    engine_cfg: Dict[str, Any] = raw_engine_cfg if isinstance(raw_engine_cfg, dict) else {}
+    values = [
+        engine_cfg.get("raw_mode"),
+        engine_cfg.get("agent_raw_mode"),
+        target.get("raw_mode"),
+        target.get("agent_raw_mode"),
+    ]
+    if any(v is True for v in values):
+        return True
+    mode = str(engine_cfg.get("mode") or target.get("reply_engine_mode") or "").lower()
+    return mode in {"raw", "raw_agent", "agent_raw"}
+
+
+def _build_raw_agent_prompt(clean_text: str, mention_name: str) -> str:
+    mention_rule = f"如需回复，建议以 @{mention_name} + 空格 开头。" if mention_name else "如需回复，建议直接输出适合微信群发送的一段话。"
+    return (
+        "你是专用微信群回复 agent。微信侧只负责监听、触发和发送；"
+        "内容理解、图片识别、wiki/知识库匹配、边界判断和回复生成都由你完成。\n"
+        "请根据 HTTP payload 里的 raw_text、clean_text、context_messages、image_paths、"
+        "target、wiki_dir、knowledge_bases 等字段自行处理。\n"
+        "只输出要发回微信群的一段中文回复；如果不应该回复，返回空字符串或 JSON 字段 should_reply=false。"
+        f"{mention_rule}\n\n"
+        f"当前清洗后消息：{clean_text}"
+    )
+
+
+def _agent_reply_from_response(data: Dict[str, Any] | None) -> str | None:
+    if not data or data.get("should_reply") is False:
+        return None
+    reply = (
+        data.get("reply_text")
+        or data.get("text")
+        or data.get("content")
+        or data.get("output")
+        or data.get("response")
+        or data.get("reply")
+    )
+    return str(reply).strip() if reply else None
+
+
+def _selected_kb_specs(config: Dict[str, Any], target: Dict[str, Any]) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    for kb_id in resolve_target_kb_ids(config, target):
+        spec = _resolve_kb_spec(config, target, kb_id)
+        if not spec:
+            specs.append({"id": kb_id, "missing": True})
+            continue
+        specs.append(spec)
+    return specs
+
+
+def _call_raw_http_agent(llm_config: Dict[str, Any], payload: Dict[str, Any]) -> str | None:
+    prompt = str(payload.get("prompt") or "")
+    body = {
+        "task": "wechat_reply",
+        "mode": "raw_agent",
+        "messages": [
+            {"role": "system", "content": "你是专用微信群回复 agent。请自行完成内容理解、图片识别、wiki匹配和回复生成。"},
+            {"role": "user", "content": prompt},
+        ],
+        "payload": payload,
+        "context": {
+            "target_name": payload.get("target", {}).get("name"),
+            "sender": payload.get("mention_name"),
+            "image_paths": payload.get("image_paths", []),
+            "knowledge_bases": payload.get("knowledge_bases", []),
+        },
+    }
+    return _agent_reply_from_response(_post_http_agent_body(llm_config, body))
+
+
 def _ensure_mention_prefix(reply: str, mention_name: str) -> str:
     text = (reply or "").strip()
     name = (mention_name or "").strip().lstrip("@")
@@ -1151,7 +1800,8 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
     else:
         task_rule = "当前已命中场景知识库。请优先依据场景wiki回答，同时遵守core边界约束；知识库无依据时说明不确定。"
         wiki_label = "[core约束与场景wiki]"
-    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n任务策略：{task_rule}\n\n{('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
+    ctx_header = ('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''
+    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n任务策略：{task_rule}\n\n{ctx_header}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
 
 
 def generate_reply(message: Dict[str, Any] | str,
@@ -1160,9 +1810,234 @@ def generate_reply(message: Dict[str, Any] | str,
     config = config or {}
     target = target or {}
     raw_text = message if isinstance(message, str) else (message.get("content") or message.get("str_content") or message.get("message") or message.get("message_content") or "")
+    raw_agent_mode = _is_raw_agent_mode(config, target)
+    # Vision routing for image messages (local_type==3)
+    image_paths = []
+    if isinstance(message, dict) and message.get("local_type") == 3:
+        image_path = message.get("image_path")
+        if image_path and os.path.isfile(str(image_path)):
+            image_paths.append(str(image_path))
+        # Strip raw binary placeholder from image messages so the LLM never sees "<bytes 516>"
+        if isinstance(raw_text, str) and raw_text.startswith("<bytes "):
+            raw_text = ""
+    # Also pick up images from session context (e.g. user sent a photo then asked about it)
+    session_img_paths = message.get("session_image_paths") if isinstance(message, dict) else None
+    if session_img_paths:
+        import logging
+        logging.getLogger('reply_engine').info('session_image_paths received: %s', session_img_paths)
+        for p in session_img_paths:
+            if p and os.path.isfile(str(p)) and str(p) not in image_paths:
+                image_paths.append(str(p))
+                logging.getLogger('reply_engine').info('session_image_paths added: %s', str(p))
+            elif p:
+                logging.getLogger('reply_engine').warning('session_image_paths file not found: %s', str(p))
+    # Route vision processing according to target config. In raw agent mode,
+    # image recognition is delegated to the agent; WeChat side only passes paths.
+    if image_paths and isinstance(message, dict) and not raw_agent_mode:
+        vision_mode = (target.get("vision") or {}).get("mode", "agent_llm")
+        if vision_mode == "agent_llm":
+            # Pass image_paths to provider payload; agent decides how to handle
+            pass
+        elif vision_mode == "llm_vision":
+            # Direct LLM vision call if provider supports it
+            try:
+                from image_handler import mmx_recognize_image
+                desc = mmx_recognize_image(image_paths[0], prompt="简要的描述一下图片内容")
+                if desc and not desc.startswith("[VLM Error]"):
+                    raw_text = f"{raw_text or ''}\n\n【系统识别：用户发送了图片，图片内容如下】{desc}".strip()
+                else:
+                    import logging
+                    logging.getLogger('reply_engine').warning('vision llm_vision failed: %s', desc)
+            except Exception as e:
+                import logging
+                logging.getLogger('reply_engine').warning('vision llm_vision exception: %r', e)
+        elif vision_mode == "hook":
+            # Call user-configured hook command
+            try:
+                from image_handler import run_vision_hook
+                hook_cmd = (target.get("vision") or {}).get("hook_cmd")
+                if hook_cmd and image_paths:
+                    desc = run_vision_hook(image_paths[0], hook_cmd)
+                    if desc and not desc.startswith("[Vision Hook Error]"):
+                        raw_text = f"{raw_text or ''}\n\n【系统识别：用户发送了图片，图片内容如下】{desc}".strip()
+            except Exception:
+                pass
     triggers = target.get("triggers") or config.get("default_triggers") or DEFAULT_TRIGGERS
     clean = strip_triggers(raw_text, triggers)
     mention_name = _extract_mention_name(message)
+
+    if raw_agent_mode:
+        context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
+        selected_kbs = resolve_target_kb_ids(config, target)
+        llm_config = dict(config.get("reply_engine", config) or {})
+        current_local_id = message.get("local_id") if isinstance(message, dict) else None
+        if image_paths and not clean:
+            clean = _recent_image_prompt_from_context(context_messages, current_local_id=current_local_id)
+            if clean:
+                raw_text = clean
+        # --- Capability-aware vision handling ---
+        caps = get_capabilities() if get_capabilities else None
+        has_local_vision = bool(caps.local_vision_mmx) if caps else False
+        image_descriptions: List[Dict[str, str]] = []
+        if image_paths:
+            if has_local_vision:
+                image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text)
+            else:
+                # No vision capability – mark as missing so agent_provider can degrade gracefully
+                image_descriptions = [{"path": p, "description": "[当前环境未配置视觉识别能力]"} for p in image_paths]
+        prompt = _build_raw_agent_prompt(clean or raw_text, mention_name)
+        boundary = precheck(clean or raw_text)
+        if boundary:
+            boundary.reply_text = _ensure_mention_prefix(postcheck(boundary.reply_text), mention_name)
+            boundary.retrieval_debug = {"mode": "raw_agent", "selected_kbs": selected_kbs, "blocked_before_agent": True}
+            return boundary
+        # --- Task complexity routing (M2) ---
+        # Decide whether this message should enter the job queue (deep_agent)
+        # or be handled locally (fast_reply).  Must run BEFORE smalltalk check
+        # because short messages like "分析这张图" are deep_agent, not smalltalk.
+        route_decision = None
+        if _HAS_TASK_ROUTER:
+            local_type = message.get("local_type") if isinstance(message, dict) else None
+            msg_type = "text"
+            if local_type == 3:
+                msg_type = "image"
+            elif local_type == 34:
+                msg_type = "voice"
+            elif local_type == 49:
+                msg_type = "file"
+            route_decision = _task_router.route_message(  # type: ignore
+                clean,
+                message_type=msg_type,
+                has_image=bool(image_paths),
+                has_file=(local_type == 49),
+            )
+            if route_decision.route == _task_router.ROUTE_DEEP:  # type: ignore
+                try:
+                    job_key = "%s:%s" % (target.get("username", "unknown"), message.get("local_id", 0) if isinstance(message, dict) else 0)
+                    group_key = target.get("username") or target.get("name") or "unknown"
+                    payload_context_messages = context_messages[-10:] if isinstance(context_messages, list) else context_messages
+                    job = _agent_jobs.enqueue_job(  # type: ignore
+                        job_key=job_key,
+                        group_key=group_key,
+                        target_name=target.get("name"),
+                        sender=mention_name,
+                        message_local_id=message.get("local_id") if isinstance(message, dict) else None,
+                        task_type="deep_agent",
+                        payload=_json_safe({
+                            "prompt": clean or raw_text,
+                            "clean_text": clean,
+                            "raw_text": raw_text,
+                            "image_paths": image_paths,
+                            "image_descriptions": image_descriptions,
+                            "context_messages": payload_context_messages,
+                            "mention_name": mention_name,
+                            "target": {
+                                "name": target.get("name"),
+                                "username": target.get("username"),
+                                "table": target.get("table"),
+                            },
+                        }),
+                    )
+                    ack_text = "收到，正在处理，稍等。"
+                    return ReplyDecision(
+                        True,
+                        _ensure_mention_prefix(ack_text, mention_name),
+                        intent="deep_agent_queued",
+                        risk_level="low",
+                        need_human=False,
+                        reason="deep_agent_enqueued",
+                        wiki_hits=[],
+                        retrieval_debug={
+                            "mode": "raw_agent",
+                            "route": route_decision.route,
+                            "route_reason": route_decision.reason,
+                            "job_id": job.get("id"),
+                            "selected_kbs": selected_kbs,
+                        },
+                    )
+                except Exception:
+                    pass
+        # Raw-agent mode delegates substantial work to the product-owned
+        # AgentProvider job queue. A bare mention/hello still uses local rules
+        # so the user gets an instant answer without consuming external agents.
+        if not clean or _looks_like_smalltalk(clean):
+            reply, intent, need_human = fallback_reply(clean, [])
+            return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
+                                 risk_level="medium" if need_human else "low",
+                                 need_human=need_human,
+                                 reason="raw_agent_smalltalk_fallback",
+                                 wiki_hits=[],
+                                  retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
+        if _HAS_TASK_ROUTER:
+            try:
+                local_type = message.get("local_type") if isinstance(message, dict) else None
+                route_name = getattr(route_decision, "route", "agent_provider")
+                route_reason = getattr(route_decision, "reason", "agent_provider")
+                job_key = "%s:%s" % (target.get("username", "unknown"), message.get("local_id", 0) if isinstance(message, dict) else 0)
+                group_key = target.get("username") or target.get("name") or "unknown"
+                payload_context_messages = context_messages[-10:] if isinstance(context_messages, list) else context_messages
+                job = _agent_jobs.enqueue_job(  # type: ignore
+                    job_key=job_key,
+                    group_key=group_key,
+                    target_name=target.get("name"),
+                    sender=mention_name,
+                    message_local_id=message.get("local_id") if isinstance(message, dict) else None,
+                    task_type=str(route_name or "agent_provider"),
+                    provider=(target.get("agent_provider") or target.get("provider") or None),
+                    payload=_json_safe({
+                        "prompt": clean or raw_text,
+                        "clean_text": clean,
+                        "raw_text": raw_text,
+                        "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),
+                        "image_paths": image_paths,
+                        "image_descriptions": image_descriptions,
+                        "context_messages": payload_context_messages,
+                        "event_context": (None if isinstance(message, str) else message.get('event_context')) or {},
+                        "target_policy": (None if isinstance(message, str) else message.get('target_policy')) or {},
+                        "mention_name": mention_name,
+                        "route": str(route_name or "agent_provider"),
+                        "route_reason": str(route_reason or "agent_provider"),
+                        "wiki_dir": str(resolve_wiki_dir(config, target)),
+                        "knowledge_bases": selected_kbs,
+                        "knowledge_base_specs": _selected_kb_specs(config, target),
+                        "target": {
+                            "id": target.get("id"),
+                            "name": target.get("name"),
+                            "username": target.get("username"),
+                            "table": target.get("table"),
+                        },
+                        "wechat_side": {
+                            "responsibilities": ["listen", "trigger", "session", "image_extract", "send"],
+                            "delegated_to_agent": ["content_understanding", "vision", "wiki_match", "rag", "reply_generation"],
+                        },
+                    }),
+                )
+                ack_text = "收到，正在处理，稍等。"
+                return ReplyDecision(
+                    True,
+                    _ensure_mention_prefix(ack_text, mention_name),
+                    intent="agent_job_queued",
+                    risk_level="low",
+                    need_human=False,
+                    reason="agent_provider_enqueued",
+                    wiki_hits=[],
+                    retrieval_debug={
+                        "mode": "raw_agent",
+                        "route": str(route_name or "agent_provider"),
+                        "route_reason": str(route_reason or "agent_provider"),
+                        "job_id": job.get("id"),
+                        "selected_kbs": selected_kbs,
+                    },
+                )
+            except Exception as e:
+                return ReplyDecision(True, _ensure_mention_prefix("复杂处理服务暂不可用，我先收到。", mention_name),
+                                     intent="agent_job_enqueue_failed", risk_level="low", need_human=False,
+                                     reason="agent_provider_enqueue_failed:%r" % (e,), wiki_hits=[],
+                                     retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
+        return ReplyDecision(True, _ensure_mention_prefix("复杂处理服务暂不可用，我先收到。", mention_name),
+                             intent="agent_job_router_unavailable", risk_level="low", need_human=False,
+                             reason="agent_job_router_unavailable", wiki_hits=[],
+                             retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
 
     if not clean:
         reply, intent, need_human = fallback_reply(clean, [])
@@ -1177,16 +2052,33 @@ def generate_reply(message: Dict[str, Any] | str,
         pre.reply_text = _ensure_mention_prefix(postcheck(pre.reply_text), mention_name)
         return pre
 
-    # Retrieval comes before chat classification.  A message with scene KB hits is
-    # by definition a knowledge-bound question, even if it looks casual/short.
-    # If retrieval yields no scene hits, core boundaries still apply and the
-    # request falls back to bounded chat mode.
-    layers = retrieve_knowledge_layers(clean or raw_text, config, target)
+    # --- reply_mode control ---
+    reply_mode = str(config.get("reply_mode") or target.get("reply_mode") or "standard").lower()
+
+    # Retrieval: skip in free mode; always run in standard/strict mode.
+    if reply_mode == "free":
+        layers = {"core": [], "scene": []}
+    else:
+        layers = retrieve_knowledge_layers(clean or raw_text, config, target)
     core_hits = layers.get("core") or []
     raw_scene_hits = layers.get("scene") or []
     scene_hits = _strong_scene_hits(clean or raw_text, raw_scene_hits)
+
+    # strict mode: refuse to reply when no scene wiki hit.
+    if reply_mode == "strict" and not scene_hits:
+        return ReplyDecision(
+            should_reply=False,
+            reply_text="",
+            intent="strict_no_wiki",
+            risk_level="low",
+            need_human=False,
+            reason="strict_mode_no_scene_hit",
+            wiki_hits=[],
+        )
+
     retrieval_debug = {
         "query": clean or raw_text,
+        "reply_mode": reply_mode,
         "selected_kbs": list(target.get("knowledge_bases") or resolve_target_kb_ids(config, target) or []),
         "core_count": len(core_hits),
         "raw_scene_count": len(raw_scene_hits),
@@ -1231,6 +2123,7 @@ def generate_reply(message: Dict[str, Any] | str,
             "table": target.get("table"),
         },
         "retrieval_debug": retrieval_debug,
+        "image_paths": image_paths,
     }
     llm_text = call_llm_provider(prompt, llm_config, provider_payload)
     if llm_text:

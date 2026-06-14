@@ -18,9 +18,56 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
-from reply_engine import DEFAULT_TRIGGERS, generate_reply
+from reply_engine import DEFAULT_TRIGGERS, generate_reply, precheck, postcheck
+from reply_decision import decide as reply_decision_decide
 from wechat_sender import send_reply_detailed
+from message_aggregator import (
+    ingest_event,
+    event_from_monitor_message,
+    flush_all_pending,
+    flush_due,
+    has_open_window,
+    AggregatedTurn,
+)
+try:
+    import event_log as _event_log
+except Exception:  # pragma: no cover
+    _event_log = None
+
+
+def _record_event(kind, target=None, sender=None, payload=None):
+    if _event_log is None:
+        return
+    try:
+        _event_log.log_event(kind, target=target, sender=sender, payload=payload or {})
+    except Exception:
+        # never let telemetry break the monitor loop
+        pass
+
+
+def _ensure_sender_mention(text, msg, contact_names=None):
+    reply = str(text or '').strip()
+    sender_username = extract_group_sender_username(msg.get('message_content'))
+    sender_display = (contact_names or {}).get(sender_username) if sender_username else ''
+    name = str(
+        msg.get('mention_name')
+        or msg.get('sender_display_name')
+        or sender_display
+        or msg.get('sender_username')
+        or msg.get('sender')
+        or ''
+    ).strip().lstrip('@')
+    if not reply or not name:
+        return reply
+    expected = '@' + name
+    if reply.startswith(expected):
+        return reply if reply.startswith(expected + ' ') else expected + ' ' + reply[len(expected):].strip()
+    if reply.startswith('@'):
+        import re
+        reply = re.sub(r'^@\S+\s*', '', reply, count=1).strip()
+    return (expected + ' ' + reply).strip()
 
 ROOT = Path(__file__).resolve().parent
 MEMORY = (ROOT.parent.parent / 'memory').resolve()
@@ -31,8 +78,62 @@ WECHAT_HWND_HINT = 67810
 LOG = ROOT / 'wechat_bot_monitor.log'
 STOP_FILE = ROOT / 'wechat_bot_monitor.stop'
 
+SESSION_WINDOW_DEFAULT = 60  # seconds; group chats should be conservative by default
+
+# Active session state per user per target.
+# Key: target+sender, Value: {'expires_at': float}
+_active_sessions = {}
+_CONFIG_CACHE: dict = {}  # str(path) -> (mtime_ns: int, cfg: dict)
+_CONTACT_CACHE: dict = {}  # str(path) -> (mtime_ns: int, names: dict[str, str])
+
+
+def _invalidate_config_cache(path) -> None:
+    try:
+        _CONFIG_CACHE.pop(str(Path(path).resolve()), None)
+    except Exception:
+        pass
+
+
+def _invalidate_contact_cache(path) -> None:
+    try:
+        _CONTACT_CACHE.pop(str(Path(path).resolve()), None)
+    except Exception:
+        pass
+
+
+MODE_DEFAULTS = {
+    'personal_assistant': {
+        'reply_policy': 'relaxed',
+        'session_policy': {'timeout_seconds': 300, 'max_turns': 10, 'require_followup_intent': False},
+        'context_policy': {'time_window_seconds': 180, 'max_messages': 40, 'sender_recent_limit': 8, 'include_bot_recent': True},
+    },
+    'group_assistant': {
+        'reply_policy': 'conservative',
+        'session_policy': {'timeout_seconds': 60, 'max_turns': 3, 'require_followup_intent': True},
+        'context_policy': {'time_window_seconds': 90, 'max_messages': 30, 'sender_recent_limit': 5, 'include_bot_recent': True},
+    },
+    'customer_service': {
+        'reply_policy': 'knowledge_grounded',
+        'session_policy': {'timeout_seconds': 120, 'max_turns': 5, 'require_followup_intent': True},
+        'context_policy': {'time_window_seconds': 120, 'max_messages': 40, 'sender_recent_limit': 6, 'include_bot_recent': True},
+    },
+}
+
+FOLLOWUP_PATTERNS = [
+    '继续', '那这个', '这个呢', '为什么', '怎么', '如何', '咋', '然后呢', '还有呢',
+    '什么意思', '啥意思', '看下', '帮我看', '分析', '对吗', '可以吗', '要怎么',
+    '图片', '图里', '截图', '上面', '刚才', '前面', '它', '这个', '?', '？'
+]
+
+CLOSE_SESSION_PATTERNS = ['谢谢', '谢了', '好了', '好啦', '明白', '懂了', '不用了', '没事了', '解决了']
+
+# Recent image paths per sender per target, used when a text message triggers after an image.
+# Key: target+sender, Value: [{'path': str, 'time': float}, ...]
+_pending_images = {}
+
 try:
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # type: ignore[attr-defined]
 except Exception:
     pass
 
@@ -44,25 +145,193 @@ def log(msg):
         f.write(line + '\n')
 
 
+def _deep_merge(base, override):
+    out = dict(base or {})
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def resolve_target_policy(cfg, target):
+    """Return normalized product policy for a target.
+
+    Keep product entities intentionally small: mode decides business behavior;
+    text/image/voice/file are input capabilities, not separate modes.
+    """
+    mode = str(target.get('mode') or cfg.get('mode') or 'group_assistant').lower()
+    if mode not in MODE_DEFAULTS:
+        mode = 'group_assistant'
+    policy = _deep_merge(MODE_DEFAULTS[mode], {})
+    policy = _deep_merge(policy, cfg.get('policy') or {})
+    policy = _deep_merge(policy, target.get('policy') or {})
+    for key in ('reply_policy', 'session_policy', 'context_policy', 'trigger_policy', 'input_capabilities', 'image_policy'):
+        if key in cfg:
+            if isinstance(cfg[key], dict) and isinstance(policy.get(key), dict):
+                policy[key] = _deep_merge(policy[key], cfg[key])
+            else:
+                policy[key] = cfg[key]
+        if key in target:
+            if isinstance(target[key], dict) and isinstance(policy.get(key), dict):
+                policy[key] = _deep_merge(policy[key], target[key])
+            else:
+                policy[key] = target[key]
+    policy.setdefault('input_capabilities', {'text': True, 'image': True, 'voice': False, 'file': False})
+    policy.setdefault('image_policy', {'bind_window_seconds': 90, 'max_pending_images': 5, 'trigger_behavior': 'mention_or_active_session'})
+    policy['mode'] = mode
+    return policy
+
+
+def _message_text(msg):
+    return str((msg or {}).get('message_content') or '').strip()
+
+
+def _looks_like_followup(text):
+    low = str(text or '').lower()
+    return any(p.lower() in low for p in FOLLOWUP_PATTERNS)
+
+
+def _looks_like_session_close(text):
+    low = str(text or '').lower()
+    return any(p.lower() in low for p in CLOSE_SESSION_PATTERNS)
+
+
 def msg_table(username):
     return 'Msg_' + hashlib.md5(str(username).encode('utf-8')).hexdigest()
 
 
-def load_config(path=CONFIG_PATH):
-    if not path.exists():
-        raise FileNotFoundError('missing config: %s' % path)
-    cfg = json.loads(path.read_text(encoding='utf-8'))
+def _session_key(t, msg):
+    """Unique key for session: target + sender.
+
+    Always uses real_sender_id (numeric id, stable across messages)
+    so that image messages (which may not have sender_username set)
+    and trigger messages (which do) share the same key.
+    Falls back to sender_username only when real_sender_id is missing.
+    """
+    sender = msg.get('real_sender_id')
+    if sender is None:
+        sender = msg.get('sender_username')
+        if not sender:
+            sender = msg.get('sender') or ''
+    key = '%s|%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'), sender)
+    log('session_key target=%s sender_field=%s real_sender_id=%s sender_username=%s key=%s' % (
+        t.get('name'),
+        msg.get('sender') or '',
+        msg.get('real_sender_id'),
+        msg.get('sender_username') or '',
+        key))
+    return key
+
+
+def _clear_expired_sessions(cfg):
+    """Remove sessions and pending images that have expired."""
+    now = time.time()
+    group_policy = resolve_target_policy(cfg, {})
+    window = float((group_policy.get('image_policy') or {}).get('bind_window_seconds') or cfg.get('session_window') or SESSION_WINDOW_DEFAULT)
+    # Clear expired sessions
+    expired = [k for k, v in _active_sessions.items() if now > v.get('expires_at', 0)]
+    for k in expired:
+        log('session_expired key=%s' % k)
+        del _active_sessions[k]
+    # Clear expired pending images (same window as session)
+    for key, items in list(_pending_images.items()):
+        fresh = [item for item in items if now - item.get('time', 0) <= window]
+        if fresh:
+            _pending_images[key] = fresh
+        else:
+            log('pending_images_expired key=%s' % key)
+            del _pending_images[key]
+
+
+def _is_in_session(t, msg, cfg):
+    """Check if sender can continue an active session for this target."""
+    key = _session_key(t, msg)
+    sess = _active_sessions.get(key)
+    policy = resolve_target_policy(cfg, t)
+    session_policy = policy.get('session_policy') or {}
+    text = _message_text(msg)
+    if sess and time.time() < sess.get('expires_at', 0):
+        if _looks_like_session_close(text):
+            log('session_close key=%s reason=close_intent text=%r' % (key, text[:80]))
+            _active_sessions.pop(key, None)
+            return False
+        max_turns = int(session_policy.get('max_turns') or 3)
+        turns = int(sess.get('turns') or 0)
+        if max_turns > 0 and turns >= max_turns:
+            log('session_miss key=%s reason=max_turns turns=%s max=%s' % (key, turns, max_turns))
+            return False
+        require_followup = bool(session_policy.get('require_followup_intent', True))
+        has_images = bool(msg.get('image_path') or msg.get('session_image_paths'))
+        if require_followup and not has_images and not _looks_like_followup(text):
+            log('session_miss key=%s reason=no_followup_intent text=%r' % (key, text[:80]))
+            return False
+        timeout = float(session_policy.get('timeout_seconds') or cfg.get('session_window') or SESSION_WINDOW_DEFAULT)
+        sess['turns'] = turns + 1
+        sess['last_message_at'] = time.time()
+        sess['expires_at'] = time.time() + timeout
+        log('session_hit key=%s turns=%s expires_in=%.0fs followup=%s image=%s' % (
+            key, sess['turns'], sess['expires_at'] - time.time(), _looks_like_followup(text), has_images))
+        return True
+    log('session_miss key=%s active_keys=%s' % (key, list(_active_sessions.keys())))
+    return False
+
+
+def _activate_session(t, msg, cfg):
+    """Activate or refresh a session window for this sender."""
+    policy = resolve_target_policy(cfg, t)
+    session_policy = policy.get('session_policy') or {}
+    window = float(session_policy.get('timeout_seconds') or cfg.get('session_window') or SESSION_WINDOW_DEFAULT)
+    key = _session_key(t, msg)
+    prev = _active_sessions.get(key) or {}
+    _active_sessions[key] = {
+        'expires_at': time.time() + window,
+        'last_message_at': time.time(),
+        'turns': int(prev.get('turns') or 0) + 1,
+        'mode': policy.get('mode'),
+        'state': 'active',
+    }
+    log('session_activated key=%s mode=%s turns=%s window=%.0fs expires_at=%s' % (
+        key, policy.get('mode'), _active_sessions[key]['turns'], window,
+        time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_active_sessions[key]['expires_at']))))
+
+
+def _read_and_init_config(path) -> dict:
+    cfg = json.loads(Path(path).read_text(encoding='utf-8'))
     cfg.setdefault('poll_interval', 3)
     cfg.setdefault('default_triggers', DEFAULT_TRIGGERS[:])
+    cfg.setdefault('default_response_mode', 'trigger')
     cfg.setdefault('default_reply_template', '')
     cfg.setdefault('wiki_dir', str(ROOT / 'wiki'))
     cfg.setdefault('reply_engine', {})
     cfg.setdefault('context_limit', 12)
-    cfg.setdefault('send_mode', 'foreground')
+    cfg.setdefault('send_mode', 'cua_separate_window')
     cfg.setdefault('send_strategy', 'current_or_uia_then_ocr_search_physical')
     cfg.setdefault('uia_probe_enabled', True)
     cfg.setdefault('stop_file', str(STOP_FILE))
     cfg.setdefault('targets', [])
+    # Merge image/DB settings from config.json (decryptor config) if available
+    try:
+        from config import CONFIG_FILE
+        import json as _json
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                db_cfg = _json.load(f)
+            # Copy keys needed by image_handler and other utilities
+            for key in ('db_dir', 'decrypted_dir', 'image_aes_key', 'image_xor_key', 'decoded_images_dir'):
+                if key in db_cfg and key not in cfg:
+                    cfg[key] = db_cfg[key]
+            # Also expose wechat_data_dir for backward compatibility
+            # wechat_data_dir should be the parent of db_dir (which ends with /db_storage)
+            if 'db_dir' in db_cfg and 'wechat_data_dir' not in cfg:
+                db_dir = db_cfg['db_dir']
+                if db_dir.endswith('db_storage') or db_dir.endswith('db_storage/'):
+                    cfg['wechat_data_dir'] = os.path.dirname(db_dir)
+                else:
+                    cfg['wechat_data_dir'] = db_dir
+    except Exception:
+        pass
     for t in cfg['targets']:
         t.setdefault('enabled', True)
         if not t.get('table') and t.get('username'):
@@ -70,14 +339,43 @@ def load_config(path=CONFIG_PATH):
         t.setdefault('db', 'message_0.db')
         t.setdefault('last_local_id', 0)
         t.setdefault('triggers', [])
+        t.setdefault('response_mode', 'trigger')
         t.setdefault('reply_template', '')
     return cfg
 
 
+def load_config(path=CONFIG_PATH):
+    """Load and initialize wechat_bot_targets.json, cached by mtime.
+
+    The main loop calls this every poll cycle.  When the file mtime is unchanged
+    we return the previously initialized dict, avoiding JSON parse + setdefault
+    + per-target table derivation on every cycle.  External writes
+    (manage_targets, control_api) are detected via st_mtime_ns and the cache is
+    rebuilt.  save_config() invalidates the cache entry before writing.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError('missing config: %s' % p)
+    try:
+        mtime_ns = p.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = -1
+    key = str(p.resolve())
+    cached = _CONFIG_CACHE.get(key)
+    if cached is not None and cached[0] == mtime_ns:
+        return cached[1]
+    cfg = _read_and_init_config(p)
+    _CONFIG_CACHE[key] = (mtime_ns, cfg)
+    return cfg
+
+
 def save_config(cfg, path=CONFIG_PATH):
-    tmp = path.with_suffix(path.suffix + '.tmp')
+    _invalidate_config_cache(path)
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + '.tmp')
     tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(path)
+    tmp.replace(p)
+
 
 
 def run_decrypt():
@@ -109,9 +407,6 @@ def clean_value(v):
 
 def row_to_dict(row):
     d = {k: clean_value(row[k]) for k in row.keys()}
-    # Keep raw bytes for packed_info_data so image handler can extract MD5
-    if 'packed_info_data' in row.keys():
-        d['packed_info_data'] = row['packed_info_data']
     ts = d.get('create_time') or 0
     try:
         d['create_time_local'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ts))) if int(ts) else ''
@@ -125,33 +420,54 @@ def table_exists(con, table):
 
 
 def load_contact_name_map(db_path=DECRYPTED_CONTACT_DB):
-    """Return username -> display name from the decrypted contact DB.
+    """Return username -> display name from the decrypted contact DB, cached.
 
     Group messages in message DB are stored as "username:\ncontent".  That
     username is stable but not suitable for a human-facing @ prefix, so resolve
     it to remark/nick_name before passing the message to reply_engine.
+
+    The main loop calls this every poll cycle.  We cache the dict keyed by
+    file mtime_ns; on a hit we skip the SQLite open and full-table scan.
+    The contact DB only changes when fast_refresh_targets decrypts it, so
+    a stable mtime means the result is stable.  Returning a fresh copy on
+    hit keeps the contract that callers may mutate the dict without
+    poisoning the cache.
     """
     p = Path(db_path)
     if not p.exists():
         return {}
-    con = sqlite3.connect('file:%s?mode=ro' % p.as_posix(), uri=True)
-    con.row_factory = sqlite3.Row
+    try:
+        mtime_ns = p.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = -1
+    key = str(p.resolve())
+    cached = _CONTACT_CACHE.get(key)
+    if cached is not None and cached[0] == mtime_ns:
+        return dict(cached[1])
+    try:
+        con = sqlite3.connect('file:%s?mode=ro' % p.as_posix(), uri=True)
+        con.row_factory = sqlite3.Row
+    except Exception as e:
+        log('warn load contact names failed: %r' % (e,))
+        return {}
     try:
         if not table_exists(con, 'contact'):
-            return {}
-        names = {}
-        for row in con.execute('select username, remark, nick_name, alias from contact'):
-            username = str(row['username'] or '').strip()
-            if not username:
-                continue
-            display = str(row['remark'] or row['nick_name'] or row['alias'] or username).strip()
-            names[username] = display or username
-        return names
+            names = {}
+        else:
+            names = {}
+            for row in con.execute('select username, remark, nick_name, alias from contact'):
+                username = str(row['username'] or '').strip()
+                if not username:
+                    continue
+                display = str(row['remark'] or row['nick_name'] or row['alias'] or username).strip()
+                names[username] = display or username
     except Exception as e:
         log('warn load contact names failed: %r' % (e,))
         return {}
     finally:
         con.close()
+    _CONTACT_CACHE[key] = (mtime_ns, names)
+    return dict(names)
 
 
 def extract_group_sender_username(message_content):
@@ -203,7 +519,12 @@ def fetch_new_for_db(db_name, targets):
                       order by local_id asc
                       limit 50'''
             for row in con.execute(sql, (last_id,)):
-                out.append((t, row_to_dict(row)))
+                d = row_to_dict(row)
+                # Keep packed_info_data as raw bytes for image MD5 extraction
+                raw_val = row['packed_info_data']
+                if raw_val is not None:
+                    d['packed_info_data'] = raw_val
+                out.append((t, d))
     finally:
         con.close()
     return out
@@ -259,31 +580,102 @@ def has_self_sent_after(t, after_local_id, text_hint=None):
         con.close()
 
 
+def _target_raw_db_path(t, cfg) -> Optional[Path]:
+    """Return the encrypted (raw) DB path for a target, or None if unknown.
+
+    The fast-refresh tool treats the target's ``db`` field as either a bare
+    filename (e.g. ``message_0.db``) or a relative path inside the WeChat
+    db_storage tree (e.g. ``bizchat/biz_message_0.db``).  Bare filenames are
+    resolved under the canonical ``message/`` subdirectory.  This mirrors
+    ``fast_refresh_targets.normalize_target_db`` so the two stay in sync.
+    """
+    db_dir = (cfg or {}).get('db_dir')
+    if not db_dir:
+        return None
+    rel = str(t.get('db') or 'message_0.db').replace('\\', '/').lstrip('/')
+    if '/' not in rel:
+        rel = 'message/' + rel
+    norm = os.path.normpath(rel)
+    if os.path.isabs(norm) or norm.startswith('..') or not norm.endswith('.db'):
+        return None
+    return Path(db_dir) / norm
+
+
+def _read_db_dir() -> Optional[str]:
+    """Return the raw WeChat db_storage path from config.json, or None.
+
+    We intentionally bypass ``load_config`` here: the wait path runs inside
+    a tight confirm loop and we only need a single field.  On any failure
+    (missing config, import error) we return None and the caller falls back
+    to refreshing every cycle, which is the safe default.
+    """
+    try:
+        from config import CONFIG_FILE
+    except Exception:
+        return None
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        db_dir = cfg.get('db_dir')
+        return db_dir if isinstance(db_dir, str) and db_dir else None
+    except Exception:
+        return None
+
+
+
+
+
 def wait_sent_confirmation(t, before_local_id, text, config_path=CONFIG_PATH, timeout=5.0):
-    """Refresh decrypted DB briefly and confirm a new self-sent row exists."""
+    """Wait until a new self-sent row shows up in the decrypted DB.
+
+    Refresh policy: the raw (encrypted) DB only changes when WeChat itself
+    writes a new message.  We stat the raw DB mtime and skip the
+    ``fast_refresh_targets`` step when it is unchanged, so an in-flight send
+    confirmation does not redundantly re-decrypt all targets every 0.5s.
+    If the raw DB mtime moves (or the raw file is missing) we do a refresh.
+    """
     t0 = time.time()
     deadline = t0 + max(0.5, float(timeout or 5.0))
     attempts = 0
     refresh_total = 0.0
+    refresh_skipped = 0
     lookup_total = 0.0
     last_summary = ''
+    last_rc = 0
+    last_changed = 0
+    raw_path = _target_raw_db_path(t, {'db_dir': _read_db_dir()})
+    last_raw_mtime_ns: Optional[int] = None
     while time.time() < deadline:
         attempts += 1
-        refresh_t0 = time.time()
-        rc, refresh_dt, changed, failed, summary = run_fast_refresh(config_path)
-        refresh_total += time.time() - refresh_t0
-        last_summary = summary
+        cur_mtime_ns: Optional[int] = None
+        if raw_path is not None and raw_path.exists():
+            try:
+                cur_mtime_ns = raw_path.stat().st_mtime_ns
+            except OSError:
+                cur_mtime_ns = None
+        need_refresh = (raw_path is None) or (cur_mtime_ns is None) or (cur_mtime_ns != last_raw_mtime_ns)
+        if need_refresh:
+            refresh_t0 = time.time()
+            rc, refresh_dt, changed, failed, summary = run_fast_refresh(config_path)
+            refresh_total += time.time() - refresh_t0
+            last_summary = summary
+            last_rc, last_changed, last_failed = rc, changed, failed
+            if cur_mtime_ns is not None:
+                last_raw_mtime_ns = cur_mtime_ns
+        else:
+            refresh_skipped += 1
         lookup_t0 = time.time()
         sent = has_self_sent_after(t, before_local_id, text)
         lookup_total += time.time() - lookup_t0
         if sent:
-            log('send DB-confirmed target=%s before=%s sent_local_id=%s elapsed=%.3fs attempts=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=rc%s/changed%s/failed%s/%s content=%r' % (
-                t.get('name'), before_local_id, sent.get('local_id'), time.time() - t0, attempts, refresh_total, lookup_total,
-                rc, changed, failed, last_summary, sent.get('message_content')))
+            log('send DB-confirmed target=%s before=%s sent_local_id=%s elapsed=%.3fs attempts=%d refresh=%d skipped=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=rc%s/changed%s/failed%s/%s content=%r' % (
+                t.get('name'), before_local_id, sent.get('local_id'), time.time() - t0, attempts, attempts - refresh_skipped, refresh_skipped,
+                refresh_total, lookup_total, last_rc, last_changed, last_failed, last_summary, sent.get('message_content')))
             return True
         time.sleep(0.5)
-    log('send NOT DB-confirmed target=%s before=%s timeout=%.1fs elapsed=%.3fs attempts=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=%s' % (
-        t.get('name'), before_local_id, float(timeout or 5.0), time.time() - t0, attempts, refresh_total, lookup_total, last_summary))
+    log('send NOT DB-confirmed target=%s before=%s timeout=%.1fs elapsed=%.3fs attempts=%d refresh=%d skipped=%d refresh_total=%.3fs lookup_total=%.3fs last_refresh=%s' % (
+        t.get('name'), before_local_id, float(timeout or 5.0), time.time() - t0, attempts, attempts - refresh_skipped, refresh_skipped,
+        refresh_total, lookup_total, last_summary))
     return False
 
 
@@ -308,7 +700,7 @@ def fetch_context_for_target(t, upto_local_id=None, limit=12):
         if upto_local_id is not None:
             where = 'where local_id <= ?'
             params.append(int(upto_local_id))
-        sql = 'select local_id, real_sender_id, create_time, status, message_content from "%s" %s order by local_id desc limit ?' % (table, where)
+        sql = 'select local_id, real_sender_id, create_time, status, message_content, packed_info_data from "%s" %s order by local_id desc limit ?' % (table, where)
         params.append(max(1, int(limit)))
         rows = [row_to_dict(r) for r in con.execute(sql, params)]
         out = []
@@ -328,12 +720,106 @@ def fetch_context_for_target(t, upto_local_id=None, limit=12):
         con.close()
 
 
+def build_event_context(t, trigger_msg, cfg, limit=None):
+    """Build event-centered context for group bot replies.
+
+    Keeps the legacy flat context_messages for compatibility, and adds structured
+    slices so the agent can distinguish the trigger, same-sender short history,
+    nearby group chatter, recent bot reply, and related images.
+    """
+    policy = resolve_target_policy(cfg, t)
+    ctx_policy = policy.get('context_policy') or {}
+    max_messages = int(limit or ctx_policy.get('max_messages') or cfg.get('context_limit') or 30)
+    sender_recent_limit = int(ctx_policy.get('sender_recent_limit') or 5)
+    window_seconds = int(ctx_policy.get('time_window_seconds') or 90)
+    all_rows = fetch_context_for_target(t, upto_local_id=trigger_msg.get('local_id'), limit=max_messages)
+    trigger_lid = int(trigger_msg.get('local_id') or 0)
+    trigger_ts = int(trigger_msg.get('create_time') or 0)
+    sender = trigger_msg.get('sender_username')
+    if not sender:
+        sender = trigger_msg.get('real_sender_id')
+        if sender is None:
+            sender = trigger_msg.get('sender') or ''
+
+    def row_sender(row):
+        return extract_group_sender_username(row.get('message_content')) or row.get('real_sender_id') or row.get('sender') or ''
+
+    time_window_messages = []
+    sender_recent = []
+    bot_recent = []
+    for row in all_rows:
+        try:
+            lid = int(row.get('local_id') or 0)
+            ts = int(row.get('create_time') or 0)
+        except Exception:
+            lid, ts = 0, 0
+        if lid == trigger_lid:
+            continue
+        if trigger_ts and ts and 0 <= (trigger_ts - ts) <= window_seconds:
+            time_window_messages.append(row)
+        if sender and str(row_sender(row)) == str(sender):
+            sender_recent.append(row)
+        if int(row.get('status') or 0) == 2:
+            bot_recent.append(row)
+
+    event_context = {
+        'mode': policy.get('mode'),
+        'reply_policy': policy.get('reply_policy'),
+        'trigger_message': trigger_msg,
+        'time_window_seconds': window_seconds,
+        'time_window_messages': time_window_messages[-max_messages:],
+        'sender_recent': sender_recent[-sender_recent_limit:],
+        'bot_recent': bot_recent[-1:] if (ctx_policy.get('include_bot_recent') is not False) else [],
+        'related_images': list(trigger_msg.get('session_image_paths') or ([] if not trigger_msg.get('image_path') else [trigger_msg.get('image_path')])),
+    }
+    return all_rows, event_context
+
+
+import re
+
+def _match_triggers(text: str, triggers: list) -> bool:
+    """Exact trigger matching. @mentions must match whole word like WeChat @attention."""
+    text = str(text or '')
+    for trig in triggers:
+        if not trig:
+            continue
+        if trig.startswith('@'):
+            # @mention exact match: @nickname followed by space/sep or end of string
+            # WeChat uses \u2005 (four-per-em space) after @mentions
+            pattern = re.escape(trig) + r'(?:[\s\u2005]|$)'
+            if re.search(pattern, text):
+                return True
+        else:
+            # Non-@ triggers: substring match
+            if trig in text:
+                return True
+    return False
+
+
 def is_trigger(cfg, target, msg):
+    """Unified trigger check for all message types.
+
+    Modes:
+      - 'trigger' (default): only respond when a trigger keyword matches.
+        Empty trigger list means NO response.
+      - 'free': respond to all messages (no trigger check).
+    """
     if int(msg.get('status') or 0) == 2:  # skip self-sent messages
         return False
+
+    response_mode = (target.get('response_mode') or cfg.get('default_response_mode') or 'trigger').lower()
+    if response_mode == 'free':
+        return True
+
+    # trigger mode
+    triggers = target.get('triggers')
+    if triggers is None:
+        triggers = cfg.get('default_triggers', [])
+    if not triggers:
+        return False  # empty trigger list = no response
+
     text = str(msg.get('message_content') or '')
-    triggers = target.get('triggers') or cfg.get('default_triggers') or []
-    return any(k and k in text for k in triggers)
+    return _match_triggers(text, triggers)
 
 
 def reply_text(cfg, target):
@@ -356,6 +842,23 @@ def send_reply(text, mode=None, target=None, before_local_id=None, cfg=None, con
     log('send result ok=%s mode=%s reason=%s confirmed=%s attempted=%s detail_keys=%s' % (
         result.ok, result.mode, result.reason, result.confirmed, ','.join(result.attempted), ','.join(sorted(result.detail.keys()))))
     return bool(result)
+
+
+def _send_image_task_missing_guide(turn, cfg, config_path=CONFIG_PATH, dry_run=False):
+    event_context = turn.event_context or {}
+    sender = event_context.get('sender_display_name') or event_context.get('mention_name') or event_context.get('sender_username') or ''
+    mention = f"@{sender} " if sender else ""
+    guide_text = f"{mention}缺少图片处理任务描述，请重新发送图片+任务描述"
+    target = turn.target or {}
+    log('aggregator_image_only_no_description target=%s local_id=%s sender=%s' % (
+        target.get('name'), turn.end_local_id, sender))
+    if dry_run:
+        log('dry-run: skip image-only guide send')
+        return True
+    t0 = time.time()
+    ok = send_reply(guide_text, cfg.get('send_mode'), target=target, before_local_id=turn.end_local_id, cfg=cfg, config_path=config_path)
+    log('reply send attempted ok=%s cost=%.3fs' % (ok, time.time() - t0))
+    return bool(ok)
 
 
 def enabled_targets(cfg):
@@ -471,7 +974,7 @@ def main():
                 new_count += 1
                 lid = int(m.get('local_id') or 0)
                 advance_state = True
-                # Image message: decrypt and attach image_path
+                # Image message: decrypt and attach image_path for vision processing in reply_engine
                 if int(m.get('local_type') or 0) == 3:
                     try:
                         from image_handler import process_image_message
@@ -482,50 +985,224 @@ def main():
                         if img_path:
                             m['image_path'] = img_path
                             log('image decrypted target=%s local_id=%s path=%s' % (t.get('name'), lid, img_path))
+                            # Store image path for this sender so a follow-up text query can reference it
+                            key = _session_key(t, m)
+                            _pending_images.setdefault(key, []).append({'path': img_path, 'time': time.time()})
+                            # Keep only the most recent 5 images per sender to avoid unbounded growth
+                            _pending_images[key] = _pending_images[key][-5:]
+                            log('pending_images stored key=%s sender=%s count=%d' % (key, m.get('real_sender_id') or m.get('sender') or '', len(_pending_images[key])))
                         else:
                             log('image decrypt failed target=%s local_id=%s' % (t.get('name'), lid))
                     except Exception as e:
                         log('image decrypt exception target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
-                log('new msg target=%s local_id=%s type=%s content=%r image=%s' % (
-                    t.get('name'), lid, m.get('local_type'), m.get('message_content'), m.get('image_path')))
-                if is_trigger(cfg, t, m):
-                    hit_count += 1
-                    context_limit = int(cfg.get('context_limit') or 12)
-                    context_t0 = time.time()
-                    ctx = fetch_context_for_target(t, upto_local_id=lid, limit=context_limit)
-                    context_dt = time.time() - context_t0
-                    if ctx:
-                        m['context_messages'] = ctx
-                    gen_t0 = time.time()
-                    decision = generate_reply(m, t, cfg)
+                log('new msg target=%s local_id=%s content=%r image=%s' % (t.get('name'), lid, m.get('message_content'), m.get('image_path', '')))
+                # --- session-based trigger handling ---
+                _clear_expired_sessions(cfg)
+                triggered = bool(is_trigger(cfg, t, m))
+                in_session = False
+                if triggered:
+                    _activate_session(t, m, cfg)
+                    _record_event(
+                        'trigger_matched',
+                        target=t.get('name'),
+                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                        payload={'local_id': lid, 'reason': 'trigger'},
+                    )
+                elif _is_in_session(t, m, cfg):
+                    log('session_trigger target=%s local_id=%s' % (t.get('name'), lid))
+                    in_session = True
+                    _record_event(
+                        'trigger_matched',
+                        target=t.get('name'),
+                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                        payload={'local_id': lid, 'reason': 'session'},
+                    )
+                should_process = triggered or in_session
+                if not should_process:
+                    current_event = event_from_monitor_message(m, t)
+                    if has_open_window(current_event.chat_id, current_event.sender_id):
+                        log('aggregator_open_window_append target=%s local_id=%s chat=%s sender=%s' % (
+                            t.get('name'), lid, current_event.chat_id, current_event.sender_id))
+                        should_process = True
+                        in_session = True
+                if not should_process:
+                    key = _session_key(t, m)
+                    text_for_pending = str(m.get('message_content') or '')
+                    triggers_for_pending = t.get('triggers')
+                    if triggers_for_pending is None:
+                        triggers_for_pending = cfg.get('default_triggers', [])
+                    pending_trigger = any((trig and trig in text_for_pending) for trig in triggers_for_pending)
+                    if pending_trigger and _pending_images.get(key):
+                        log('pending_image_trigger_fallback target=%s local_id=%s key=%s' % (t.get('name'), lid, key))
+                        triggered = True
+                        should_process = True
+                if should_process:
+                    key = _session_key(t, m)
+                    pending = _pending_images.pop(key, None)
+                    log('pending_images lookup key=%s sender=%s found=%s' % (key, m.get('real_sender_id') or m.get('sender') or '', bool(pending)))
+                    if pending:
+                        policy_for_pending = resolve_target_policy(cfg, t)
+                        image_policy = policy_for_pending.get('image_policy') or {}
+                        window = float(image_policy.get('bind_window_seconds') or cfg.get('session_window') or SESSION_WINDOW_DEFAULT)
+                        now = time.time()
+                        fresh_paths = [item['path'] for item in pending if now - item.get('time', 0) <= window]
+                        log('pending_images fresh_paths=%d total=%d window=%.0fs' % (len(fresh_paths), len(pending), window))
+                        if fresh_paths:
+                            m['session_image_paths'] = fresh_paths
+                if not should_process:
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
+
+                # High-risk requests should get an immediate safety boundary reply.
+                # This avoids losing the response if a debounce window is interrupted.
+                boundary = precheck(str(m.get('message_content') or ''))
+                if boundary and boundary.risk_level == 'high':
+                    text = _ensure_sender_mention(postcheck(boundary.reply_text), m, contact_names)
+                    if text and not args.dry_run:
+                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
+                        log('pre_boundary_immediate target=%s local_id=%s ok=%s reason=%s' % (
+                            t.get('name'), lid, ok, boundary.reason))
+                        _record_event(
+                            'send_ok' if ok else 'send_failed',
+                            target=t.get('name'),
+                            sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                            payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True},
+                        )
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
+
+                # ---- Message Aggregator (M5) ----
+                # Instead of immediately generating a reply for this single message,
+                # we feed it into a short conversation window.  When the window
+                # closes we get an AggregatedTurn containing all text + images.
+                event = event_from_monitor_message(m, t)
+                # Build minimal event_context for the aggregated turn
+                policy = resolve_target_policy(cfg, t)
+                ctx_policy = policy.get('context_policy') or {}
+                context_limit = int(ctx_policy.get('max_messages') or cfg.get('context_limit') or 30)
+                ctx, event_context = build_event_context(t, m, cfg, limit=context_limit)
+                event_context['target_policy'] = policy
+                event_context['trigger_matched'] = bool(triggered)
+                event_context['in_session'] = bool(in_session)
+                event_context['sender'] = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
+                event_context['sender_username'] = m.get('sender_username') or ''
+                event_context['sender_display_name'] = m.get('sender_display_name') or ''
+                event_context['mention_name'] = m.get('mention_name') or m.get('sender_display_name') or ''
+                sess_entry = _active_sessions.get(_session_key(t, m)) or {}
+                event_context['session_active'] = bool(sess_entry)
+                event_context['session_state'] = 'active' if sess_entry else 'idle'
+                event_context['session_turns'] = int(sess_entry.get('turns') or 0)
+
+                turn = ingest_event(
+                    event,
+                    trigger_matched=triggered,
+                    in_session=in_session,
+                    event_context=event_context,
+                    target=t,
+                    config=cfg,
+                )
+
+                if turn is None:
+                    # Window still open – do not reply yet, but advance cursor
+                    # so we don't re-process this message next cycle.
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
+
+                # Window closed – we have an aggregated turn.  Proceed to reply.
+                hit_count += 1
+
+                # Image-only without task description: guide the user instead of
+                # dispatching an agent job that has nothing to analyze.
+                if turn.image_paths and not turn.has_image_task_description():
+                    _send_image_task_missing_guide(turn, cfg, config_path=config_path, dry_run=args.dry_run)
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                    continue
+
+                agg_msg = turn.to_generate_reply_message()
+                agg_msg['context_messages'] = ctx
+                # Carry forward the original message's metadata for reply_engine
+                agg_msg['target_policy'] = policy
+                agg_msg['event_context'] = event_context
+
+                # Product reply decision layer (on the *aggregated* message)
+                decision_plan = reply_decision_decide(t, agg_msg, event_context)
+                log('decision target=%s local_id=%s should_reply=%s reason=%s mode=%s risk=%s confidence=%.2f' % (
+                    t.get('name'), turn.end_local_id, decision_plan.should_reply, decision_plan.reason,
+                    decision_plan.reply_mode, decision_plan.risk_level, decision_plan.confidence))
+                _record_event(
+                    'decision',
+                    target=t.get('name'),
+                    sender=event_context.get('sender'),
+                    payload={
+                        'local_id': turn.end_local_id,
+                        'should_reply': decision_plan.should_reply,
+                        'reason': decision_plan.reason,
+                        'reply_mode': decision_plan.reply_mode,
+                        'risk_level': decision_plan.risk_level,
+                        'confidence': decision_plan.confidence,
+                    },
+                )
+                if decision_plan.reply_mode == 'handoff' or decision_plan.risk_level == 'high':
+                    _record_event(
+                        'risk_detected',
+                        target=t.get('name'),
+                        sender=event_context.get('sender'),
+                        payload={'local_id': turn.end_local_id, 'reason': decision_plan.reason},
+                    )
+                if not decision_plan.should_reply:
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                    continue
+
+                gen_t0 = time.time()
+                try:
+                    decision = generate_reply(agg_msg, t, cfg)
                     gen_dt = time.time() - gen_t0
                     text = decision.reply_text
-                    log('trigger hit target=%s local_id=%s ctx=%d ctx=%.3fs gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
-                        t.get('name'), lid, len(ctx), context_dt, gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
+                    log('trigger hit target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
+                        t.get('name'), turn.end_local_id, len(ctx), gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
                     try:
                         detail = decision.to_dict()
                         detail['target'] = t.get('name')
-                        detail['local_id'] = lid
+                        detail['local_id'] = turn.end_local_id
                         detail['context_count'] = len(ctx)
-                        detail['context_seconds'] = round(context_dt, 3)
                         detail['generate_seconds'] = round(gen_dt, 3)
                         detail['reply_preview'] = (text or '')[:200]
                         log('decision_detail %s' % json.dumps(detail, ensure_ascii=False, default=str))
                     except Exception as e:
-                        log('decision_detail_error target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
+                        log('decision_detail_error target=%s local_id=%s error=%r' % (t.get('name'), turn.end_local_id, e))
                     if not decision.should_reply or not text:
                         log('decision: skip send')
+                        _record_event(
+                            'reply_skipped',
+                            target=t.get('name'),
+                            sender=event_context.get('sender'),
+                            payload={
+                                'local_id': turn.end_local_id,
+                                'reason': decision.reason,
+                                'intent': decision.intent,
+                                'risk_level': decision.risk_level,
+                            },
+                        )
                     elif args.dry_run:
                         log('dry-run: skip send')
                     else:
                         t0 = time.time()
-                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
-                        log('reply send attempted ok=%s cost=%.3fs' % (ok, time.time() - t0))
+                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=turn.end_local_id, cfg=cfg, config_path=config_path)
+                        cost = time.time() - t0
+                        log('reply send attempted ok=%s cost=%.3fs' % (ok, cost))
+                        _record_event(
+                            'send_ok' if ok else 'send_failed',
+                            target=t.get('name'),
+                            sender=event_context.get('sender'),
+                            payload={'local_id': turn.end_local_id, 'latency': round(cost, 3)},
+                        )
                         if not ok:
-                            # Do not pretend a message was delivered.  Still advance the cursor
-                            # by default to avoid repeatedly pasting the same failed reply every
-                            # poll; the failed local_id is recorded for manual/native retry.
-                            t['last_send_failed_local_id'] = lid
+                            t['last_send_failed_local_id'] = turn.end_local_id
                             t['last_send_failed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
                             if not cfg.get('advance_on_send_failure', True):
                                 advance_state = False
@@ -535,9 +1212,53 @@ def main():
                         else:
                             t.pop('last_send_failed_local_id', None)
                             t.pop('last_send_failed_at', None)
+                except Exception as e:
+                    import traceback as _tb
+                    tb_text = _tb.format_exc().replace('\n', ' | ')[:1200]
+                    log('reply_pipeline_exception target=%s local_id=%s error=%r traceback=%s' % (
+                        t.get('name'), turn.end_local_id, e, tb_text))
+                    try:
+                        _record_event(
+                            'reply_pipeline_exception',
+                            target=t.get('name'),
+                            sender=event_context.get('sender'),
+                            payload={'local_id': turn.end_local_id, 'error': repr(e)[:300]},
+                        )
+                    except Exception:
+                        pass
+                    advance_state = True
                 if advance_state:
-                    t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
-        if new_count and not args.no_save_state:
+                    t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+        # Close conversation windows whose debounce timer elapsed even when no
+        # new message arrives.  Without this, a single image + wake word can sit
+        # in memory forever waiting for another message to trigger the flush.
+        flushed_turns = flush_due()
+        for turn in flushed_turns:
+            turn_cfg = turn.config or cfg
+            turn_target = turn.target or {}
+            if turn.image_paths and not turn.has_image_task_description():
+                _send_image_task_missing_guide(turn, turn_cfg, config_path=config_path, dry_run=args.dry_run)
+                for tt in targets:
+                    if tt.get('username') == turn.chat_id:
+                        tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
+                        break
+                continue
+            try:
+                agg_msg = turn.to_generate_reply_message()
+                decision = generate_reply(agg_msg, turn_target, turn_cfg)
+                text = decision.reply_text
+                log('aggregator_flush_due target=%s local_id=%s intent=%s reason=%s reply=%r' % (
+                    turn_target.get('name'), turn.end_local_id, decision.intent, decision.reason, text))
+                if decision.should_reply and text and not args.dry_run:
+                    send_reply(text, turn_cfg.get('send_mode'), target=turn_target, before_local_id=turn.end_local_id, cfg=turn_cfg, config_path=config_path)
+                for tt in targets:
+                    if tt.get('username') == turn.chat_id:
+                        tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
+                        break
+            except Exception as e:
+                log('aggregator_flush_due_exception target=%s local_id=%s error=%r' % (
+                    turn_target.get('name'), turn.end_local_id, e))
+        if (new_count or flushed_turns) and not args.no_save_state:
             save_config(cfg, config_path)
         mode = 'sync-each-cycle' if args.sync_each_cycle else ('read-only' if args.no_fast_refresh else 'fast-refresh')
         log('cycle done mode=%s sync=%.3fs total=%.3fs targets=%d new=%d hits=%d refresh_changed=%d refresh_failed=%d' % (

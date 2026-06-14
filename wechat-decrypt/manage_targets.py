@@ -17,9 +17,27 @@ except Exception:
 
 import target_registry as reg
 
+try:
+    import event_log as _el
+except Exception:  # pragma: no cover
+    _el = None
+
+
+def _audit_event(kind: str, target: str | None = None, payload: dict | None = None) -> None:
+    """Best-effort audit write; never raises into the CLI flow."""
+    if _el is None:
+        return
+    try:
+        _el.log_event(kind, target=target, payload=payload or {})
+    except Exception:
+        pass
+
+
 ROOT = Path(__file__).resolve().parent
 MONITOR_SCRIPT = ROOT / "wechat_bot_monitor.py"
 STOP_FILE = ROOT / (reg.load_config().get("stop_file") or "wechat_bot_monitor.stop")
+GA_ROOT = ROOT.parents[1] if len(ROOT.parents) > 1 else ROOT
+_SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
 INIT_SCRIPT = ROOT / "config.py"
 KEY_SCRIPT = ROOT / "find_all_keys_windows.py" if (ROOT / "find_all_keys_windows.py").exists() else ROOT / "find_all_keys.py"
@@ -57,37 +75,6 @@ def cmd_init(json_mode=False):
         safe_print("decrypted_dir: %s" % out["decrypted_dir"])
         safe_print("下一步：python manage_targets.py key  # 提取数据库密钥")
         safe_print("或：  python manage_targets.py setup  # 提钥并解密全部数据库")
-    return 0
-
-
-def cmd_where(json_mode=False):
-    """Show current active WeChat data directory (auto-detected by message mtime)."""
-    from config import _auto_detect_db_dir_windows, _SYSTEM
-    detected = None
-    if _SYSTEM == "windows":
-        detected = _auto_detect_db_dir_windows()
-    if detected:
-        mtime = None
-        msg_dir = os.path.join(detected, "message")
-        if os.path.isdir(msg_dir):
-            try:
-                mtime = os.path.getmtime(msg_dir)
-                from datetime import datetime
-                mtime = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-            except OSError:
-                pass
-        if json_mode:
-            print_json({"ok": True, "active_db_dir": detected, "reason": "latest_message_mtime", "message_mtime": mtime})
-        else:
-            safe_print(f"[+] 当前活跃微信数据目录: {detected}")
-            if mtime:
-                safe_print(f"    message 目录最后活跃: {mtime}")
-            safe_print("    -> 用于 init / key / setup 等后续命令")
-    else:
-        if json_mode:
-            print_json({"ok": False, "error": "no_active_account_found"})
-        else:
-            safe_print("[!] 未检测到活跃微信账号（请确保微信已启动并登录）")
     return 0
 
 
@@ -152,6 +139,7 @@ def _monitor_pids():
             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -match 'wechat_bot_monitor\\.py' -and $_.Name -match '^pythonw?\\.exe$' } | Select-Object ProcessId | ForEach-Object { $_.ProcessId }"
         ],
         capture_output=True, text=True, encoding="utf-8",
+        creationflags=_SUBPROCESS_FLAGS,
     )
     pids = [int(x) for x in (out.stdout or "").strip().split() if x.strip().isdigit()]
     return pids
@@ -161,9 +149,59 @@ def _is_monitor_running():
     return bool(_monitor_pids())
 
 
+def _ensure_genericagent_bridge(cfg: dict | None = None) -> bool:
+    """Start GenericAgent desktop bridge when the reply engine depends on it.
+
+    The monitor can be started from the control UI via ``manage_targets start``;
+    that path used to skip ``start_wechat_auto.ps1`` and therefore left the
+    bridge down.  If raw GenericAgent mode is configured, no bridge means every
+    matched message turns into an empty reply.
+    """
+    loaded_cfg = cfg or reg.load_config()
+    if not isinstance(loaded_cfg, dict):
+        return True
+    raw_engine = loaded_cfg.get("reply_engine")
+    engine = raw_engine if isinstance(raw_engine, dict) else {}
+    if str(engine.get("provider") or "").lower() != "genericagent_bridge":
+        return True
+    bridge_url = str(engine.get("bridge_url") or "http://127.0.0.1:14168").rstrip("/")
+    try:
+        import urllib.request
+        import urllib.error
+        with urllib.request.urlopen(f"{bridge_url}/status", timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        if data.get("ready"):
+            return True
+    except Exception:
+        pass
+
+    ga_root = Path(engine.get("bridge_cwd") or GA_ROOT).resolve()
+    bridge_script = ga_root / "frontends" / "desktop_bridge.py"
+    if not bridge_script.exists():
+        return False
+    python = Path(sys.executable)
+    subprocess.Popen(
+        [str(python), str(bridge_script)],
+        cwd=str(ga_root),
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(3.0)
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{bridge_url}/status", timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+        return bool(data.get("ready"))
+    except Exception:
+        return False
+
+
 def cmd_start(json_mode=False):
+    cfg = reg.load_config()
+    bridge_ready = _ensure_genericagent_bridge(cfg)
     if _is_monitor_running():
-        msg = {"ok": True, "running": True, "message": "微信自动监听已在运行。"}
+        msg = {"ok": True, "running": True, "bridge_ready": bridge_ready, "message": "微信自动监听已在运行。"}
         if json_mode:
             safe_print(json.dumps(msg, ensure_ascii=False))
         else:
@@ -183,7 +221,7 @@ def cmd_start(json_mode=False):
     )
     time.sleep(1.0)
     running = _is_monitor_running()
-    msg = {"ok": running, "running": running, "message": "已启动微信自动监听。" if running else "启动中，请稍候再查看状态。"}
+    msg = {"ok": running, "running": running, "bridge_ready": bridge_ready, "message": "已启动微信自动监听。" if running else "启动中，请稍候再查看状态。"}
     if json_mode:
         safe_print(json.dumps(msg, ensure_ascii=False))
     else:
@@ -263,10 +301,6 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Manage WeChat bot monitored targets.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    # where = show current active WeChat data directory
-    p = sub.add_parser("where", aliases=["detect", "active"], help="show current active WeChat account data directory")
-    p.add_argument("--json", action="store_true")
-
     # scan = discover
     p = sub.add_parser("scan", aliases=["discover"], help="scan new chats into pending candidates")
     p.add_argument("--include-contacts", action="store_true", help="also add 1:1 contacts; default groups only")
@@ -294,7 +328,31 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
 
     # trigger = manage per-target trigger keywords
-    p = sub.add_parser("trigger", aliases=["triggers", "kw", "keyword"], help="list/add/set/remove trigger keywords for a target")
+    p = sub.add_parser("trigger-list", aliases=["tl"], help="list trigger keywords for a target (and the global default_triggers)")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("trigger-add", aliases=["ta"], help="add trigger keywords to a target")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("words", nargs="+", help="trigger keywords to add, e.g. @bot #ask")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("trigger-remove", aliases=["tr"], help="remove specific trigger keywords from a target")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("words", nargs="+", help="trigger keywords to remove")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("trigger-replace", aliases=["tp"], help="replace all per-target trigger keywords")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("words", nargs="+", help="new trigger keywords list")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("trigger-clear", aliases=["tc"], help="clear all per-target trigger keywords (fall back to default_triggers)")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("--json", action="store_true")
+
+    # legacy alias: `trigger key [words ...] [--set|--remove|--clear]`
+    p = sub.add_parser("trigger", aliases=["triggers", "kw", "keyword"], help="legacy alias; prefer trigger-list/add/remove/replace/clear")
     p.add_argument("key", help="target name or WeChat username")
     p.add_argument("triggers", nargs="*", help="trigger keywords, e.g. #ask #穿越测试")
     p.add_argument("--set", dest="replace", action="store_true", help="replace existing per-target triggers")
@@ -385,8 +443,6 @@ def main(argv=None):
 
     try:
         # -- db decrypt lifecycle --
-        if cmd in ("where", "detect", "active"):
-            return cmd_where(json_mode=args.json)
         if cmd in ("init", "cfg"):
             return cmd_init(json_mode=args.json)
         if cmd in ("key", "keys"):
@@ -500,11 +556,60 @@ def main(argv=None):
                     safe_print("监听进程未运行，请执行：python manage_targets.py start")
             return 0
 
-        # -- trigger / triggers / kw --
+        # -- trigger-list / trigger-add / trigger-remove / trigger-replace / trigger-clear --
+        if cmd in ("trigger-list", "tl"):
+            out = reg.get_triggers(args.key)
+            if args.json:
+                print_json({"ok": True, "target": out})
+            else:
+                safe_print("per-target triggers: %s" % (", ".join(out.get("triggers") or []) or "(empty; uses default_triggers)"))
+                safe_print("default_triggers: %s" % (", ".join(out.get("default_triggers") or []) or "(empty)"))
+            return 0
+
+        if cmd in ("trigger-add", "ta"):
+            out = reg.set_triggers(args.key, list(args.words), replace=False)
+            _audit_event("trigger_add", target=out.get("name"), payload={"words": list(args.words)})
+            if args.json:
+                print_json({"ok": True, "action": "added", "target": out})
+            else:
+                safe_print("已添加触发词: %s -> %s" % (out.get("name"), ", ".join(args.words)))
+            return 0
+
+        if cmd in ("trigger-remove", "tr"):
+            out = reg.remove_triggers(args.key, list(args.words), clear=False)
+            _audit_event("trigger_remove", target=out.get("name"), payload={"words": list(args.words)})
+            if args.json:
+                print_json({"ok": True, "action": "removed", "target": out})
+            else:
+                safe_print("已删除触发词: %s -> %s" % (out.get("name"), ", ".join(args.words)))
+            return 0
+
+        if cmd in ("trigger-replace", "tp"):
+            out = reg.set_triggers(args.key, list(args.words), replace=True)
+            _audit_event("trigger_replace", target=out.get("name"), payload={"words": list(args.words)})
+            if args.json:
+                print_json({"ok": True, "action": "replaced", "target": out})
+            else:
+                safe_print("已替换触发词: %s -> %s" % (out.get("name"), ", ".join(args.words)))
+            return 0
+
+        if cmd in ("trigger-clear", "tc"):
+            out = reg.remove_triggers(args.key, [], clear=True)
+            _audit_event("trigger_clear", target=out.get("name"), payload={})
+            if args.json:
+                print_json({"ok": True, "action": "cleared", "target": out})
+            else:
+                safe_print("已清空触发词: %s" % out.get("name"))
+            return 0
+
+        # -- legacy `trigger key [words] [--set|--remove|--clear]` --
         if cmd in ("trigger", "triggers", "kw", "keyword"):
-            if args.clear or args.remove:
-                out = reg.remove_triggers(args.key, args.triggers, clear=args.clear)
-                action = "已清空触发词" if args.clear else "已删除触发词"
+            if args.clear:
+                out = reg.remove_triggers(args.key, [], clear=True)
+                action = "已清空触发词"
+            elif args.remove:
+                out = reg.remove_triggers(args.key, args.triggers, clear=False)
+                action = "已删除触发词"
             elif args.triggers:
                 out = reg.set_triggers(args.key, args.triggers, replace=args.replace)
                 action = "已替换触发词" if args.replace else "已添加触发词"
@@ -517,10 +622,6 @@ def main(argv=None):
                 safe_print("%s: %s (%s)" % (action, out.get("name"), out.get("username")))
                 safe_print("per-target triggers: %s" % (", ".join(out.get("triggers") or []) or "(empty; uses default_triggers)"))
                 safe_print("default_triggers: %s" % (", ".join(out.get("default_triggers") or []) or "(empty)"))
-                if _is_monitor_running():
-                    safe_print("监听进程运行中，变更会在下一轮轮询自动生效。")
-                else:
-                    safe_print("监听进程未运行；启动：python manage_targets.py start")
             return 0
 
         # -- kb-list / kbs --
