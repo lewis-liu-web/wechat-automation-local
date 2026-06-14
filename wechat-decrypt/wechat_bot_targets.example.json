@@ -1,5 +1,6 @@
 {
   "poll_interval": 3,
+  "session_window": 60,
   "default_triggers": [
     "@机器人名称"
   ],
@@ -12,10 +13,28 @@
       "table": "Msg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
       "last_local_id": 0,
       "enabled": true,
+      "mode": "group_assistant",
+      "reply_policy": "conservative",
       "triggers": [
         "@机器人名称"
       ],
       "reply_template": "",
+      "cua_window_title": "",
+      "reply_mode": "standard",
+      "vision": {
+        "mode": "agent_llm"
+      },
+      "input_capabilities": {
+        "text": true,
+        "image": true,
+        "voice": false,
+        "file": false
+      },
+      "session_policy": {
+        "timeout_seconds": 60,
+        "max_turns": 3,
+        "require_followup_intent": true
+      },
       "knowledge_bases": [
         "scene.bot_testing",
         "online.getnote.bot_testing",
@@ -29,10 +48,28 @@
       "table": "Msg_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
       "last_local_id": 0,
       "enabled": true,
+      "mode": "customer_service",
+      "cua_window_title": "",
+      "reply_policy": "knowledge_grounded",
       "triggers": [
         "@机器人名称"
       ],
       "reply_template": "",
+      "reply_mode": "standard",
+      "vision": {
+        "mode": "agent_llm"
+      },
+      "input_capabilities": {
+        "text": true,
+        "image": true,
+        "voice": false,
+        "file": false
+      },
+      "session_policy": {
+        "timeout_seconds": 120,
+        "max_turns": 5,
+        "require_followup_intent": true
+      },
       "knowledge_bases": [
         "scene.chongqing_mobile_work",
         "online.getnote.chongqing_mobile_work"
@@ -41,13 +78,31 @@
   ],
   "wiki_dir": "./wiki",
   "reply_engine": {
-    "provider": "cmd",
-    "command": "echo 请配置你的 LLM 命令",
+    "provider": "genericagent_bridge",
+    "bridge_url": "http://127.0.0.1:14168",
+    "raw_mode": true,
+    "agent_timeout": 60,
+    "bridge_max_wait": 60,
+    "bridge_poll_interval": 1.0,
     "temperature": 0.7,
-    "max_tokens": 800
+    "max_tokens": 800,
+    "chat_llm_timeout": 20
   },
-  "context_limit": 15,
-  "send_mode": "foreground",
+  "reply_mode": "standard",
+  "context_policy": {
+    "time_window_seconds": 90,
+    "max_messages": 30,
+    "sender_recent_limit": 5,
+    "include_bot_recent": true
+  },
+  "image_policy": {
+    "bind_window_seconds": 90,
+    "max_pending_images": 5,
+    "trigger_behavior": "mention_or_active_session"
+  },
+  "context_limit": 30,
+  "send_mode": "cua_separate_window",
+  "_send_mode_comment": "Options: foreground (UIA/OCR/physical), backend (clipboard+PostMessage), cua (CUA driver main-window path), cua_separate_window/cua_window (CUA background send to pre-opened independent chat window, default), backend_then_foreground, cua_then_foreground"
   "stop_file": "wechat_bot.stop",
   "send_confirm_timeout": 5.0,
   "advance_on_send_failure": true,

@@ -6,6 +6,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SENDER_PATH = ROOT / 'wechat_sender.py'
 
 spec = importlib.util.spec_from_file_location('wechat_sender_under_test', SENDER_PATH)
+assert spec is not None
+assert spec.loader is not None
 wechat_sender = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = wechat_sender
 spec.loader.exec_module(wechat_sender)
@@ -46,6 +48,30 @@ def test_send_reply_backend_mode_uses_confirmation(monkeypatch):
     assert result.confirmed is True
     assert result.attempted == ['backend']
     assert calls == [('群A', 7, 'hello', 0.3)]
+
+
+def test_safe_clipboard_copy_retries_transient_failure():
+    calls = []
+
+    class FlakyClip:
+        @staticmethod
+        def copy(text):
+            calls.append(text)
+            if len(calls) == 1:
+                raise RuntimeError('OpenClipboard busy')
+
+    logs = []
+    ok = wechat_sender._safe_clipboard_copy(
+        FlakyClip,
+        'hello',
+        log=logs.append,
+        attempts=3,
+        base_sleep=0,
+    )
+
+    assert ok is True
+    assert calls == ['hello', 'hello']
+    assert any('recovered attempt=2' in line for line in logs)
 
 
 def test_send_reply_foreground_confirmation_timeout_sets_reason(monkeypatch):
@@ -137,9 +163,10 @@ def test_foreground_skips_search_when_uia_current_chat_verified(monkeypatch):
     monkeypatch.setitem(sys.modules, 'ljqCtrl', FakeLjq)
     monkeypatch.setitem(sys.modules, 'pyperclip', FakeClip)
     # UIA says current chat matches target, and UIA input/send succeeds
+    monkeypatch.setattr(wechat_sender, '_force_foreground_window', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender, '_uia_is_effectively_available', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender, '_uia_current_chat_matches', lambda target=None, log=None: True)
-    monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, cfg=None, log=None: True)
+    monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, target=None, cfg=None, log=None: True)
     # Make sure OCR/search are NOT called
     monkeypatch.setattr(wechat_sender, 'open_chat_from_visible_list', lambda *a, **k: (_ for _ in ()).throw(AssertionError('ocr should be skipped')))
     monkeypatch.setattr(wechat_sender, '_open_chat_by_search', lambda *a, **k: (_ for _ in ()).throw(AssertionError('search should be skipped')))
@@ -156,7 +183,7 @@ def test_foreground_skips_search_when_uia_current_chat_verified(monkeypatch):
     assert 'physical_input' not in result.attempted
 
 
-def test_foreground_uia_search_then_uia_send(monkeypatch):
+def test_foreground_uia_visible_list_then_uia_send(monkeypatch):
     monkeypatch.setattr(wechat_sender, 'find_wechat_hwnd', lambda: 123)
     monkeypatch.setattr(wechat_sender, '_uia_is_effectively_available', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender.ctypes, 'windll', type('W', (), {'user32': type('U', (), {'SetProcessDPIAware': lambda self: None})()})(), raising=False)
@@ -182,10 +209,11 @@ def test_foreground_uia_search_then_uia_send(monkeypatch):
     monkeypatch.setitem(sys.modules, 'ljqCtrl', type('L', (), {'dpi_scale': 1, 'Click': staticmethod(lambda *a, **k: None), 'Press': staticmethod(lambda *a, **k: None)}))
     monkeypatch.setitem(sys.modules, 'pyperclip', type('C', (), {'copy': staticmethod(lambda t: None)}))
 
-    # Current chat does NOT match, but UIA search succeeds and UIA send succeeds
+    # Current chat does NOT match, but UIA visible-list selection succeeds and UIA send succeeds
+    monkeypatch.setattr(wechat_sender, '_force_foreground_window', lambda hwnd, log=None: True)
     monkeypatch.setattr(wechat_sender, '_uia_current_chat_matches', lambda target=None, log=None: False)
-    monkeypatch.setattr(wechat_sender, '_uia_open_chat_by_search', lambda target, cfg=None, log=None: True)
-    monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, cfg=None, log=None: True)
+    monkeypatch.setattr(wechat_sender, '_uia_open_chat_from_visible_list', lambda target, cfg=None, log=None: True)
+    monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, target=None, cfg=None, log=None: True)
     monkeypatch.setattr(wechat_sender, '_ensure_chat_area_focused', lambda cfg=None, log=None: None)
     monkeypatch.setattr(wechat_sender, '_find_send_button_coords', lambda hwnd, cfg=None: (900, 750))
     # OCR and search fallback should not be reached
@@ -194,7 +222,7 @@ def test_foreground_uia_search_then_uia_send(monkeypatch):
 
     result = wechat_sender.send_reply_foreground('hello', target={'name': '群B'}, cfg={'send_strategy': 'current_or_uia_then_ocr_search_physical'})
     assert result.ok is True
-    assert result.attempted == ['uia_current_check', 'uia_search', 'uia_input_send']
+    assert result.attempted == ['uia_current_check', 'uia_visible_list', 'uia_input_send']
 
 
 def test_foreground_full_fallback_to_physical_when_all_uia_fail(monkeypatch):
@@ -238,17 +266,22 @@ def test_foreground_full_fallback_to_physical_when_all_uia_fail(monkeypatch):
     monkeypatch.setitem(sys.modules, 'ljqCtrl', FakeLjq)
     monkeypatch.setitem(sys.modules, 'pyperclip', FakeClip)
 
-    # All UIA paths fail
-    monkeypatch.setattr(wechat_sender, '_uia_current_chat_matches', lambda target=None, log=None: False)
+    monkeypatch.setattr(wechat_sender, '_force_foreground_window', lambda hwnd, log=None: True)
+    # All UIA paths fail initially; recheck before physical fallback passes
+    _match_calls = []
+    def _fake_match(target=None, log=None):
+        _match_calls.append(1)
+        return len(_match_calls) > 1  # first call False, second call True
+    monkeypatch.setattr(wechat_sender, '_uia_current_chat_matches', _fake_match)
     monkeypatch.setattr(wechat_sender, '_uia_open_chat_by_search', lambda target, cfg=None, log=None: False)
     # OCR succeeds (so we skip search fallback)
     monkeypatch.setattr(wechat_sender, 'open_chat_from_visible_list', lambda target, cfg=None, log=None: (True, True))
     # UIA input fails, physical succeeds
-    monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, cfg=None, log=None: False)
+    monkeypatch.setattr(wechat_sender, '_uia_input_and_send', lambda text, target=None, cfg=None, log=None: False)
     monkeypatch.setattr(wechat_sender, '_ensure_chat_area_focused', lambda cfg=None, log=None: None)
     monkeypatch.setattr(wechat_sender, '_find_send_button_coords', lambda hwnd, cfg=None: (900, 750))
 
     result = wechat_sender.send_reply_foreground('hello', target={'name': '群C'}, cfg={'send_strategy': 'current_or_uia_then_ocr_search_physical'})
     assert result.ok is True
-    assert result.attempted == ['uia_current_check', 'uia_search', 'ocr_visible_list', 'physical_input']
+    assert result.attempted == ['uia_current_check', 'uia_visible_list', 'ocr_visible_list', 'physical_input']
     assert FakeClip.copied == ['hello']

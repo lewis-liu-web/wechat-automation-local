@@ -28,6 +28,7 @@ voice_transcriptions.json
 *.ret.txt
 *.stop
 fast_refresh_state.json
+@AutomationLog.txt
 wechat-decrypt/wechat_bot_candidates.json
 wechat-decrypt/.fast_refresh_tmp/
 
@@ -60,9 +61,11 @@ find_all_keys_macos
 repo_probe/
 _sandbox/
 tmp/
+wechat-decrypt/temp/
 update_backup_*/
 remote_update/
 pywechat_probe/
+.omkc/
 
 # Private bot knowledge and chat-derived samples
 wechat-decrypt/wiki/groups/
