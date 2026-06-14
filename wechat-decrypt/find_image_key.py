@@ -19,17 +19,9 @@ import glob
 import json
 import time
 import ctypes
-import traceback
 from ctypes import wintypes
 from Crypto.Cipher import AES
 from Crypto.Util import Padding
-
-# Fix stdout encoding for pipe environments
-try:
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-except Exception:
-    pass
 
 # Windows API constants
 PROCESS_ALL_ACCESS = 0x1F0FFF
@@ -60,6 +52,11 @@ kernel32 = ctypes.windll.kernel32
 RE_KEY32 = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32}(?![a-zA-Z0-9])')
 # 正则: 精确 16 字符 alphanum
 RE_KEY16 = re.compile(rb'(?<![a-zA-Z0-9])[a-zA-Z0-9]{16}(?![a-zA-Z0-9])')
+# 扩展: 匹配含特殊字符的 16/32 char strings (base64-like)
+RE_KEY32_EXT = re.compile(rb'(?<![a-zA-Z0-9_\-+=/])[a-zA-Z0-9_\-+=/]{32}(?![a-zA-Z0-9_\-+=/])')
+RE_KEY16_EXT = re.compile(rb'(?<![a-zA-Z0-9_\-+=/])[a-zA-Z0-9_\-+=/]{16}(?![a-zA-Z0-9_\-+=/])')
+# 32-char hex string (lowercase)
+RE_KEY32_HEX = re.compile(rb'(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])')
 
 
 def get_wechat_pids():
@@ -272,6 +269,43 @@ def _scan_regions(h_process, regions, ciphertext):
                 print(f"  AES key: {key_str}", flush=True)
                 return key_str
 
+        # 扩展搜索: 16/32 char with special chars (base64-like)
+        for m in RE_KEY32_EXT.finditer(data):
+            key_bytes = m.group()
+            candidates_32 += 1
+            fmt = try_key(key_bytes[:16], ciphertext)
+            if fmt:
+                key_str = key_bytes.decode('ascii')
+                print(f"\n*** 找到 AES key (32-ext)! → {fmt} ***", flush=True)
+                print(f"  完整: {key_str}", flush=True)
+                print(f"  AES key: {key_str[:16]}", flush=True)
+                return key_str[:16]
+
+        for m in RE_KEY16_EXT.finditer(data):
+            key_bytes = m.group()
+            candidates_16 += 1
+            fmt = try_key(key_bytes, ciphertext)
+            if fmt:
+                key_str = key_bytes.decode('ascii')
+                print(f"\n*** 找到 AES key (16-ext)! → {fmt} ***", flush=True)
+                print(f"  AES key: {key_str}", flush=True)
+                return key_str
+
+        # 搜索 32-char hex strings
+        for m in RE_KEY32_HEX.finditer(data):
+            key_bytes = m.group()
+            candidates_32 += 1
+            try:
+                hex_key = bytes.fromhex(key_bytes.decode('ascii'))
+                fmt = try_key(hex_key, ciphertext)
+                if fmt:
+                    key_str = key_bytes.decode('ascii')
+                    print(f"\n*** 找到 AES key (hex32)! → {fmt} ***", flush=True)
+                    print(f"  Hex: {key_str}", flush=True)
+                    return key_str
+            except:
+                pass
+
     elapsed = time.time() - t0
     print(f"\n  测试: {candidates_32} x 32-char + {candidates_16} x 16-char ({elapsed:.1f}s)", flush=True)
     return None
@@ -388,13 +422,9 @@ def main():
     aes_key = None
     for pid in pids:
         print(f"Scanning PID {pid}...", flush=True)
-        try:
-            aes_key = scan_memory_for_aes_key(pid, ciphertext)
-            if aes_key:
-                break
-        except Exception as e:
-            print(f"Error scanning PID {pid}: {e}", flush=True)
-            traceback.print_exc()
+        aes_key = scan_memory_for_aes_key(pid, ciphertext)
+        if aes_key:
+            break
 
     if aes_key:
         print(f"\n=== Result ===", flush=True)

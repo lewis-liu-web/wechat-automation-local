@@ -88,10 +88,15 @@ def main() -> int:
 
     payload: Dict[str, Any] = json.load(sys.stdin)
     prompt = payload.get("prompt") or payload.get("clean_text") or ""
+    image_paths = payload.get("image_paths") or []
+    image_hint = ""
+    if image_paths:
+        image_hint = "\n\n[用户发送了图片，图片路径: " + ", ".join(image_paths) + "]\n"
     input_text = (
         "你是群聊小助手。请根据下面的群消息、本地wiki片段和边界约束，"
         "只输出一段可以直接发送到微信群的中文回复；不要解释过程，不要使用工具，不要写summary。\n\n"
         + str(prompt)
+        + image_hint
     )
     client = _load_client(Path(args.code_root), args.llm_no)
     messages = [{"role": "user", "content": input_text}]
