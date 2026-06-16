@@ -57,6 +57,45 @@ Routing classes:
 | `fast_reply` | hello, help, simple clarification, normal short KB answer | local rule / fast LLM / local retrieval | fast response |
 | `deep_agent` | image analysis, chart analysis, file summary, multi-step diagnosis, open-ended free task | job queue + provider | controlled delay with status |
 
+## Skill Injection for Agent Jobs
+
+All deep-agent jobs carry a project-local skill prompt that defines the WeChat task role, available conceptual tools, hard rules, and required JSON output format.
+
+- Skill source: `wechat-decrypt/skills/wechat_task/skill.md`
+- Loaded at runtime by `reply_engine._load_skill_prompt()` and injected into the job payload as `skill_name` and `skill_prompt`.
+- The provider's `_build_wechat_deep_prompt()` places the skill text at the top of the agent prompt.
+
+This keeps agent behavior consistent across GenericAgent bridge and Hermes CLI providers without changing external agent code.
+
+## Knowledge Context in Job Payload
+
+Deep-agent jobs include the following knowledge fields when applicable:
+
+- `knowledge_hits`: top scene/core hits formatted as `{source, kb_id, scope, rel_path, label, score, content}`.
+- `knowledge_bases`: resolved list of KB ids bound to the target.
+- `reply_mode`: `"raw_agent"` for raw/agent_raw targets.
+- `retrieval_debug`: hit counts, query, route reason for observability.
+
+`agent_provider._build_wechat_deep_prompt()` renders hits under a `[知识库片段]` section. The origin line uses `来源: <source>` when `rel_path` is empty and `来源: <source> <rel_path>` when a relative path exists.
+
+
+## Job Payload Reference
+
+Deep-agent job payloads produced by `reply_engine.generate_reply()` include:
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `prompt` / `clean_text` / `raw_text` | str | User request at multiple stages |
+| `skill_name` | str | `wechat_task` (project-local skill) |
+| `skill_prompt` | str | Full skill markdown text injected into agent prompt |
+| `knowledge_hits` | list | Scene/core knowledge hits as dicts |
+| `knowledge_bases` | list | Bound KB ids for the target |
+| `reply_mode` | str | `"raw_agent"` for raw/agent_raw targets |
+| `retrieval_debug` | dict | Query, hit counts, route reason |
+| `image_paths` / `image_descriptions` | list | Vision inputs |
+| `context_messages` | list | Recent group chat context |
+| `mention_name` | str | Sender to prefix in final reply |
+| `target` | dict | Target id/name/username/table |
 Free mode should mean "complex tasks may upgrade to deep agents", not "all messages go to a general agent".
 
 ## User Experience Contract

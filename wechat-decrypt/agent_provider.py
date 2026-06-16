@@ -180,7 +180,31 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
             + "\n如果当前 agent 不能直接读取这些图片文件，不要编造图片内容；请说明需要视觉工具读取图片。"
         )
         image_hint = f"{image_hint}{path_hint}"
+
+    # --- Skill injection (NEW) ---
+    skill_prompt = str(payload.get("skill_prompt") or "").strip()
+    skill_section = f"{skill_prompt}\n\n" if skill_prompt else ""
+
+    # --- Knowledge hits injection (NEW) ---
+    knowledge_hits = payload.get("knowledge_hits") or []
+    knowledge_section = ""
+    if knowledge_hits:
+        parts = []
+        for idx, hit in enumerate(knowledge_hits[:5], start=1):
+            if isinstance(hit, dict):
+                source = str(hit.get("source") or hit.get("kb_id") or "unknown")
+                rel = str(hit.get("rel_path") or hit.get("path") or "").strip()
+                origin = f"{source} {rel}".strip() if rel else source
+                content = str(hit.get("content") or hit.get("body") or "").strip()
+                parts.append(f"### 片段 {idx} (来源: {origin})\n{content[:800]}")
+            elif isinstance(hit, (list, tuple)) and len(hit) >= 2:
+                parts.append(f"### 片段 {idx}\n{str(hit[1])[:800]}")
+            else:
+                parts.append(f"### 片段 {idx}\n{str(hit)[:800]}")
+        knowledge_section = "\n\n[知识库片段]\n" + "\n\n".join(parts) + "\n"
+
     return (
+        f"{skill_section}"
         "你正在执行 wechat-deep-reply 任务。\n"
         "目标：处理一个微信群复杂请求，并只返回最终可发送到微信群的简短中文回复。\n"
         "硬规则：\n"
@@ -191,6 +215,7 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         "5. 最多 600 字。\n"
         f"{mention_rule}\n\n"
         f"用户请求：{prompt}"
+        f"{knowledge_section}"
         f"{image_hint}"
     )
 

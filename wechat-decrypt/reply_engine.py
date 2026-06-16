@@ -1461,6 +1461,38 @@ def _json_safe(value: Any) -> Any:
     return _convert(value)
 
 
+
+
+def _load_skill_prompt(skill_name: str | None = None) -> str:
+    """Load a project-local skill prompt by name."""
+    name = skill_name or "wechat_task"
+    try:
+        from skills import load_skill
+        return load_skill(name)
+    except Exception:
+        return ""
+
+
+def _knowledge_hits_to_payload(hits: List[Any]) -> List[Dict[str, Any]]:
+    """Convert KnowledgeHit objects or tuples to serializable dicts."""
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        if isinstance(h, KnowledgeHit):
+            out.append({
+                "source": h.source,
+                "kb_id": h.kb_id,
+                "scope": h.scope,
+                "rel_path": h.rel_path,
+                "label": h.label,
+                "score": h.score,
+                "content": h.content,
+            })
+        elif isinstance(h, (list, tuple)) and len(h) >= 2:
+            out.append({"source": "local", "kb_id": "", "rel_path": str(h[0]), "label": str(h[0]), "content": str(h[1])})
+        else:
+            out.append({"source": "unknown", "kb_id": "", "rel_path": "", "label": str(h), "content": str(h)})
+    return out
+
 def _call_genericagent_bridge(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
     """Use GenericAgent's existing frontends/desktop_bridge.py HTTP API.
 
@@ -1680,6 +1712,8 @@ def _extract_mention_name(message: Dict[str, Any] | str) -> str:
     if m:
         return m.group(1).strip().lstrip("@")
     return ""
+
+
 
 
 def _is_raw_agent_mode(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
@@ -1927,6 +1961,17 @@ def generate_reply(message: Dict[str, Any] | str,
                             "prompt": clean or raw_text,
                             "clean_text": clean,
                             "raw_text": raw_text,
+                            "skill_name": "wechat_task",
+                            "skill_prompt": _load_skill_prompt("wechat_task"),
+                            "knowledge_hits": [],
+                            "knowledge_bases": selected_kbs,
+                            "reply_mode": "raw_agent",
+                            "retrieval_debug": {
+                                "mode": "raw_agent",
+                                "route": route_decision.route,
+                                "route_reason": route_decision.reason,
+                                "selected_kbs": selected_kbs,
+                            },
                             "image_paths": image_paths,
                             "image_descriptions": image_descriptions,
                             "context_messages": payload_context_messages,
@@ -1989,6 +2034,17 @@ def generate_reply(message: Dict[str, Any] | str,
                         "clean_text": clean,
                         "raw_text": raw_text,
                         "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),
+                        "skill_name": "wechat_task",
+                        "skill_prompt": _load_skill_prompt("wechat_task"),
+                        "knowledge_hits": [],
+                        "knowledge_bases": selected_kbs,
+                        "reply_mode": "raw_agent",
+                        "retrieval_debug": {
+                            "mode": "raw_agent",
+                            "route": str(route_name or "agent_provider"),
+                            "route_reason": str(route_reason or "agent_provider"),
+                            "selected_kbs": selected_kbs,
+                        },
                         "image_paths": image_paths,
                         "image_descriptions": image_descriptions,
                         "context_messages": payload_context_messages,
@@ -1998,7 +2054,6 @@ def generate_reply(message: Dict[str, Any] | str,
                         "route": str(route_name or "agent_provider"),
                         "route_reason": str(route_reason or "agent_provider"),
                         "wiki_dir": str(resolve_wiki_dir(config, target)),
-                        "knowledge_bases": selected_kbs,
                         "knowledge_base_specs": _selected_kb_specs(config, target),
                         "target": {
                             "id": target.get("id"),
