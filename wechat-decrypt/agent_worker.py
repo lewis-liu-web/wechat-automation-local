@@ -72,7 +72,10 @@ def _provider_name(provider: AgentProvider) -> str:
 
 
 def _resolve_mention_name(job: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    event_ctx = payload.get("event_context") or {}
     for value in (
+        event_ctx.get("mention_name"),
+        event_ctx.get("sender_display_name"),
         payload.get("mention_name"),
         payload.get("sender_display_name"),
         payload.get("sender_name"),
@@ -84,18 +87,6 @@ def _resolve_mention_name(job: Dict[str, Any], payload: Dict[str, Any]) -> str:
             return name
     return ""
 
-
-def _ensure_mention_prefix(reply_text: str, mention_name: str) -> str:
-    reply = jobs.sanitize_agent_result_text(reply_text)
-    mention = str(mention_name or "").strip().lstrip("@")
-    if not mention:
-        return reply
-    expected = f"@{mention}"
-    if reply.startswith(expected):
-        return reply if reply.startswith(f"{expected} ") else f"{expected} {reply[len(expected):].strip()}"
-    if reply.startswith("@"):
-        reply = re.sub(r"^@\S+\s*", "", reply, count=1).strip()
-    return f"{expected} {reply}".strip()
 
 
 def build_provider(args: argparse.Namespace) -> AgentProvider:
@@ -147,8 +138,8 @@ def _send_result_back(job: Dict[str, Any], result_text: str, config_path: Path) 
     if not target:
         return {"sent": False, "reason": f"target not found: {target_username}"}
 
-    # Ensure reply starts with the target sender mention, not a stale agent guess.
-    reply_text = _ensure_mention_prefix(result_text, mention_name)
+    # Mention prefix is now applied by wechat_sender.send_reply_detailed(mention_name=...).
+    reply_text = result_text
 
     send_mode = cfg.get("send_mode") or "foreground"
     try:
@@ -158,6 +149,7 @@ def _send_result_back(job: Dict[str, Any], result_text: str, config_path: Path) 
             target=target,
             before_local_id=message_local_id,
             cfg=cfg,
+            mention_name=mention_name,
         )
         return {"sent": bool(ok), "reason": "ok" if ok else "send_reply returned False"}
     except Exception as e:

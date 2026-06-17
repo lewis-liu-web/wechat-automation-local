@@ -81,6 +81,16 @@ def get_capabilities() -> CapabilityRegistry:
 # Data structures
 # ---------------------------------------------------------------------------
 
+# Default policy values for image-task detection and flush boundaries.
+# These may be extended or overridden via target.policy.* or config.*.
+_DEFAULT_IMAGE_TASK_MARKERS: List[str] = [
+    "分析", "看看", "识别", "截图", "提取", "总结", "对比", "整理",
+    "生成", "写", "描述", "解释", "什么意思", "怎么办", "怎么处理",
+    "怎么看", "查一下", "帮我看", "图里", "图片", "照片",
+    "怎么样", "觉得", "评价", "好看", "有意思",
+]
+_DEFAULT_TERMINATION_WORDS: List[str] = ["好了", "就这样", "结束"]
+
 @dataclass
 class MessageEvent:
     """One raw message from DB polling."""
@@ -134,6 +144,9 @@ class AggregatedTurn:
 
         If the user explicitly @-ed the bot or is in an active session, any
         non-empty follow-up text with an image is treated as a task.
+
+        The default keyword list may be extended via
+        target.policy.image_task_markers or config.image_task_markers.
         """
         text = self.combined_text()
         if not text:
@@ -143,14 +156,17 @@ class AggregatedTurn:
         if self.event_context.get("trigger_matched") or self.event_context.get("session_active"):
             return True
         low = text.lower()
-        # Core action words plus common question patterns that ask the bot to
-        # interpret / evaluate an image.
-        markers = [
-            "分析", "看看", "识别", "截图", "提取", "总结", "对比", "整理",
-            "生成", "写", "描述", "解释", "什么意思", "怎么办", "怎么处理",
-            "怎么看", "查一下", "帮我看", "图里", "图片", "照片",
-            "怎么样", "觉得", "评价", "好看", "有意思",
-        ]
+        markers = list(_DEFAULT_IMAGE_TASK_MARKERS)
+        extra_markers: List[str] = []
+        if isinstance(self.target, dict):
+            policy = self.target.get("policy")
+            if isinstance(policy, dict):
+                extra_markers = list(policy.get("image_task_markers") or [])
+        if not extra_markers and isinstance(self.config, dict):
+            extra_markers = list(self.config.get("image_task_markers") or [])
+        for m in extra_markers:
+            if m and m not in markers:
+                markers.append(m)
         return any(m in low for m in markers)
 
     def to_generate_reply_message(self) -> Dict[str, Any]:
@@ -165,7 +181,14 @@ class AggregatedTurn:
         base["session_image_paths"] = self.image_paths
         base["context_messages"] = self.context_messages
         base["event_context"] = self.event_context
+        for src_key in ("mention_name", "sender_display_name", "sender_name", "from_display_name"):
+            if not base.get(src_key):
+                base[src_key] = self.event_context.get(src_key) or self.event_context.get("mention_name") or self.event_context.get("sender_display_name")
         base["target_policy"] = self.event_context.get("target_policy", {})
+        # Aggregation metadata for downstream agent routing / context shaping
+        base["is_aggregated"] = len(self.text_parts) > 1
+        base["aggregated_local_ids"] = [ctx.get("local_id") for ctx in self.context_messages]
+        base["text_parts_count"] = len(self.text_parts)
         # Preserve trigger/session flags so reply_engine can route correctly
         base["_aggregator_trigger_matched"] = self.trigger_matched
         base["_aggregator_in_session"] = self.in_session
@@ -201,6 +224,50 @@ def has_open_window(chat_id: str, sender_id: str) -> bool:
         return key in _buffers
 
 
+def _clean_text_for_policy(text: str) -> str:
+    """Strip sender prefix and whitespace for keyword checks."""
+    cleaned = re.sub(r"^[^:\n]{1,80}:\n", "", text, count=1).strip()
+    return cleaned
+
+
+def _termination_words(
+    target: Optional[Dict[str, Any]],
+    config: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Return configured termination words, falling back to defaults."""
+    if isinstance(target, dict):
+        policy = target.get("policy")
+        if isinstance(policy, dict) and policy.get("termination_words"):
+            return list(policy["termination_words"])
+    if isinstance(config, dict) and config.get("termination_words"):
+        return list(config["termination_words"])
+    return list(_DEFAULT_TERMINATION_WORDS)
+
+
+def _max_aggregated_messages(
+    target: Optional[Dict[str, Any]],
+    config: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Return configured maximum messages per turn, or None for unlimited."""
+    raw: Any = None
+    if isinstance(target, dict):
+        policy = target.get("policy")
+        if isinstance(policy, dict):
+            raw = policy.get("max_aggregated_messages")
+    if raw is None and isinstance(config, dict):
+        raw = config.get("max_aggregated_messages")
+    if raw is None:
+        return None
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _contains_termination_word(text: str, target: Optional[Dict[str, Any]], config: Optional[Dict[str, Any]]) -> bool:
+    return any(word in text for word in _termination_words(target, config) if word)
+
+
 def ingest_event(
     event: MessageEvent,
     *,
@@ -217,24 +284,39 @@ def ingest_event(
     now = time.time()
 
     with _BUFFER_LOCK:
-        # If a window exists and has been idle > DEBOUNCE_SECONDS, close it
-        # and start a fresh window with this event.  This absorbs the burst
-        # correctly: text arrives → window opens; image arrives 1 s later
-        # (still < DEBOUNCE) → merged; if caller sleeps 3.5 s and then sends
-        # another event, the old window closes and the new event starts a new
-        # window.  In real monitor usage the sleep is between poll cycles, so
-        # the next event naturally starts a new window if the user stopped.
+        return_value: Optional[AggregatedTurn] = None
+
+        # If a window exists and has been idle > DEBOUNCE_SECONDS or has hit
+        # the hard ceiling, close it and continue with the current event as the
+        # start of a fresh window.
         if key in _buffers and key in _window_last_at:
             since_last = now - _window_last_at[key]
             elapsed = now - _window_opened_at.get(key, now)
             if elapsed >= _MAX_WINDOW_SECONDS or since_last >= _DEBOUNCE_SECONDS:
-                # Close old window, then fall through to start new one
-                old_turn = _build_turn(key, trigger_matched, in_session, event_context, target, config)
-                # Now start fresh window with current event
-                _buffers[key] = [event]
-                _window_opened_at[key] = now
-                _window_last_at[key] = now
-                return old_turn
+                meta = _window_meta.get(key) or {}
+                return_value = _build_turn(
+                    key,
+                    bool(meta.get("trigger_matched")),
+                    bool(meta.get("in_session")),
+                    meta.get("event_context") if isinstance(meta.get("event_context"), dict) else event_context,
+                    meta.get("target") if isinstance(meta.get("target"), dict) else target,
+                    meta.get("config") if isinstance(meta.get("config"), dict) else config,
+                )
+
+        # Termination-word flush: the current event ends the previous turn and
+        # starts a new one.  This only applies to an existing, non-empty window
+        # (not a window that was just flushed above).
+        cleaned = _clean_text_for_policy(event.content or "")
+        if key in _buffers and _contains_termination_word(cleaned, target, config):
+            meta = _window_meta.get(key) or {}
+            return_value = _build_turn(
+                key,
+                bool(meta.get("trigger_matched")),
+                bool(meta.get("in_session")),
+                meta.get("event_context") if isinstance(meta.get("event_context"), dict) else event_context,
+                meta.get("target") if isinstance(meta.get("target"), dict) else target,
+                meta.get("config") if isinstance(meta.get("config"), dict) else config,
+            )
 
         # Initialise or extend window
         if key not in _buffers:
@@ -242,14 +324,32 @@ def ingest_event(
             _window_opened_at[key] = now
         _buffers[key].append(event)
         _window_last_at[key] = now
+
+        # Max-messages flush: once the window reaches the configured limit,
+        # return it immediately with the current event included.
+        max_messages = _max_aggregated_messages(target, config)
+        if max_messages is not None and len(_buffers[key]) >= max_messages:
+            meta = _window_meta.get(key) or {}
+            return _build_turn(
+                key,
+                bool(meta.get("trigger_matched")) or trigger_matched,
+                bool(meta.get("in_session")) or in_session,
+                meta.get("event_context") if isinstance(meta.get("event_context"), dict) else event_context,
+                meta.get("target") if isinstance(meta.get("target"), dict) else target,
+                meta.get("config") if isinstance(meta.get("config"), dict) else config,
+            )
+
+        # Update stored metadata, propagating trigger/session flags so that a
+        # later trigger-bearing event marks the whole turn as triggered.
+        meta = _window_meta.get(key) or {}
         _window_meta[key] = {
-            "trigger_matched": trigger_matched,
-            "in_session": in_session,
+            "trigger_matched": bool(meta.get("trigger_matched")) or trigger_matched,
+            "in_session": bool(meta.get("in_session")) or in_session,
             "event_context": event_context or {},
             "target": target or {},
             "config": config or {},
         }
-        return None
+        return return_value
 
 
 def _build_turn(
@@ -321,7 +421,15 @@ def flush_all_pending(
             # Only flush windows that have been open for at least 1 second
             # to avoid cutting off a brand-new burst
             if now - opened >= 1.0:
-                results.append(_build_turn(key, False, False, None, target, config))
+                meta = _window_meta.get(key) or {}
+                results.append(_build_turn(
+                    key,
+                    bool(meta.get("trigger_matched")),
+                    bool(meta.get("in_session")),
+                    meta.get("event_context") if isinstance(meta.get("event_context"), dict) else None,
+                    meta.get("target") if isinstance(meta.get("target"), dict) else target,
+                    meta.get("config") if isinstance(meta.get("config"), dict) else config,
+                ))
     return results
 
 

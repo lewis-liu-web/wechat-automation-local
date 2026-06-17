@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -25,29 +26,121 @@ _NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO
 
 
 try:
-    from reply_engine import _clean_agent_output, postcheck  # type: ignore
+    from reply_engine import postcheck  # type: ignore
 except Exception:  # pragma: no cover - keeps provider importable in isolation
-    def _clean_agent_output(text: str) -> str:
-        return (text or "").strip()
-
     def postcheck(text: str) -> str:
         return (text or "").strip()
 
+try:
+    from skills import load_skill, render_skill
+except ImportError:
+    try:
+        from skills import load_skill
+        render_skill = None  # type: ignore
+    except ImportError:
+        load_skill = None  # type: ignore
+        render_skill = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+import re
+
+_NOISE_LINE_PATTERNS = [
+    re.compile(r"^Initializing\b", re.IGNORECASE),
+    re.compile(r"^Query:"),
+    re.compile(r"^preparing\b", re.IGNORECASE),
+    re.compile(r"^\s*read\b", re.IGNORECASE),
+    re.compile(r"^\s*find\b", re.IGNORECASE),
+    re.compile(r"^[─╭╮╰╯│\s]+$"),
+    re.compile(r"resume session", re.IGNORECASE),
+]
+
+
+def _clean_agent_output(text: str) -> str:
+    """Return only sendable lines from agent stdout, dropping tool/init noise."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    lines = text.splitlines()
+    useful: List[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(p.search(line) for p in _NOISE_LINE_PATTERNS):
+            continue
+        useful.append(line)
+    if not useful:
+        return ""
+    return "\n".join(useful)
+
 
 def _extract_hermes_reply(stdout: str) -> str:
-    """Extract the actual reply from Hermes terminal output."""
-    import re
+    """Extract the actual reply from Hermes terminal output.
 
+    Strips the Hermes box frame, ANSI codes, tool hints. Uses the last
+    non-empty Hermes box because Hermes may emit intermediate reasoning
+    boxes before the final reply box.
+    """
     text = str(stdout or "").strip()
     hermes_reply = ""
-    hermes_box = re.search(r"╭─ ⚕ Hermes ─+╮(.*?)╰─+╯", text, re.DOTALL)
-    if hermes_box:
-        box_content = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", hermes_box.group(1))
+    boxes = list(re.finditer(r"╭─ ⚕ Hermes ─+╮(.*?)╰─+╯", text, re.DOTALL))
+    if boxes:
+        last_box = boxes[-1]
+        box_content = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", last_box.group(1))
         lines = [line.strip().strip("│").strip() for line in box_content.split("\n") if line.strip()]
         hermes_reply = "\n".join(line for line in lines if line)
     if not hermes_reply:
         hermes_reply = _clean_agent_output(text)
     return postcheck(hermes_reply)
+
+
+def _read_hermes_reply_file(session_dir: Path) -> str:
+    """Read final reply from response.txt or reply.txt if Hermes wrote it there."""
+    for filename in ("response.txt", "reply.txt"):
+        try:
+            reply_path = session_dir / filename
+            if reply_path.exists():
+                return reply_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return ""
+
+
+
+
+def _trim_reply_json_block(text: str) -> str:
+    """Remove trailing JSON object from the reply, including an optional 'json' label.
+
+    Kept for backward compatibility with old skill prompts that still ask for JSON.
+    """
+    text = str(text or "").rstrip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    cut_index = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.lower() == "json":
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("{"):
+                cut_index = i
+                break
+        elif stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                json.loads(stripped)
+                cut_index = i
+                break
+            except Exception:
+                pass
+    if cut_index is not None:
+        trimmed = "\n".join(lines[:cut_index]).rstrip()
+        return trimmed
+    return text
+
+
+
+
 
 
 @dataclass
@@ -181,11 +274,7 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         )
         image_hint = f"{image_hint}{path_hint}"
 
-    # --- Skill injection (NEW) ---
-    skill_prompt = str(payload.get("skill_prompt") or "").strip()
-    skill_section = f"{skill_prompt}\n\n" if skill_prompt else ""
-
-    # --- Knowledge hits injection (NEW) ---
+    # --- Knowledge hits injection ---
     knowledge_hits = payload.get("knowledge_hits") or []
     knowledge_section = ""
     if knowledge_hits:
@@ -203,6 +292,35 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
                 parts.append(f"### 片段 {idx}\n{str(hit)[:800]}")
         knowledge_section = "\n\n[知识库片段]\n" + "\n\n".join(parts) + "\n"
 
+    # --- Skill injection ---
+    skill_name = str(payload.get("skill_name") or "").strip()
+    skill_prompt = str(payload.get("skill_prompt") or "").strip()
+    skill_section = ""
+    skill_rendered = False
+    if skill_prompt:
+        logger.warning("agent_provider: using legacy skill_prompt field; migrate to skill_name")
+        skill_section = f"{skill_prompt}\n\n"
+    elif skill_name:
+        try:
+            if render_skill is not None:
+                skill_section = render_skill(
+                    skill_name,
+                    mention_name=sender,
+                    user_request=prompt,
+                    knowledge_hits=knowledge_section,
+                    mode_instruction=str(payload.get("mode_instruction") or ""),
+                )
+                skill_rendered = True
+            elif load_skill is not None:
+                skill_section = load_skill(skill_name)
+            else:
+                skill_section = ""
+        except Exception as exc:
+            logger.warning("agent_provider: failed to load/render skill %s: %s", skill_name, exc)
+            skill_section = ""
+        if skill_section:
+            skill_section = f"{skill_section.strip()}\n\n"
+
     return (
         f"{skill_section}"
         "你正在执行 wechat-deep-reply 任务。\n"
@@ -211,11 +329,12 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         "1. 不要输出思考过程、工具日志、Markdown 计划或 JSON 外壳。\n"
         "2. 最终只输出一段微信群可直接发送的文本。\n"
         "3. 如果涉及转账、密钥、密码、数据库、内部路径、授权/承诺/决策，回复需要本人确认。\n"
-        "4. 不确定就说不确定，不要编造事实。\n"
-        "5. 最多 600 字。\n"
+        "4. 不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序。\n"
+        "5. 不确定就说不确定，不要编造事实。\n"
+        "6. 最多 600 字。\n"
         f"{mention_rule}\n\n"
         f"用户请求：{prompt}"
-        f"{knowledge_section}"
+        f"{'' if skill_rendered else knowledge_section}"
         f"{image_hint}"
     )
 
@@ -719,6 +838,7 @@ class HermesProvider:
                 "cfg=json.loads(pathlib.Path(__file__).with_name('runner_config.json').read_text(encoding='utf-8'))\n"
                 "flags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)\n"
                 "t0=time.time()\n"
+                "out=None\n"
                 "try:\n"
                 "    p=subprocess.run(cfg['args'], capture_output=True, text=True, timeout=float(cfg['timeout']), env=cfg.get('env'), encoding='utf-8', errors='replace', creationflags=flags)\n"
                 "    out={'ok': True, 'rc': p.returncode, 'stdout': p.stdout or '', 'stderr': p.stderr or '', 'latency': time.time()-t0}\n"
@@ -726,11 +846,17 @@ class HermesProvider:
                 "    out={'ok': False, 'timeout': True, 'stdout': e.stdout or '', 'stderr': e.stderr or '', 'latency': time.time()-t0}\n"
                 "except Exception as e:\n"
                 "    out={'ok': False, 'error': repr(e), 'latency': time.time()-t0}\n"
-                "pathlib.Path(cfg['result_path']).write_text(json.dumps(out, ensure_ascii=False), encoding='utf-8')\n",
+                "finally:\n"
+                "    if out is None:\n"
+                "        out={'ok': False, 'error': 'unknown runner error'}\n"
+                "    pathlib.Path(cfg['result_path']).write_text(json.dumps(out, ensure_ascii=False), encoding='utf-8')\n",
                 encoding="utf-8",
             )
             (session_dir / "runner_config.json").write_text(json.dumps(runner_payload, ensure_ascii=False), encoding="utf-8")
-            proc = subprocess.Popen([sys.executable, str(runner_path)], cwd=str(session_dir),
+            exe = Path(sys.executable).with_name("pythonw.exe")
+            if not exe.exists():
+                exe = Path(sys.executable)
+            proc = subprocess.Popen([str(exe), str(runner_path)], cwd=str(session_dir),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     creationflags=_NO_WINDOW_FLAGS)
             (session_dir / "meta.json").write_text(json.dumps({
@@ -776,9 +902,26 @@ class HermesProvider:
         stdout = str(data.get("stdout") or "").strip()
         stderr = str(data.get("stderr") or "").strip()
         rc = int(data.get("rc") or 0)
+        # Helper: try to read response.txt/reply.txt when Hermes writes the final reply to a file
+        # instead of printing it to stdout.
+        def _read_reply_txt() -> str:
+            return _read_hermes_reply_file(session_dir)
+
+        def _trim_if_legacy(text: str) -> str:
+            """Only trim JSON for legacy skill_prompt jobs that still ask for JSON."""
+            return _trim_reply_json_block(text)
+
+        def _extract(text: str) -> str:
+            reply = _extract_hermes_reply(text)
+            if not reply:
+                reply = _read_reply_txt()
+            return reply
+
         if data.get("timeout"):
-            reply = _extract_hermes_reply(stdout)
+            reply = _extract(stdout)
             if reply:
+                # For legacy prompts that asked for JSON metadata, keep only the prose part.
+                reply = _trim_if_legacy(reply)
                 return AgentResult(True, "done", reply_text=reply,
                                    latency=float(data.get("latency") or 0), provider=self.name,
                                    worker_id=self.worker_id, raw=data)
@@ -789,11 +932,13 @@ class HermesProvider:
             return AgentResult(False, "failed", error=f"hermes chat failed (rc={rc}): {stderr[:200] or 'no output'}",
                                latency=float(data.get("latency") or 0), provider=self.name,
                                worker_id=self.worker_id, raw=data)
-        reply = _extract_hermes_reply(stdout)
+        reply = _extract(stdout)
         if not reply:
             return AgentResult(False, "failed", error="hermes returned no sendable reply",
                                latency=float(data.get("latency") or 0), provider=self.name,
                                worker_id=self.worker_id, raw=data)
+        # For legacy prompts that asked for JSON metadata, keep only the prose part.
+        reply = _trim_if_legacy(reply)
         return AgentResult(True, "done", reply_text=reply,
                            latency=float(data.get("latency") or 0), provider=self.name,
                            worker_id=self.worker_id, raw=data)

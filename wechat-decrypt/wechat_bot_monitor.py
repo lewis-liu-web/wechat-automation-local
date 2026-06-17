@@ -253,7 +253,7 @@ def _is_in_session(t, msg, cfg):
     session_policy = policy.get('session_policy') or {}
     text = _message_text(msg)
     if sess and time.time() < sess.get('expires_at', 0):
-        if _looks_like_session_close(text):
+        if policy.get('mode') != 'personal_assistant' and _looks_like_session_close(text):
             log('session_close key=%s reason=close_intent text=%r' % (key, text[:80]))
             _active_sessions.pop(key, None)
             return False
@@ -827,7 +827,7 @@ def reply_text(cfg, target):
 
 
 
-def send_reply(text, mode=None, target=None, before_local_id=None, cfg=None, config_path=CONFIG_PATH):
+def send_reply(text, mode=None, target=None, before_local_id=None, cfg=None, config_path=CONFIG_PATH, mention_name=None):
     """Compatibility wrapper around wechat_sender with DB confirmation."""
     result = send_reply_detailed(
         text,
@@ -838,6 +838,7 @@ def send_reply(text, mode=None, target=None, before_local_id=None, cfg=None, con
         confirm=lambda t, lid, body, timeout: wait_sent_confirmation(
             t, lid, body, config_path=config_path, timeout=timeout),
         log=log,
+        mention_name=mention_name,
     )
     log('send result ok=%s mode=%s reason=%s confirmed=%s attempted=%s detail_keys=%s' % (
         result.ok, result.mode, result.reason, result.confirmed, ','.join(result.attempted), ','.join(sorted(result.detail.keys()))))
@@ -1192,7 +1193,8 @@ def main():
                         log('dry-run: skip send')
                     else:
                         t0 = time.time()
-                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=turn.end_local_id, cfg=cfg, config_path=config_path)
+                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=turn.end_local_id, cfg=cfg, config_path=config_path,
+                                        mention_name=event_context.get('mention_name') or event_context.get('sender_display_name') or event_context.get('sender_name') or event_context.get('from_display_name'))
                         cost = time.time() - t0
                         log('reply send attempted ok=%s cost=%.3fs' % (ok, cost))
                         _record_event(
@@ -1250,7 +1252,8 @@ def main():
                 log('aggregator_flush_due target=%s local_id=%s intent=%s reason=%s reply=%r' % (
                     turn_target.get('name'), turn.end_local_id, decision.intent, decision.reason, text))
                 if decision.should_reply and text and not args.dry_run:
-                    send_reply(text, turn_cfg.get('send_mode'), target=turn_target, before_local_id=turn.end_local_id, cfg=turn_cfg, config_path=config_path)
+                    send_reply(text, turn_cfg.get('send_mode'), target=turn_target, before_local_id=turn.end_local_id, cfg=turn_cfg, config_path=config_path,
+                               mention_name=(turn.event_context or {}).get('mention_name') or (turn.event_context or {}).get('sender_display_name') or (turn.event_context or {}).get('sender_name') or (turn.event_context or {}).get('from_display_name'))
                 for tt in targets:
                     if tt.get('username') == turn.chat_id:
                         tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)

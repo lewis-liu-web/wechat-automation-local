@@ -39,6 +39,8 @@ from api import (  # noqa: E402
     delete_target,
     disable_kb,
     disable_target,
+    dismiss_job,
+    dismiss_jobs_batch,
     enable_kb,
     enable_target,
     events_recent,
@@ -653,6 +655,47 @@ def _page_triggers():
                        format_func=lambda i: options[i])
     target = targets[idx]
     key = target.get("name") or target.get("username") or ""
+
+    mode_options = [("自由", "personal_assistant"), ("平衡", "group_assistant"), ("客服", "customer_service")]
+    mode_label_map = {v: k for k, v in mode_options}
+    current_mode = target.get("mode") or "group_assistant"
+    selected_label = st.selectbox(
+        "响应模式",
+        options=[label for label, _ in mode_options],
+        index=[v for _, v in mode_options].index(current_mode),
+        key=f"target_mode_{key}",
+    )
+    selected_mode = dict(mode_options)[selected_label]
+    if selected_mode != current_mode:
+        try:
+            # Mode is a bundle: also overwrite derived policy fields so the switch takes effect immediately
+            mode_policy = {
+                "personal_assistant": {
+                    "reply_policy": "relaxed",
+                    "session_policy": {"timeout_seconds": 300, "max_turns": 10, "require_followup_intent": False},
+                    "context_policy": {"time_window_seconds": 180, "max_messages": 40, "sender_recent_limit": 8, "include_bot_recent": True},
+                },
+                "group_assistant": {
+                    "reply_policy": "conservative",
+                    "session_policy": {"timeout_seconds": 60, "max_turns": 3, "require_followup_intent": True},
+                    "context_policy": {"time_window_seconds": 90, "max_messages": 30, "sender_recent_limit": 5, "include_bot_recent": True},
+                },
+                "customer_service": {
+                    "reply_policy": "knowledge_grounded",
+                    "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
+                    "context_policy": {"time_window_seconds": 120, "max_messages": 40, "sender_recent_limit": 6, "include_bot_recent": True},
+                },
+            }[selected_mode]
+            set_target_field(key, "mode", selected_mode, base_url=base)
+            set_target_field(key, "reply_policy", mode_policy["reply_policy"], base_url=base)
+            set_target_field(key, "session_policy", mode_policy["session_policy"], base_url=base)
+            set_target_field(key, "context_policy", mode_policy["context_policy"], base_url=base)
+            st.success("已切换响应模式为：%s" % selected_label)
+            if "data_loaded" in st.session_state:
+                del st.session_state["data_loaded"]
+            st.rerun()
+        except ControlAPIError as e:
+            st.error("切换失败：%s" % e)
 
     info = {}
     try:
@@ -1362,6 +1405,9 @@ def _page_agent_jobs():
                     st.caption("错误原因：%s" % (j.get("error") or "未知"))
                     if j.get("result_text"):
                         st.caption("结果预览：%s" % j["result_text"][:120])
+                    raw_out = (j.get("payload") or {}).get("agent_raw_output")
+                    if raw_out:
+                        st.caption("Agent 原始输出：%s" % str(raw_out)[:300])
                     c1, c2, c3, c4 = st.columns(4)
                     if c1.button("忽略", key="dismiss_%s" % job_id, use_container_width=True):
                         try:
@@ -1431,6 +1477,9 @@ def _page_agent_jobs():
                 with st.expander("任务 #%s - %s" % (job_id, title), expanded=False):
                     st.caption("任务内容：%s" % ((j.get("payload") or {}).get("prompt") or "")[:120])
                     st.caption("结果预览：%s" % (j.get("result_text") or "")[:160])
+                    raw_out = (j.get("payload") or {}).get("agent_raw_output")
+                    if raw_out:
+                        st.caption("Agent 原始输出：%s" % str(raw_out)[:300])
                     s1, s2 = st.columns(2)
                     if s1.button("补发已有结果", key="send_done_%s" % job_id, use_container_width=True):
                         try:

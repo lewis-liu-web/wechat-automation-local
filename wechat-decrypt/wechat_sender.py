@@ -17,6 +17,8 @@ import os
 import sys
 import subprocess
 import time
+import re
+
 
 ROOT = Path(__file__).resolve().parent
 PYWECHAT_SRC = (ROOT.parent / 'pywechat_src').resolve()
@@ -41,6 +43,20 @@ class SendResult:
 
 def _noop_log(msg: str) -> None:
     pass
+
+
+def _ensure_mention_prefix(text: str, mention_name: str) -> str:
+    """Ensure the reply starts with '@mention_name ' exactly once."""
+    text = (text or "").strip()
+    mention = str(mention_name or "").strip().lstrip("@")
+    if not text or not mention:
+        return text
+    expected = f"@{mention}"
+    if text.startswith(expected):
+        return text if text.startswith(f"{expected} ") else f"{expected} {text[len(expected):].strip()}"
+    if text.startswith("@"):
+        text = re.sub(r"^@\S+\s*", "", text, count=1).strip()
+    return f"{expected} {text}".strip()
 
 
 def _log(log: Optional[LogFn], msg: str) -> None:
@@ -2554,10 +2570,13 @@ def _confirm_result(result: SendResult, target: Optional[dict], before_local_id:
 
 def send_reply_detailed(text: str, mode: Optional[str] = None, target: Optional[dict] = None,
                         before_local_id: Optional[int] = None, cfg: Optional[dict] = None,
-                        confirm: Optional[ConfirmFn] = None, log: Optional[LogFn] = None) -> SendResult:
+                        confirm: Optional[ConfirmFn] = None, log: Optional[LogFn] = None,
+                        mention_name: Optional[str] = None) -> SendResult:
     cfg = cfg or {}
     mode = (mode or cfg.get('send_mode') or 'foreground').lower()
     confirm_timeout = float(cfg.get('send_confirm_timeout') or 5.0)
+    if mention_name:
+        text = _ensure_mention_prefix(text, mention_name)
 
     if mode in ('backend', 'backend_only', 'background'):
         attempted = send_reply_backend(text, log=log)
@@ -2613,6 +2632,7 @@ def send_reply_detailed(text: str, mode: Optional[str] = None, target: Optional[
 
 def send_reply(text: str, mode: Optional[str] = None, target: Optional[dict] = None,
                before_local_id: Optional[int] = None, cfg: Optional[dict] = None,
-               confirm: Optional[ConfirmFn] = None, log: Optional[LogFn] = None) -> bool:
+               confirm: Optional[ConfirmFn] = None, log: Optional[LogFn] = None,
+               mention_name: Optional[str] = None) -> bool:
     return bool(send_reply_detailed(text, mode=mode, target=target, before_local_id=before_local_id,
-                                    cfg=cfg, confirm=confirm, log=log))
+                                    cfg=cfg, confirm=confirm, log=log, mention_name=mention_name))

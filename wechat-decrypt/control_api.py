@@ -54,6 +54,7 @@ import event_log  # noqa: E402
 import agent_jobs  # noqa: E402
 import agent_worker  # noqa: E402
 from agent_provider import (  # noqa: E402
+    AgentResult,
     EchoAgentProvider,
     HermesProvider,
     list_agent_instances,
@@ -768,13 +769,26 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
     if instance_id:
         agent_jobs.merge_payload(int(job["id"]), {"agent_instance_id": str(instance_id)})
     
-    # Compute appropriate timeout based on job content
+    # Compute timeouts from payload; payload agent_timeout drives agent_deadline_at.
     raw_payload = job.get("payload") or {}
-    if isinstance(raw_payload, dict) and raw_payload.get("image_paths"):
-        submit_timeout = 240.0  # Image analysis needs more time
+    has_images = isinstance(raw_payload, dict) and bool(raw_payload.get("image_paths"))
+    configured_timeout = raw_payload.get("agent_timeout") if isinstance(raw_payload, dict) else None
+    try:
+        agent_timeout = float(configured_timeout) if configured_timeout is not None else None
+    except Exception:
+        agent_timeout = None
+
+    if agent_timeout is not None:
+        deadline_seconds = agent_timeout
+        submit_timeout = min(agent_timeout, 240.0)
+    elif has_images:
+        deadline_seconds = 600.0
+        submit_timeout = 240.0
     else:
+        deadline_seconds = 300.0
         submit_timeout = 30.0
-    
+    agent_deadline_at = time.time() + deadline_seconds
+
     submit_result = provider.submit(job, timeout=submit_timeout)
     if not submit_result.ok:
         agent_jobs.fail_job(
@@ -784,7 +798,7 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"ok": False, "action": "submit_failed", "job_id": job["id"],
                 "error": submit_result.error, "duration": round(time.time() - t0, 3)}
-    
+
     raw = submit_result.raw or {}
     session_id = str(raw.get("bridge_session_id") or "")
     user_msg_id = int(raw.get("bridge_user_msg_id") or 0)
@@ -793,14 +807,7 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
                            status=agent_jobs.STATUS_FAILED)
         return {"ok": False, "action": "no_session", "job_id": job["id"],
                 "duration": round(time.time() - t0, 3)}
-    
-    # Compute agent_deadline_at from payload timeout or default 600s
-    raw_payload = job.get("payload") or {}
-    if isinstance(raw_payload, dict) and raw_payload.get("image_paths"):
-        deadline_seconds = 600.0
-    else:
-        deadline_seconds = 300.0
-    agent_deadline_at = time.time() + deadline_seconds
+
     
     ok = agent_jobs.mark_submitted(
         int(job["id"]),
@@ -840,49 +847,68 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         session_id = str(job.get("external_session_id") or "")
         user_msg_id = int(job.get("external_user_msg_id") or 0)
         deadline = float(job.get("agent_deadline_at") or 0)
-        
-        # Check if expired first
+        attempts = int(job.get("reconcile_attempts") or 0)
+
+        # Check if expired first (no poll done yet, no raw to merge)
+        now = time.time()
         if deadline and now > deadline:
             agent_jobs.mark_expired(job_id, reason="past deadline")
             results.append({"job_id": job_id, "action": "expired"})
             continue
-        
+
         # Build provider from job's external_provider
         ext_provider = str(job.get("external_provider") or "genericagent")
         payload = job.get("payload") or {}
         instance_id = payload.get("agent_instance_id") if isinstance(payload, dict) else None
         provider = _build_agent_provider(ext_provider, instance_id=str(instance_id) if instance_id else None)
 
-        poll_result = provider.poll(session_id, user_msg_id, timeout=10)
-        
+        # Poll with exception guard
+        try:
+            poll_result = provider.poll(session_id, user_msg_id, timeout=10)
+        except Exception as e:
+            poll_result = AgentResult(False, "failed", error="poll exception: %r" % (e,),
+                                       provider=ext_provider, worker_id="reconciler")
+
         if poll_result.ok and poll_result.reply_text:
-            # Agent finished with a reply
             reply_text = agent_jobs.sanitize_agent_result_text(poll_result.reply_text)
-            ok = agent_jobs.complete_job(job_id, reply_text)
-            if ok:
-                results.append({"job_id": job_id, "action": "completed",
-                                "reply_preview": reply_text[:80]})
+            raw = getattr(poll_result, "raw", None) or None
+            if raw:
+                agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
+            if not reply_text:
+                agent_jobs.fail_job(job_id, "empty after sanitize",
+                                    status=agent_jobs.STATUS_FAILED)
+                agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
+                                            external_status="failed")
+                results.append({"job_id": job_id, "action": "failed",
+                                "reason": "empty after sanitize"})
             else:
-                results.append({"job_id": job_id, "action": "complete_failed"})
+                ok = agent_jobs.complete_job(job_id, reply_text)
+                if ok:
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
+                                                external_status="done")
+                    results.append({"job_id": job_id, "action": "completed",
+                                    "reply_preview": reply_text[:80]})
+                else:
+                    results.append({"job_id": job_id, "action": "complete_failed"})
         elif poll_result.status == "running":
-            # Still running, mark as agent_running if first poll, then update next_poll_at
             if job.get("status") == agent_jobs.STATUS_SUBMITTED:
                 agent_jobs.mark_agent_running(job_id, next_poll_at=now + 10.0)
             else:
                 # Backoff: 10s, 20s, 40s, max 60s
-                attempts = int(job.get("reconcile_attempts") or 0)
                 backoff = min(60.0, 10.0 * (2 ** min(attempts, 3)))
                 agent_jobs.update_poll_state(job_id, next_poll_at=now + backoff,
                                             external_status="running")
             results.append({"job_id": job_id, "action": "still_running"})
         else:
-            # Failed (network error, etc.) - keep trying up to deadline
+            raw = getattr(poll_result, "raw", None) or None
+            if raw:
+                agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
             if deadline and now + 30.0 > deadline:
                 agent_jobs.mark_expired(job_id, reason=str(poll_result.error or "poll failed"))
                 results.append({"job_id": job_id, "action": "expired",
                                 "error": poll_result.error})
             else:
-                attempts = int(job.get("reconcile_attempts") or 0)
+                # Backoff: 5s, 10s, 20s, max 60s
                 backoff = min(60.0, 5.0 * (2 ** min(attempts, 3)))
                 agent_jobs.update_poll_state(job_id, next_poll_at=now + backoff,
                                             external_status="error")

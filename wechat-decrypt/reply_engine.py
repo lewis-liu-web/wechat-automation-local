@@ -197,6 +197,12 @@ HIGH_RISK_PATTERNS = [
     "登录", "删", "删除", "格式化", "改配置", "系统设置", "发文件", "聊天记录", "数据库",
     "内部日志", "路径", "keys.json", "忽略之前", "忽略以上", "绕过", "越权", "退群", "踢人", "移出群",
 ]
+FILE_OPERATION_PATTERNS = [
+    "删文件", "删除文件", "打开文件", "读取文件", "修改文件", "写文件", "创建文件",
+    "复制文件", "移动文件", "访问文件", "清理文件", "整理文件", "执行命令", "执行脚本",
+    "执行程序", "运行脚本", "运行程序", "批量删除", "重装系统", "格式化硬盘", "格式化电脑",
+    "清理磁盘", "清空回收站",
+]
 PROMISE_PATTERNS = [
     "你替群主", "代表群主", "承诺", "保证", "报价", "授权", "拍板", "决定",
 ]
@@ -1022,6 +1028,15 @@ def retrieve_knowledge(query: str, config: Dict[str, Any], target: Dict[str, Any
 
 
 def precheck(user_text: str) -> ReplyDecision | None:
+    if _contains_any(user_text, FILE_OPERATION_PATTERNS):
+        return ReplyDecision(
+            True,
+            "这个涉及电脑文件或系统操作，我不能直接处理，需要飞扬确认。",
+            intent="need_human",
+            risk_level="high",
+            need_human=True,
+            reason="pre_boundary_file_operation",
+        )
     if _contains_any(user_text, HIGH_RISK_PATTERNS):
         return ReplyDecision(
             True,
@@ -1738,17 +1753,44 @@ def _is_raw_agent_mode(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
     return mode in {"raw", "raw_agent", "agent_raw"}
 
 
-def _build_raw_agent_prompt(clean_text: str, mention_name: str) -> str:
+def _build_raw_agent_prompt(clean_text: str, mention_name: str, response_mode: str = "group_assistant") -> str:
+    mode_instruction = _mode_instruction(response_mode)
     mention_rule = f"如需回复，建议以 @{mention_name} + 空格 开头。" if mention_name else "如需回复，建议直接输出适合微信群发送的一段话。"
     return (
-        "你是专用微信群回复 agent。微信侧只负责监听、触发和发送；"
-        "内容理解、图片识别、wiki/知识库匹配、边界判断和回复生成都由你完成。\n"
-        "请根据 HTTP payload 里的 raw_text、clean_text、context_messages、image_paths、"
-        "target、wiki_dir、knowledge_bases 等字段自行处理。\n"
-        "只输出要发回微信群的一段中文回复；如果不应该回复，返回空字符串或 JSON 字段 should_reply=false。"
-        f"{mention_rule}\n\n"
-        f"当前清洗后消息：{clean_text}"
+        "你正在执行 wechat-raw-agent 任务。请根据用户消息和群聊上下文，只输出最终要发送到微信群的一段中文回复。\n"
+        f"{mode_instruction}\n"
+        f"{mention_rule}\n"
+        "硬规则：\n"
+        "1. 不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作。\n"
+        "2. 不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节。\n"
+        "3. 不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序。\n"
+        "4. 不确定就说不确定，不要编造事实。\n"
+        "5. 最多300字。\n\n"
+        f"[用户消息]\n{clean_text}\n\n"
+        "请只输出要发送到微信群的一段中文回复。"
     )
+
+
+
+def _mode_instruction(mode: str) -> str:
+    mode = str(mode or "group_assistant").lower()
+    if mode == "personal_assistant":
+        return "当前响应模式：自由。用自然轻松的群聊口吻回复；允许闲聊；如果用户只是闲聊，也给一个简短自然回应，不要套用客服澄清模板。"
+    if mode == "customer_service":
+        return "当前响应模式：客服。用客服口吻，先确认诉求；信息不足时只问一个必要澄清问题；不要承诺、报价、授权或替负责人做决定。"
+    return "当前响应模式：平衡。简短克制，只回答用户明确表达的问题；不主动扩展，不替负责人承诺。"
+
+
+def _agent_ack(response_mode: str) -> Tuple[str, bool]:
+    """Return (ack_text, should_reply_now) for an agent-queued decision.
+
+    Only customer_service mode gets an immediate acknowledgement; free and
+    balanced modes should feel natural and wait for the final async reply.
+    """
+    if str(response_mode or "").lower() == "customer_service":
+        return "正在处理中，请稍等。", True
+    return "", False
+
 
 
 def _agent_reply_from_response(data: Dict[str, Any] | None) -> str | None:
@@ -1797,13 +1839,9 @@ def _call_raw_http_agent(llm_config: Dict[str, Any], payload: Dict[str, Any]) ->
 
 
 def _ensure_mention_prefix(reply: str, mention_name: str) -> str:
-    text = (reply or "").strip()
-    name = (mention_name or "").strip().lstrip("@")
-    if not text or not name:
-        return text
-    if text.startswith("@"):
-        return text
-    return f"@{name} {text}"
+    """prefix responsibility moved to wechat_sender.send_reply_detailed(mention_name=...)"""
+    return reply
+
 
 
 def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None, mention_name: str = "", mode: str = "scene") -> str:
@@ -1835,7 +1873,7 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
         task_rule = "当前已命中场景知识库。请优先依据场景wiki回答，同时遵守core边界约束；知识库无依据时说明不确定。"
         wiki_label = "[core约束与场景wiki]"
     ctx_header = ('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''
-    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n任务策略：{task_rule}\n\n{ctx_header}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
+    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n任务策略：{task_rule}\n\n{ctx_header}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
 
 
 def generate_reply(message: Dict[str, Any] | str,
@@ -1903,6 +1941,8 @@ def generate_reply(message: Dict[str, Any] | str,
     if raw_agent_mode:
         context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
         selected_kbs = resolve_target_kb_ids(config, target)
+        target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
+        response_mode = str((target_policy or {}).get("mode") or target.get("mode") or "group_assistant").lower()
         llm_config = dict(config.get("reply_engine", config) or {})
         current_local_id = message.get("local_id") if isinstance(message, dict) else None
         if image_paths and not clean:
@@ -1919,10 +1959,10 @@ def generate_reply(message: Dict[str, Any] | str,
             else:
                 # No vision capability – mark as missing so agent_provider can degrade gracefully
                 image_descriptions = [{"path": p, "description": "[当前环境未配置视觉识别能力]"} for p in image_paths]
-        prompt = _build_raw_agent_prompt(clean or raw_text, mention_name)
+        prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode)
         boundary = precheck(clean or raw_text)
         if boundary:
-            boundary.reply_text = _ensure_mention_prefix(postcheck(boundary.reply_text), mention_name)
+            boundary.reply_text = postcheck(boundary.reply_text)
             boundary.retrieval_debug = {"mode": "raw_agent", "selected_kbs": selected_kbs, "blocked_before_agent": True}
             return boundary
         # --- Task complexity routing (M2) ---
@@ -1956,16 +1996,23 @@ def generate_reply(message: Dict[str, Any] | str,
                         target_name=target.get("name"),
                         sender=mention_name,
                         message_local_id=message.get("local_id") if isinstance(message, dict) else None,
+                        is_aggregated=message.get("is_aggregated") if isinstance(message, dict) else None,
+                        aggregated_local_ids=message.get("aggregated_local_ids") if isinstance(message, dict) else None,
+                        session_image_paths=message.get("session_image_paths") if isinstance(message, dict) else None,
+                        text_parts_count=message.get("text_parts_count") if isinstance(message, dict) else None,
+                        agent_timeout=240.0 if image_paths else 90.0,
                         task_type="deep_agent",
                         payload=_json_safe({
                             "prompt": clean or raw_text,
                             "clean_text": clean,
                             "raw_text": raw_text,
                             "skill_name": "wechat_task",
-                            "skill_prompt": _load_skill_prompt("wechat_task"),
                             "knowledge_hits": [],
                             "knowledge_bases": selected_kbs,
                             "reply_mode": "raw_agent",
+                            "response_mode": response_mode,
+                            "target_policy": target_policy or {},
+                            "mode_instruction": _mode_instruction(response_mode),
                             "retrieval_debug": {
                                 "mode": "raw_agent",
                                 "route": route_decision.route,
@@ -1983,10 +2030,10 @@ def generate_reply(message: Dict[str, Any] | str,
                             },
                         }),
                     )
-                    ack_text = "收到，正在处理，稍等。"
+                    ack_text, ack_now = _agent_ack(response_mode)
                     return ReplyDecision(
-                        True,
-                        _ensure_mention_prefix(ack_text, mention_name),
+                        ack_now,
+                        ack_text,
                         intent="deep_agent_queued",
                         risk_level="low",
                         need_human=False,
@@ -1996,28 +2043,33 @@ def generate_reply(message: Dict[str, Any] | str,
                             "mode": "raw_agent",
                             "route": route_decision.route,
                             "route_reason": route_decision.reason,
-                            "job_id": job.get("id"),
                             "selected_kbs": selected_kbs,
                         },
                     )
                 except Exception:
                     pass
-        # Raw-agent mode delegates substantial work to the product-owned
-        # AgentProvider job queue. A bare mention/hello still uses local rules
-        # so the user gets an instant answer without consuming external agents.
-        if not clean or _looks_like_smalltalk(clean):
-            reply, intent, need_human = fallback_reply(clean, [])
-            return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
-                                 risk_level="medium" if need_human else "low",
-                                 need_human=need_human,
+        is_smalltalk = _looks_like_smalltalk(clean)
+        if not clean:
+            reply = "我在，想聊什么直接说就行。"
+            return ReplyDecision(True, postcheck(reply), intent="smalltalk",
+                                 risk_level="low", need_human=False,
+                                 reason="raw_agent_empty_message_fallback",
+                                 wiki_hits=[],
+                                 retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
+        if is_smalltalk and response_mode != "personal_assistant":
+            reply = "我先收到啦，需要我具体处理的话，可以补充一下问题。"
+            return ReplyDecision(True, postcheck(reply), intent="smalltalk",
+                                 risk_level="low", need_human=False,
                                  reason="raw_agent_smalltalk_fallback",
                                  wiki_hits=[],
-                                  retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
+                                 retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
         if _HAS_TASK_ROUTER:
             try:
                 local_type = message.get("local_type") if isinstance(message, dict) else None
                 route_name = getattr(route_decision, "route", "agent_provider")
                 route_reason = getattr(route_decision, "reason", "agent_provider")
+                if is_smalltalk and response_mode == "personal_assistant" and (route_decision is None or getattr(route_decision, "route", None) != _task_router.ROUTE_DEEP):  # type: ignore
+                    route_reason = "personal_smalltalk_agent"
                 job_key = "%s:%s" % (target.get("username", "unknown"), message.get("local_id", 0) if isinstance(message, dict) else 0)
                 group_key = target.get("username") or target.get("name") or "unknown"
                 payload_context_messages = context_messages[-10:] if isinstance(context_messages, list) else context_messages
@@ -2027,6 +2079,11 @@ def generate_reply(message: Dict[str, Any] | str,
                     target_name=target.get("name"),
                     sender=mention_name,
                     message_local_id=message.get("local_id") if isinstance(message, dict) else None,
+                    is_aggregated=message.get("is_aggregated") if isinstance(message, dict) else None,
+                    aggregated_local_ids=message.get("aggregated_local_ids") if isinstance(message, dict) else None,
+                    session_image_paths=message.get("session_image_paths") if isinstance(message, dict) else None,
+                    text_parts_count=message.get("text_parts_count") if isinstance(message, dict) else None,
+                    agent_timeout=240.0 if image_paths else 90.0,
                     task_type=str(route_name or "agent_provider"),
                     provider=(target.get("agent_provider") or target.get("provider") or None),
                     payload=_json_safe({
@@ -2035,21 +2092,18 @@ def generate_reply(message: Dict[str, Any] | str,
                         "raw_text": raw_text,
                         "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),
                         "skill_name": "wechat_task",
-                        "skill_prompt": _load_skill_prompt("wechat_task"),
                         "knowledge_hits": [],
                         "knowledge_bases": selected_kbs,
                         "reply_mode": "raw_agent",
+                        "response_mode": response_mode,
+                        "target_policy": target_policy or {},
+                        "mode_instruction": _mode_instruction(response_mode),
                         "retrieval_debug": {
                             "mode": "raw_agent",
                             "route": str(route_name or "agent_provider"),
                             "route_reason": str(route_reason or "agent_provider"),
                             "selected_kbs": selected_kbs,
                         },
-                        "image_paths": image_paths,
-                        "image_descriptions": image_descriptions,
-                        "context_messages": payload_context_messages,
-                        "event_context": (None if isinstance(message, str) else message.get('event_context')) or {},
-                        "target_policy": (None if isinstance(message, str) else message.get('target_policy')) or {},
                         "mention_name": mention_name,
                         "route": str(route_name or "agent_provider"),
                         "route_reason": str(route_reason or "agent_provider"),
@@ -2067,10 +2121,10 @@ def generate_reply(message: Dict[str, Any] | str,
                         },
                     }),
                 )
-                ack_text = "收到，正在处理，稍等。"
+                ack_text, ack_now = _agent_ack(response_mode)
                 return ReplyDecision(
-                    True,
-                    _ensure_mention_prefix(ack_text, mention_name),
+                    ack_now,
+                    ack_text,
                     intent="agent_job_queued",
                     risk_level="low",
                     need_human=False,
@@ -2080,23 +2134,22 @@ def generate_reply(message: Dict[str, Any] | str,
                         "mode": "raw_agent",
                         "route": str(route_name or "agent_provider"),
                         "route_reason": str(route_reason or "agent_provider"),
-                        "job_id": job.get("id"),
                         "selected_kbs": selected_kbs,
                     },
                 )
             except Exception as e:
-                return ReplyDecision(True, _ensure_mention_prefix("复杂处理服务暂不可用，我先收到。", mention_name),
+                return ReplyDecision(True, "复杂处理服务暂不可用，我先收到。",
                                      intent="agent_job_enqueue_failed", risk_level="low", need_human=False,
                                      reason="agent_provider_enqueue_failed:%r" % (e,), wiki_hits=[],
                                      retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
-        return ReplyDecision(True, _ensure_mention_prefix("复杂处理服务暂不可用，我先收到。", mention_name),
+        return ReplyDecision(True, "复杂处理服务暂不可用，我先收到。",
                              intent="agent_job_router_unavailable", risk_level="low", need_human=False,
                              reason="agent_job_router_unavailable", wiki_hits=[],
                              retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
 
     if not clean:
         reply, intent, need_human = fallback_reply(clean, [])
-        return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
+        return ReplyDecision(True, postcheck(reply), intent=intent,
                              risk_level="medium" if need_human else "low",
                              need_human=need_human,
                              reason="empty_after_trigger_fallback",
@@ -2104,7 +2157,7 @@ def generate_reply(message: Dict[str, Any] | str,
 
     pre = precheck(clean)
     if pre:
-        pre.reply_text = _ensure_mention_prefix(postcheck(pre.reply_text), mention_name)
+        pre.reply_text = postcheck(pre.reply_text)
         return pre
 
     # --- reply_mode control ---
@@ -2184,14 +2237,14 @@ def generate_reply(message: Dict[str, Any] | str,
     if llm_text:
         llm_text = _clean_agent_output(llm_text)
     if llm_text:
-        reply = _ensure_mention_prefix(postcheck(llm_text), mention_name)
+        reply = postcheck(llm_text)
         return ReplyDecision(True, reply, intent="wiki_qa" if scene_hits else "smalltalk", risk_level="low", need_human=False,
                              reason="llm_provider_scene" if scene_hits else "llm_provider_core_chat",
                              wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits],
                              retrieval_debug=retrieval_debug)
 
     reply, intent, need_human = fallback_reply(clean, scene_hits, mode=mode)
-    return ReplyDecision(True, _ensure_mention_prefix(postcheck(reply), mention_name), intent=intent,
+    return ReplyDecision(True, postcheck(reply), intent=intent,
                          risk_level="medium" if need_human else "low",
                          need_human=need_human,
                          reason="safe_fallback_scene_no_provider" if scene_hits else "safe_fallback_core_chat_no_provider",

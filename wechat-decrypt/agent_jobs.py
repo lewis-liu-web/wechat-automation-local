@@ -82,7 +82,13 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def sanitize_agent_result_text(text: str) -> str:
-    """Remove terminal/Hermes wrapper noise before a reply is stored or sent."""
+    """Lightweight format cleanup before a reply is stored or sent.
+
+    Responsibilities: strip ANSI escapes, terminal box characters, and the
+    "Resume this session" prompt; merge remaining non-empty lines into a single
+    line.  Detection of tool logs or Hermes init noise belongs to the provider
+    layer (``agent_provider._clean_agent_output``).
+    """
     value = str(text or "").replace("\r", "").strip()
     if not value:
         return ""
@@ -98,9 +104,7 @@ def sanitize_agent_result_text(text: str) -> str:
         line = line.strip().strip("│").strip()
         if not line:
             continue
-        if set(line) <= {"─", "╭", "╮", "╰", "╯", "│", " "}:
-            continue
-        if line.startswith("Query:"):
+        if set(line) <= {"─", "╭", "╮", "╰", "╯", "│", " ", }:
             continue
         cleaned_lines.append(line)
     return " ".join(cleaned_lines).strip()
@@ -211,11 +215,25 @@ def enqueue_job(*,
                 message_local_id: int | None = None,
                 priority: int = 0,
                 provider: str | None = None,
+                is_aggregated: bool | None = None,
+                aggregated_local_ids: List[Any] | None = None,
+                session_image_paths: List[str] | None = None,
+                text_parts_count: int | None = None,
+                agent_timeout: float | None = None,
+                knowledge_hits: List[Dict[str, Any]] | None = None,
+                knowledge_bases: List[str] | None = None,
+                reply_mode: str | None = None,
+                retrieval_debug: Dict[str, Any] | None = None,
+                skill_name: str | None = None,
                 db_path: Optional[Path] = None) -> Dict[str, Any]:
     """Create a queued job, or return the existing job with the same key.
 
     `job_key` is the duplicate-reply guard.  For WeChat messages it should be
     derived from target/table/local_id rather than random UUIDs.
+
+    Optional aggregation/skill metadata is merged into ``payload`` only for
+    keys not already present, preserving backward compatibility with payloads
+    that already contain fields such as ``skill_prompt``.
     """
     if not job_key:
         raise ValueError("job_key is required")
@@ -223,6 +241,23 @@ def enqueue_job(*,
         raise ValueError("group_key is required")
     if not task_type:
         raise ValueError("task_type is required")
+
+    merged_payload = dict(payload)
+    _optional_payload_fields = {
+        "is_aggregated": is_aggregated,
+        "aggregated_local_ids": aggregated_local_ids,
+        "session_image_paths": session_image_paths,
+        "text_parts_count": text_parts_count,
+        "agent_timeout": agent_timeout,
+        "knowledge_hits": knowledge_hits,
+        "knowledge_bases": knowledge_bases,
+        "reply_mode": reply_mode,
+        "retrieval_debug": retrieval_debug,
+        "skill_name": skill_name,
+    }
+    for key, value in _optional_payload_fields.items():
+        if value is not None and key not in merged_payload:
+            merged_payload[key] = value
 
     ts = _now()
     with _WRITE_LOCK, _connect(db_path) as con:
@@ -235,7 +270,7 @@ def enqueue_job(*,
             """,
             (
                 str(job_key), str(group_key), target_name, sender, message_local_id,
-                str(task_type), int(priority), STATUS_QUEUED, _json_dumps(payload),
+                str(task_type), int(priority), STATUS_QUEUED, _json_dumps(merged_payload),
                 provider, ts, SEND_PENDING,
             ),
         )
@@ -427,10 +462,11 @@ def fail_job(job_id: int, error: str, *, status: str = STATUS_FAILED,
         cur = con.execute(
             """
             UPDATE agent_jobs
-            SET status=?, error=?, finished_at=?
-            WHERE id=? AND status IN (?, ?)
+            SET status=?, error=?, finished_at=?, next_poll_at=NULL
+            WHERE id=? AND status IN (?, ?, ?, ?)
             """,
-            (status, str(error or "")[:500], _now(), int(job_id), STATUS_QUEUED, STATUS_RUNNING),
+            (status, str(error or "")[:500], _now(), int(job_id),
+             STATUS_QUEUED, STATUS_RUNNING, STATUS_SUBMITTED, STATUS_AGENT_RUNNING),
         )
         return cur.rowcount == 1
 
@@ -442,6 +478,8 @@ def mark_sending(job_id: int, *, db_path: Optional[Path] = None) -> bool:
             (STATUS_SENDING, int(job_id), STATUS_DONE),
         )
         return cur.rowcount == 1
+
+
 
 
 def mark_sent(job_id: int, *, db_path: Optional[Path] = None) -> bool:
