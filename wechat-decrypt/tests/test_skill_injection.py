@@ -161,3 +161,46 @@ def test_build_prompt_with_skill_passes_mode_instruction():
     assert "当前响应模式：自由。允许闲聊。" in prompt
     assert "{{mode_instruction}}" not in prompt
     assert "Output ONLY the final Chinese reply text" in prompt
+
+
+def test_build_prompt_keeps_long_knowledge_hit_content():
+    """知识库片段内容超过 800 字符时不应被截断；总预算超限时再截尾。"""
+    long_content = "移动云盘" + "，支持文件备份" * 200  # well over 800 chars
+    job = {
+        "payload": {
+            "prompt": "介绍一下移动云盘",
+            "sender": "user",
+            "knowledge_hits": [
+                {
+                    "source": "local",
+                    "kb_id": "desktop_pdf",
+                    "rel_path": "product.md",
+                    "content": long_content,
+                }
+            ],
+        }
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "[知识库片段]" in prompt
+    # Content beyond the old 800-char cap must be preserved
+    assert long_content[:900] in prompt
+    assert "### 片段 1 (来源: local product.md)" in prompt
+
+
+def test_build_prompt_total_kb_budget_stops_at_tail():
+    """总字符预算 12000 超限时，应停止追加后续片段，而不是截断到片段中间。"""
+    chunk = "0123456789" * 500  # 5000 chars
+    job = {
+        "payload": {
+            "prompt": "查询资料",
+            "sender": "user",
+            "knowledge_hits": [
+                {"source": "local", "kb_id": "a", "rel_path": "a.md", "content": chunk},
+                {"source": "local", "kb_id": "b", "rel_path": "b.md", "content": chunk},
+                {"source": "local", "kb_id": "c", "rel_path": "c.md", "content": chunk},
+            ],
+        }
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert prompt.count("### 片段") == 3  # 12000 budget fits three 4000-char hits
+    assert "### 片段 4" not in prompt

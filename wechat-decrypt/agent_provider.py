@@ -275,21 +275,36 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         image_hint = f"{image_hint}{path_hint}"
 
     # --- Knowledge hits injection ---
+    _KB_MAX_HITS = 5
+    _KB_DEFAULT_HIT_MAX_CHARS = 4000
+    _KB_TOTAL_BUDGET_CHARS = 12000
     knowledge_hits = payload.get("knowledge_hits") or []
     knowledge_section = ""
     if knowledge_hits:
         parts = []
-        for idx, hit in enumerate(knowledge_hits[:5], start=1):
+        total_chars = 0
+        for idx, hit in enumerate(knowledge_hits[:_KB_MAX_HITS], start=1):
             if isinstance(hit, dict):
                 source = str(hit.get("source") or hit.get("kb_id") or "unknown")
                 rel = str(hit.get("rel_path") or hit.get("path") or "").strip()
                 origin = f"{source} {rel}".strip() if rel else source
                 content = str(hit.get("content") or hit.get("body") or "").strip()
-                parts.append(f"### 片段 {idx} (来源: {origin})\n{content[:800]}")
             elif isinstance(hit, (list, tuple)) and len(hit) >= 2:
-                parts.append(f"### 片段 {idx}\n{str(hit[1])[:800]}")
+                origin = "unknown"
+                content = str(hit[1]).strip()
             else:
-                parts.append(f"### 片段 {idx}\n{str(hit)[:800]}")
+                origin = "unknown"
+                content = str(hit).strip()
+            per_hit_max = int(
+                (hit.get("hit_max_chars") if isinstance(hit, dict) else None)
+                or _KB_DEFAULT_HIT_MAX_CHARS
+            )
+            remaining = max(0, _KB_TOTAL_BUDGET_CHARS - total_chars)
+            if remaining <= 0:
+                break
+            truncated = content[:min(per_hit_max, remaining)]
+            total_chars += len(truncated)
+            parts.append(f"### 片段 {idx} (来源: {origin})\n{truncated}")
         knowledge_section = "\n\n[知识库片段]\n" + "\n\n".join(parts) + "\n"
 
     # --- Skill injection ---

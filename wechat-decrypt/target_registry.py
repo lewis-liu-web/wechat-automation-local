@@ -308,8 +308,21 @@ def find_candidate(data, key):
 
 
 def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
+    if knowledge_bases and len(knowledge_bases) > 1:
+        raise ValueError("一个监听目标最多只能绑定一个知识库，当前收到 %d 个: %s" % (len(knowledge_bases), ", ".join(str(x) for x in knowledge_bases)))
+
     cfg = load_config(config_path)
     data = load_candidates(candidates_path)
+
+    def _merge_and_validate(cur, new_kbs):
+        merged = list(cur)
+        for kb in new_kbs or []:
+            if kb not in merged:
+                merged.append(kb)
+        if len(merged) > 1:
+            raise ValueError("一个监听目标最多只能绑定一个知识库，当前合并后共 %d 个: %s" % (len(merged), ", ".join(str(x) for x in merged)))
+        validate_knowledge_bases(merged, cfg=cfg)
+        return merged
 
     existing = find_target(cfg, key)
     if existing:
@@ -317,11 +330,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         existing["category"] = _normalize_category(category, default=existing.get("category"))
         if knowledge_bases:
             cur = list(existing.get("knowledge_bases") or [])
-            for kb in knowledge_bases:
-                if kb not in cur:
-                    cur.append(kb)
-            validate_knowledge_bases(cur, cfg=cfg)
-            existing["knowledge_bases"] = cur
+            final_kbs = _merge_and_validate(cur, knowledge_bases)
+            existing["knowledge_bases"] = final_kbs
         cand = find_candidate(data, existing.get("username") or key)
         if cand:
             cand["status"] = "enabled"
@@ -341,11 +351,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         existing["category"] = _normalize_category(category, default=existing.get("category"))
         if knowledge_bases:
             cur = list(existing.get("knowledge_bases") or [])
-            for kb in knowledge_bases:
-                if kb not in cur:
-                    cur.append(kb)
-            validate_knowledge_bases(cur, cfg=cfg)
-            existing["knowledge_bases"] = cur
+            final_kbs = _merge_and_validate(cur, knowledge_bases)
+            existing["knowledge_bases"] = final_kbs
         cand["status"] = "enabled"
         cand["updated_at"] = now_text()
         data["updated_at"] = now_text()
@@ -353,6 +360,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         save_json_atomic(candidates_path, data)
         return existing
     selected_kbs = knowledge_bases or cand.get("suggested_knowledge_bases") or []
+    if len(selected_kbs) > 1:
+        raise ValueError("一个监听目标最多只能绑定一个知识库，当前收到 %d 个: %s" % (len(selected_kbs), ", ".join(str(x) for x in selected_kbs)))
     validate_knowledge_bases(selected_kbs, cfg=cfg)
     target = {
         "name": cand.get("name") or username,
@@ -493,6 +502,65 @@ def list_knowledge_bases(config_path=CONFIG_PATH):
     return rows
 
 
+def _resolve_kb_path(path, config_path=CONFIG_PATH, cfg=None):
+    """Resolve a local KB path, honoring wiki_dir from config.
+
+    - Returns None for empty path.
+    - Absolute paths are returned only if they exist.
+    - Relative paths resolve against cfg['wiki_dir'] when present,
+      using the same logic as reply_engine._resolve_wiki_path.
+    - Falls back to the config file's parent directory.
+    - Returns None if the resolved path does not exist.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if p.is_absolute():
+        return p if p.exists() else None
+    cfg = cfg or load_config(config_path)
+    base = Path(config_path).resolve().parent
+    wiki_dir = cfg.get("wiki_dir")
+    if wiki_dir:
+        wiki_root = Path(wiki_dir)
+        if not wiki_root.is_absolute():
+            wiki_root = base / wiki_root
+    else:
+        wiki_root = base / "wiki"
+    resolved = wiki_root / p
+    return resolved if resolved.exists() else None
+
+
+def validate_kb_config(kb_id, spec, config_path=CONFIG_PATH):
+    """Validate a knowledge-base spec before it is persisted.
+
+    Raises ValueError with a clear message for invalid configurations.
+    """
+    cfg = load_config(config_path)
+    kb_type = str(spec.get("type") or "").strip().lower()
+    if not kb_type:
+        raise ValueError("知识库 '%s' 缺少 type 字段" % kb_id)
+    if kb_type not in ("local", "getnote", "ima", "hook"):
+        raise ValueError("知识库 '%s' 不支持的类型: %s" % (kb_id, kb_type))
+    if not isinstance(spec.get("enabled", True), bool):
+        raise ValueError("知识库 '%s' enabled 必须是布尔值" % kb_id)
+    if kb_type == "local":
+        kb_path = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+        if not kb_path or not kb_path.exists() or not kb_path.is_dir():
+            raise ValueError("知识库 '%s' path does not exist or is not a directory: %s" % (kb_id, spec.get("path")))
+    elif kb_type in ("getnote", "ima"):
+        if not spec.get("knowledge_base_id"):
+            raise ValueError("知识库 '%s' 必须提供 knowledge_base_id" % kb_id)
+    elif kb_type == "hook":
+        if not spec.get("executable"):
+            raise ValueError("知识库 '%s' 必须提供 executable" % kb_id)
+
+
+def _local_kb_dir(kb_id, spec, config_path=CONFIG_PATH):
+    """Return the resolved local directory for a local KB spec."""
+    cfg = load_config(config_path)
+    return _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+
+
 def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=None, description="",
                         executable=None, scope="scene", limit=None, timeout=None,
                        enabled=True, replace=False, source=None, config_path=CONFIG_PATH):
@@ -534,6 +602,7 @@ def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=No
         raise ValueError("unsupported knowledge base type: %s" % kb_type)
     if description:
         spec["description"] = description
+    validate_kb_config(kb_id, spec, config_path=config_path)
     cfg["knowledge_bases"][kb_id] = spec
     save_json_atomic(config_path, cfg)
     out = dict(spec)
@@ -564,9 +633,9 @@ def delete_knowledge_base(kb_id, remove_files=False, config_path=CONFIG_PATH):
     removed = kbs.pop(kb_id)
     save_json_atomic(config_path, cfg)
     if remove_files and (removed or {}).get("type") == "local":
-        p = Path((removed or {}).get("path") or "")
-        if p.exists() and p.is_dir() and _wiki_root() in p.resolve().parents:
-            shutil.rmtree(str(p), ignore_errors=True)
+        kb_dir = _resolve_kb_path((removed or {}).get("path") or "", config_path=config_path, cfg=cfg)
+        if kb_dir and kb_dir.exists() and kb_dir.is_dir() and _wiki_root() in kb_dir.resolve().parents:
+            shutil.rmtree(str(kb_dir), ignore_errors=True)
     out = dict(removed or {})
     out["id"] = kb_id
     return out
@@ -599,7 +668,10 @@ def validate_knowledge_bases(knowledge_bases, config_path=CONFIG_PATH, cfg=None)
             continue
         if kb not in known:
             raise ValueError(_unknown_kb_message(kb, cfg))
-        sources.add(_kb_source(known.get(kb) or {}))
+        spec = known.get(kb) or {}
+        if spec.get("enabled", True) is False:
+            raise ValueError("知识库 '%s' 已被禁用，无法绑定。请先启用或选择其他知识库。" % kb)
+        sources.add(_kb_source(spec))
     if len(sources) > 1:
         raise ValueError("一个监听目标只能绑定同源知识库，当前混用了: %s。请只选择 obsidian/local_folder/getnote/ima/hook 中的一种。" % ", ".join(sorted(sources)))
     return True
@@ -610,6 +682,8 @@ def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
     t = find_target(cfg, key)
     if not t:
         raise ValueError("target not found: %s" % key)
+    if len(knowledge_bases or []) > 1:
+        raise ValueError("一个监听目标最多只能绑定一个知识库，当前收到 %d 个: %s" % (len(knowledge_bases), ", ".join(str(x) for x in knowledge_bases)))
     if replace:
         final_kbs = list(knowledge_bases)
     else:
@@ -676,6 +750,51 @@ def get_kb_info(kb_id, config_path=CONFIG_PATH):
     elif spec.get("type") == "ima":
         info.update(_resolve_ima_kb_info(spec))
     return info
+
+
+def rebuild_kb_index(kb_id, config_path=CONFIG_PATH):
+    """Force-delete the FTS index for a local knowledge base.
+
+    The index will be rebuilt lazily on the next query via reply_engine.
+    """
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("type") != "local":
+        raise ValueError("仅支持重建本地知识库索引: %s" % kb_id)
+    kb_dir = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+    if not kb_dir or not kb_dir.exists() or not kb_dir.is_dir():
+        raise ValueError("知识库路径不存在或不是目录: %s" % spec.get("path"))
+    db_path = kb_dir / ".kb_index.sqlite"
+    index_removed = False
+    if db_path.exists():
+        db_path.unlink()
+        index_removed = True
+    doc_count = sum(1 for p in kb_dir.rglob("*.md") if p.name != ".kb_index.sqlite")
+    return {
+        "id": kb_id,
+        "index_path": str(db_path),
+        "index_removed": index_removed,
+        "doc_count": doc_count,
+    }
+
+
+def diagnose_local_kb(kb_id, query='', config_path=CONFIG_PATH):
+    """Diagnose a local KB index and run a sample query."""
+    cfg = load_config(config_path)
+    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("type") != "local":
+        raise ValueError("仅支持诊断本地知识库: %s" % kb_id)
+    import reply_engine
+    root = reply_engine._kb_root(cfg)
+    # Ensure the index exists so diagnosis reflects current KB contents.
+    con = reply_engine._ensure_local_kb_fts(root, spec)
+    if con:
+        con.close()
+    return reply_engine.diagnose_local_kb(root, spec, query=query)
 
 
 def _getnote_exe(spec):

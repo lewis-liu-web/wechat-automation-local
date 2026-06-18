@@ -399,11 +399,22 @@ def main(argv=None):
     p.add_argument("id", help="knowledge base alias")
     p.add_argument("--json", action="store_true")
 
-    # kb = bind-wiki
-    p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind one or more knowledge base aliases to a target")
+    # kb = bind-wiki (single KB source per target)
+    p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind a single knowledge base alias to a target")
     p.add_argument("key")
     p.add_argument("wiki", nargs="+")
     p.add_argument("--replace", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    # kb-reindex = force rebuild local KB index
+    p = sub.add_parser("kb-reindex", aliases=["wiki-reindex"], help="force rebuild local KB FTS index")
+    p.add_argument("id", help="local knowledge base alias")
+    p.add_argument("--json", action="store_true")
+
+    # kb-diagnose = diagnose local KB index
+    p = sub.add_parser("kb-diagnose", aliases=["wiki-diagnose"], help="diagnose local KB FTS index")
+    p.add_argument("id", help="local knowledge base alias")
+    p.add_argument("--query", "-q", default="", help="sample query to test against the index")
     p.add_argument("--json", action="store_true")
 
     # db decrypt lifecycle
@@ -730,13 +741,42 @@ def main(argv=None):
                     safe_print("调用约定: 环境变量 KB_QUERY/KB_ID/KB_LIMIT，stdout 输出 JSON results")
             return 0
 
-        # -- kb / bind-wiki --
         if cmd in ("kb", "bind-wiki"):
+            if len(args.wiki) > 1:
+                raise ValueError("一个监听目标最多只能绑定一个知识库；收到 %d 个: %s" % (len(args.wiki), ", ".join(args.wiki)))
             out = reg.bind_wiki(args.key, args.wiki, replace=args.replace)
             if args.json:
                 print_json(out)
             else:
                 safe_print("knowledge_bases: %s" % ",".join(out.get("knowledge_bases") or []))
+            return 0
+
+        # -- kb-reindex / wiki-reindex --
+        if cmd in ("kb-reindex", "wiki-reindex"):
+            info = reg.rebuild_kb_index(args.id)
+            if args.json:
+                print_json({"ok": True, "knowledge_base": info})
+            else:
+                safe_print("已重建知识库索引: %s" % info.get("id"))
+                safe_print("索引文件: %s" % info.get("index_path"))
+                safe_print("文档数: %d" % info.get("doc_count", 0))
+            return 0
+
+        # -- kb-diagnose / wiki-diagnose --
+        if cmd in ("kb-diagnose", "wiki-diagnose"):
+            q = getattr(args, "query", "") or ""
+            info = reg.diagnose_local_kb(args.id, query=q)
+            if args.json:
+                print_json({"ok": True, **info})
+            else:
+                safe_print("诊断结果: %s" % info.get("kb_id"))
+                safe_print("索引文件: %s" % info.get("index_path"))
+                safe_print("索引存在: %s" % ("是" if info.get("index_exists") else "否"))
+                safe_print("schema版本: %s" % info.get("schema_version"))
+                safe_print("文档数: %d" % info.get("doc_count", 0))
+                if info.get("sample_fts_query"):
+                    safe_print("样例FTS查询: %s" % info.get("sample_fts_query"))
+                    safe_print("样例命中数: %d" % len(info.get("sample_hits", [])))
             return 0
 
         safe_print("Unknown command: %s" % cmd)

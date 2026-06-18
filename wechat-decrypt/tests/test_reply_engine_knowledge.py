@@ -46,6 +46,91 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         hits2=retrieve_knowledge('香蕉', cfg, {'knowledge_bases':['scene.a','scene.b']})
         self.assertIn('scene.b', '\n'.join(h.label for h in hits2))
 
+
+    def test_local_kb_matches_body_content(self):
+        """Body-only keywords should be retrievable from local KB via fallback scoring."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景', encoding='utf-8')
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {
+            'scene.a': {'type':'local','path':'scenes/a'},
+        }}
+        hits=retrieve_knowledge('工作号真实号', cfg, {'knowledge_bases':['scene.a']})
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_fts_matches_body_content(self):
+        """FTS5 path should be the one that returns body-only hits."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景', encoding='utf-8')
+        from reply_engine import _retrieve_local_kb_fts
+        hits=_retrieve_local_kb_fts('工作号真实号', root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_fts_matches_body_content_with_punctuation(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
+        from reply_engine import _retrieve_local_kb_fts
+        hits=_retrieve_local_kb_fts('工作号真实号', root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_fts_matches_body_content_long_sentence(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('简单介绍一下，工作号真实号是一款号码认证产品。', encoding='utf-8')
+        from reply_engine import _retrieve_local_kb_fts
+        hits=_retrieve_local_kb_fts('介绍一下工作号真实号产品', root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_fts_matches_body_content_after_cleaning_mentions(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
+        from reply_engine import _retrieve_local_kb_fts, _clean_query_for_fts
+        raw = 'lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢'
+        cleaned = _clean_query_for_fts(raw)
+        self.assertIn('工作号真实号', cleaned)
+        hits=_retrieve_local_kb_fts(cleaned, root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_matches_body_content_with_punctuation(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {
+            'scene.a': {'type':'local','path':'scenes/a'},
+        }}
+        hits=retrieve_knowledge('工作号真实号', cfg, {'knowledge_bases':['scene.a']})
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_matches_body_content_long_sentence(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('简单介绍一下，工作号真实号是一款号码认证产品。', encoding='utf-8')
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {
+            'scene.a': {'type':'local','path':'scenes/a'},
+        }}
+        hits=retrieve_knowledge('介绍一下工作号真实号产品', cfg, {'knowledge_bases':['scene.a']})
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
+
+    def test_local_kb_matches_body_content_with_mention_prefix(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {
+            'scene.a': {'type':'local','path':'scenes/a'},
+        }}
+        hits=retrieve_knowledge('lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢', cfg, {'knowledge_bases':['scene.a']})
+        contents='\n'.join(h.content for h in hits)
+        self.assertIn('工作号真实号', contents)
     def test_ima_without_key_is_safe_no_hit(self):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)

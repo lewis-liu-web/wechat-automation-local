@@ -8,7 +8,7 @@ Do not store secrets, tokens, database paths, private chat logs, or internal aut
 
 ## Knowledge base model
 
-Below `core`, knowledge is organized by reusable scenes rather than by WeChat group name. A monitored group can choose 0, 1, or many knowledge bases according to its attributes.
+Below `core`, knowledge is organized by reusable scenes rather than by WeChat group name. A monitored group can choose **exactly one** knowledge-base source (local or online) according to its attributes.
 
 Recommended local layout:
 
@@ -34,20 +34,38 @@ Config example:
     },
     "online.ima.company_faq": {
       "type": "ima",
-      "agent_id": "...",
+      "knowledge_base_id": "YOUR_KB_ID",
       "api_key_env": "IMA_API_KEY"
     }
   },
   "targets": [
     {
       "name": "some group",
-      "knowledge_bases": ["scene.bot_testing", "online.ima.company_faq"]
+      "knowledge_bases": ["scene.bot_testing"]
     }
   ]
 }
 ```
 
 A target with `knowledge_bases: []` uses only `wiki/core` and therefore only replies within the global boundaries.
+
+## Local KB indexing
+
+Local KBs are indexed with SQLite FTS5 using the `trigram` tokenizer. This makes Chinese (CJK) body content searchable without extra dependencies.
+
+- Each local KB directory gets a `.kb_index.sqlite` file.
+- The index is rebuilt automatically when the schema version changes.
+- To force a rebuild, run `python manage_targets.py kb-reindex <alias>`.
+- To inspect index state and test a query, run `python manage_targets.py kb-diagnose <alias> --query "关键词"`.
+- Raw chat messages are cleaned (sender prefix, @mentions, filler words) before FTS search, so keep product keywords in the document body.
+
+## Global toggle
+
+Set `reply_engine.disable_local_kb: true` to skip all local KBs and rely only on online providers or `wiki/core` for every target.
+
+## Single-source binding rule
+
+Each target may be bound to at most one knowledge-base alias. Binding two aliases, or mixing local with online sources, is rejected by the control API and CLI.
 
 ## Legacy cleanup
 

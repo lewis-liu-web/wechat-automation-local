@@ -226,3 +226,62 @@ def test_balanced_mode_question_does_not_return_ack():
             assert len(all_jobs) >= 1
         finally:
             jobs.DEFAULT_DB_PATH = orig_default
+
+
+def test_raw_agent_enqueue_payload_knowledge_hits_not_empty():
+    """raw_agent 模式下，命中的知识库内容必须原样进入 agent job payload。"""
+    import tempfile
+    from pathlib import Path
+    import agent_jobs as jobs
+    import reply_engine as re
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wiki_root = Path(tmpdir) / "wiki"
+        kb_path = wiki_root / "desktop_pdf"
+        kb_path.mkdir(parents=True)
+        (kb_path / "product.md").write_text(
+            "移动云盘是中国移动推出的云存储产品，支持文件备份、多端同步和在线预览。",
+            encoding="utf-8",
+        )
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        target = {
+            "name": "bot群聊测试",
+            "username": "47965620946@chatroom",
+            "table": "Msg_abc",
+            "triggers": ["@小助理"],
+            "knowledge_bases": ["desktop_pdf"],
+            "mode": "customer_service",
+        }
+        config = {
+            "reply_engine": {"raw_mode": True},
+            "knowledge_bases": {
+                "desktop_pdf": {"type": "local", "path": "desktop_pdf"},
+            },
+            "wiki_dir": str(wiki_root),
+        }
+        message = {
+            "content": "@小助理 介绍一下移动云盘",
+            "message_content": "@小助理 介绍一下移动云盘",
+            "local_id": 12346,
+            "local_type": 1,
+            "context_messages": [],
+            "is_aggregated": False,
+            "aggregated_local_ids": [12346],
+            "text_parts_count": 1,
+        }
+        orig_default = jobs.DEFAULT_DB_PATH
+        try:
+            jobs.DEFAULT_DB_PATH = db
+            decision = re.generate_reply(message, target, config)
+            assert decision.should_reply is True
+            assert decision.intent in ("deep_agent_queued", "agent_job_queued"), decision.intent
+            all_jobs = jobs.list_jobs(db_path=db)
+            assert len(all_jobs) >= 1
+            job = all_jobs[-1]
+            payload = job.get("payload") or {}
+            hits = payload.get("knowledge_hits") or []
+            assert len(hits) >= 1, "expected non-empty knowledge_hits in payload"
+            contents = "\n".join(str(h.get("content") or "") for h in hits)
+            assert "移动云盘" in contents, f"expected 移动云盘 in hits, got {contents!r}"
+        finally:
+            jobs.DEFAULT_DB_PATH = orig_default

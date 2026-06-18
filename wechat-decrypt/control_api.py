@@ -466,8 +466,16 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(action="opened", path=reg.open_kb_dir(m[0]))
         if method == "POST" and (m := _match(path, "/kbs/{key}/obsidian")):
             return _ok(action="opened_obsidian", **reg.open_kb_obsidian(m[0]))
+        if method == "GET" and (m := _match(path, "/kbs/{key}/diagnose")):
+            q = str((params.get("q") or [""])[0]).strip()
+            try:
+                return _ok(**reg.diagnose_local_kb(m[0], query=q))
+            except Exception as e:
+                return _err("diagnose failed: %s" % (e,))
         if method == "POST" and (m := _match(path, "/targets/{key}/kbs/replace")):
             kbs = list(body.get("knowledge_bases") or [])
+            if len(kbs) > 1:
+                return _err("一个监听目标最多只能绑定一个知识库；收到 %d 个: %s" % (len(kbs), ", ".join(kbs)))
             return _ok(action="bound", target=reg.bind_wiki(m[0], kbs, replace=True))
 
         return _err("not found: %s %s" % (method, path), status=404)

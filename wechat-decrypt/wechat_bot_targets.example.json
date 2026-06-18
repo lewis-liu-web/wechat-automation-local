@@ -36,10 +36,9 @@
         "require_followup_intent": true
       },
       "knowledge_bases": [
-        "scene.bot_testing",
-        "online.getnote.bot_testing",
-        "online.getnote.bot_testing_work"
-      ]
+        "scene.bot_testing"
+      ],
+      "_knowledge_bases_comment": "Each target can bind at most ONE knowledge-base alias (local or online). Remove the second alias if you want online retrieval."
     },
     {
       "name": "示例群聊名称",
@@ -71,8 +70,7 @@
         "require_followup_intent": true
       },
       "knowledge_bases": [
-        "scene.chongqing_mobile_work",
-        "online.getnote.chongqing_mobile_work"
+        "scene.chongqing_mobile_work"
       ]
     }
   ],
@@ -86,9 +84,10 @@
     "bridge_poll_interval": 1.0,
     "temperature": 0.7,
     "max_tokens": 800,
-    "chat_llm_timeout": 20
+    "chat_llm_timeout": 20,
+    "disable_local_kb": false,
+    "_disable_local_kb_comment": "Set to true to skip all local KBs and rely on online providers or wiki/core only."
   },
-  "reply_mode": "standard",
   "context_policy": {
     "time_window_seconds": 90,
     "max_messages": 30,
@@ -101,9 +100,7 @@
     "trigger_behavior": "mention_or_active_session"
   },
   "context_limit": 30,
-  "send_mode": "cua_separate_window",
-  "_send_mode_comment": "Options: foreground (UIA/OCR/physical), backend (clipboard+PostMessage), cua (CUA driver main-window path), cua_separate_window/cua_window (CUA background send to pre-opened independent chat window, default), backend_then_foreground, cua_then_foreground"
-  "stop_file": "wechat_bot.stop",
+  "_send_mode_comment": "Options: foreground (UIA/OCR/physical), backend (clipboard+PostMessage), cua (CUA driver main-window path), cua_separate_window/cua_window (CUA background send to pre-opened independent chat window, default), backend_then_foreground, cua_then_foreground",
   "send_confirm_timeout": 5.0,
   "advance_on_send_failure": true,
   "send_strategy": "single",

@@ -345,8 +345,47 @@ def retrieve_wiki(query: str, limit: int = 3, base_dir: str | Path | None = None
     return _rank_wiki_docs(query, docs, limit=limit)
 
 
-def _query_tokens(query: str) -> List[str]:
+_FTS_FILLER_WORDS = [
+    r"简单介绍一下",
+    r"简单介绍",
+    r"介绍一下",
+    r"介绍下",
+    r"简单说下",
+    r"说一下",
+    r"讲一下",
+    r"简单",
+    r"介绍",
+    r"一下",
+    r"说下",
+    r"讲下",
+]
+
+
+_DEFAULT_HIT_MAX_CHARS = 4000
+
+
+
+def _clean_query_for_fts(query: str) -> str:
+    """Strip WeChat sender prefix, @mentions, filler words, and punctuation.
+
+    The trigram FTS tokenizer needs tokens of 3+ characters to match CJK
+    body content. Raw chat messages contain short prefixes/mentions that
+    pollute the query, so we remove them before building the FTS expression.
+    """
     q = query or ""
+    # Remove common WeChat sender prefix and @mentions.
+    q = re.sub(r"^[^:\n\uff1a]{1,40}[:\uff1a]\s*", "", q)
+    q = re.sub(r"@[^\s\u2005]+[\s\u2005]*", "", q)
+    # Remove filler words that would otherwise become short/noisy tokens.
+    for pat in _FTS_FILLER_WORDS:
+        q = re.sub(pat, " ", q)
+    # Normalize punctuation to spaces.
+    q = re.sub(r"[，,。！？!?:：；;、]+", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
+
+
+def _query_tokens(query: str) -> List[str]:
+    q = _clean_query_for_fts(query)
     tokens = [t for t in re.split(r"[\s,，。！？!?:：；;、/\\]+", q) if len(t) >= 2]
     # Add useful Chinese substrings for short group messages.  Chinese group
     # questions often look like "苹果是什么"; without a tokenizer the whole
@@ -411,7 +450,7 @@ def _rank_wiki_docs(query: str, docs: List[Tuple[str, str]], limit: int = 3) -> 
         # Core rules are always useful as grounding.
         scored = [(1, rel, body) for rel, body in docs if rel.startswith("core/")]
     scored.sort(key=lambda x: (-x[0], x[1]))
-    return [(rel, body[:1200]) for _, rel, body in scored[:limit]]
+    return [(rel, body[:_DEFAULT_HIT_MAX_CHARS]) for _, rel, body in scored[:limit]]
 
 
 def _resolve_wiki_path(path_value: str | Path | None, default: Path | None = None) -> Path | None:
@@ -506,7 +545,8 @@ def _retrieve_local_kb(query: str, root: Path, spec: Dict[str, Any], limit: int)
     scored.sort(key=lambda x: (-x[0], x[1]))
     out = []
     for score, rel, body in scored[:limit]:
-        out.append(KnowledgeHit("local", str(spec.get("id") or spec.get("path")), str(spec.get("scope") or "scene"), rel, body[:1200], score))
+        max_chars = int(spec.get("hit_max_chars") or _DEFAULT_HIT_MAX_CHARS)
+        out.append(KnowledgeHit("local", str(spec.get("id") or spec.get("path")), str(spec.get("scope") or "scene"), rel, body[:max_chars], score))
     return out
 
 
@@ -527,6 +567,9 @@ def _fts_query(query: str) -> str:
     return " OR ".join('"%s"' % t.replace('"', ' ') for t in toks[:12])
 
 
+_KB_INDEX_SCHEMA_VERSION = 1
+
+
 def _ensure_local_kb_fts(root: Path, spec: Dict[str, Any]) -> sqlite3.Connection | None:
     base = _local_kb_path(root, spec)
     if not base or not base.exists() or not base.is_dir():
@@ -535,7 +578,18 @@ def _ensure_local_kb_fts(root: Path, spec: Dict[str, Any]) -> sqlite3.Connection
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE IF NOT EXISTS docs (rel_path TEXT PRIMARY KEY, mtime REAL NOT NULL, body TEXT NOT NULL)")
-    con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(rel_path, body, content='docs', content_rowid='rowid')")
+    con.execute("CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(rel_path, body, content='docs', content_rowid='rowid', tokenize='trigram')")
+    row = con.execute("SELECT value FROM index_meta WHERE key='schema_version'").fetchone()
+    if row and int(row["value"]) != _KB_INDEX_SCHEMA_VERSION:
+        con.execute("DROP TABLE docs_fts")
+        con.execute("DELETE FROM docs")
+        con.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(rel_path, body, content='docs', content_rowid='rowid', tokenize='trigram')")
+        con.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('schema_version', ?)", (str(_KB_INDEX_SCHEMA_VERSION),))
+        con.commit()
+        row = None
+    if row is None:
+        con.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('schema_version', ?)", (str(_KB_INDEX_SCHEMA_VERSION),))
     known = {row["rel_path"]: float(row["mtime"] or 0) for row in con.execute("SELECT rel_path, mtime FROM docs")}
     seen = set()
     changed = False
@@ -549,11 +603,11 @@ def _ensure_local_kb_fts(root: Path, spec: Dict[str, Any]) -> sqlite3.Connection
             if known.get(rel) == mtime:
                 continue
             body = p.read_text(encoding="utf-8", errors="replace")
-            row = con.execute("SELECT rowid FROM docs WHERE rel_path=?", (rel,)).fetchone()
-            if row:
+            db_row = con.execute("SELECT rowid FROM docs WHERE rel_path=?", (rel,)).fetchone()
+            if db_row:
                 con.execute("UPDATE docs SET mtime=?, body=? WHERE rel_path=?", (mtime, body, rel))
-                con.execute("DELETE FROM docs_fts WHERE rowid=?", (row["rowid"],))
-                con.execute("INSERT INTO docs_fts(rowid, rel_path, body) VALUES (?, ?, ?)", (row["rowid"], rel, body))
+                con.execute("DELETE FROM docs_fts WHERE rowid=?", (db_row["rowid"],))
+                con.execute("INSERT INTO docs_fts(rowid, rel_path, body) VALUES (?, ?, ?)", (db_row["rowid"], rel, body))
             else:
                 cur = con.execute("INSERT INTO docs(rel_path, mtime, body) VALUES (?, ?, ?)", (rel, mtime, body))
                 con.execute("INSERT INTO docs_fts(rowid, rel_path, body) VALUES (?, ?, ?)", (cur.lastrowid, rel, body))
@@ -561,14 +615,60 @@ def _ensure_local_kb_fts(root: Path, spec: Dict[str, Any]) -> sqlite3.Connection
         except Exception:
             continue
     for rel in set(known) - seen:
-        row = con.execute("SELECT rowid FROM docs WHERE rel_path=?", (rel,)).fetchone()
-        if row:
-            con.execute("DELETE FROM docs_fts WHERE rowid=?", (row["rowid"],))
+        db_row = con.execute("SELECT rowid FROM docs WHERE rel_path=?", (rel,)).fetchone()
+        if db_row:
+            con.execute("DELETE FROM docs_fts WHERE rowid=?", (db_row["rowid"],))
         con.execute("DELETE FROM docs WHERE rel_path=?", (rel,))
         changed = True
     if changed:
         con.commit()
     return con
+
+def diagnose_local_kb(root: Path, spec: Dict[str, Any], query: str = "") -> Dict[str, Any]:
+    """Return diagnostic info for a local KB index and a sample query."""
+    base = _local_kb_path(root, spec)
+    if not base or not base.exists() or not base.is_dir():
+        return {"error": "path does not exist or is not a directory", "path": str(base)}
+    db_path = base / ".kb_index.sqlite"
+    result: Dict[str, Any] = {
+        "kb_id": str(spec.get("id") or ""),
+        "index_path": str(db_path),
+        "index_exists": db_path.exists(),
+        "schema_version": _KB_INDEX_SCHEMA_VERSION,
+    }
+    con = None
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        meta = con.execute("SELECT value FROM index_meta WHERE key='schema_version'").fetchone()
+        result["stored_schema_version"] = int(meta["value"]) if meta else None
+        row = con.execute("SELECT COUNT(*) AS cnt FROM docs").fetchone()
+        result["doc_count"] = int(row["cnt"]) if row else 0
+        if query:
+            fts_query = _fts_query(query)
+            result["sample_query"] = query
+            result["sample_fts_query"] = fts_query
+            if fts_query:
+                try:
+                    rows = con.execute(
+                        "SELECT rel_path, body, bm25(docs_fts) AS rank FROM docs_fts WHERE docs_fts MATCH ? ORDER BY rank LIMIT 5",
+                        (fts_query,),
+                    ).fetchall()
+                    result["sample_hits"] = [
+                        {"rel_path": str(r["rel_path"]), "rank": float(r["rank"]), "snippet": str(r["body"])[:200]}
+                        for r in rows
+                    ]
+                except Exception as e:
+                    result["sample_error"] = str(e)
+    except Exception as e:
+        result["error"] = str(e)
+    finally:
+        if con:
+            try:
+                con.close()
+            except Exception:
+                pass
+    return result
 
 
 def _retrieve_local_kb_fts(query: str, root: Path, spec: Dict[str, Any], limit: int) -> List[KnowledgeHit]:
@@ -589,7 +689,8 @@ def _retrieve_local_kb_fts(query: str, root: Path, spec: Dict[str, Any], limit: 
             rel = str(row["rel_path"])
             body = str(row["body"] or "")
             score = _score_doc(query, rel, body) or max(1, len(out) + 1)
-            out.append(KnowledgeHit("local", str(spec.get("id") or spec.get("path")), str(spec.get("scope") or "scene"), rel, body[:1200], score))
+            max_chars = int(spec.get("hit_max_chars") or _DEFAULT_HIT_MAX_CHARS)
+            out.append(KnowledgeHit("local", str(spec.get("id") or spec.get("path")), str(spec.get("scope") or "scene"), rel, body[:max_chars], score))
         return out
     except Exception:
         return []
@@ -998,11 +1099,14 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
     selected = target.get("knowledge_bases")
     if selected is None:
         selected = resolve_target_kb_ids(config, target)
+    disable_local = bool((config.get("reply_engine") or {}).get("disable_local_kb"))
     for kb in selected or []:
         spec = _resolve_kb_spec(config, target, kb)
         if not spec or spec.get("enabled", True) is False:
             continue
         typ = str(spec.get("type") or "local").lower()
+        if disable_local and typ == "local":
+            continue
         per_limit = int(spec.get("limit") or limit)
         batch: List[KnowledgeHit] = []
         if typ == "local":
@@ -1943,13 +2047,25 @@ def generate_reply(message: Dict[str, Any] | str,
         selected_kbs = resolve_target_kb_ids(config, target)
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
         response_mode = str((target_policy or {}).get("mode") or target.get("mode") or "group_assistant").lower()
+        # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
+        query = _clean_query_for_fts(clean or raw_text)
+        kb_layers = retrieve_knowledge_layers(query, config, target)
+        import logging
+        logging.getLogger("reply_engine").warning(
+            "[KB_DEBUG_RAW] raw=%r clean=%r query=%r core=%d scene=%d kbs=%r target=%s",
+            raw_text, clean, query,
+            len(kb_layers.get("core") or []),
+            len(kb_layers.get("scene") or []),
+            selected_kbs,
+            target.get("username"),
+        )
+        raw_kb_hits = (kb_layers.get("core") or []) + (kb_layers.get("scene") or [])
+        payload_knowledge_hits = _knowledge_hits_to_payload(raw_kb_hits)
+        logging.getLogger("reply_engine").warning(
+            "[KB_DEBUG_RAW] enqueue hits count=%d target=%s",
+            len(payload_knowledge_hits), target.get("username"),
+        )
         llm_config = dict(config.get("reply_engine", config) or {})
-        current_local_id = message.get("local_id") if isinstance(message, dict) else None
-        if image_paths and not clean:
-            clean = _recent_image_prompt_from_context(context_messages, current_local_id=current_local_id)
-            if clean:
-                raw_text = clean
-        # --- Capability-aware vision handling ---
         caps = get_capabilities() if get_capabilities else None
         has_local_vision = bool(caps.local_vision_mmx) if caps else False
         image_descriptions: List[Dict[str, str]] = []
@@ -2007,7 +2123,7 @@ def generate_reply(message: Dict[str, Any] | str,
                             "clean_text": clean,
                             "raw_text": raw_text,
                             "skill_name": "wechat_task",
-                            "knowledge_hits": [],
+                            "knowledge_hits": payload_knowledge_hits,
                             "knowledge_bases": selected_kbs,
                             "reply_mode": "raw_agent",
                             "response_mode": response_mode,
@@ -2092,7 +2208,7 @@ def generate_reply(message: Dict[str, Any] | str,
                         "raw_text": raw_text,
                         "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),
                         "skill_name": "wechat_task",
-                        "knowledge_hits": [],
+                            "knowledge_hits": payload_knowledge_hits,
                         "knowledge_bases": selected_kbs,
                         "reply_mode": "raw_agent",
                         "response_mode": response_mode,
@@ -2156,16 +2272,11 @@ def generate_reply(message: Dict[str, Any] | str,
                              wiki_hits=[])
 
     pre = precheck(clean)
+    reply_mode = str(target.get("reply_mode") or config.get("default_reply_mode") or "standard").lower()
     if pre:
         pre.reply_text = postcheck(pre.reply_text)
         return pre
 
-    # --- reply_mode control ---
-    reply_mode = str(config.get("reply_mode") or target.get("reply_mode") or "standard").lower()
-
-    # Retrieval: skip in free mode; always run in standard/strict mode.
-    if reply_mode == "free":
-        layers = {"core": [], "scene": []}
     else:
         layers = retrieve_knowledge_layers(clean or raw_text, config, target)
     core_hits = layers.get("core") or []
