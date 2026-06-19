@@ -993,9 +993,11 @@ def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[K
     timeout = float(spec.get("timeout") or 25)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
-    except Exception:
+    except Exception as exc:
+        logger.warning("getnote search failed for kb=%s query=%r: %s", kb_id, query, exc)
         return []
     if proc.returncode != 0 or not (proc.stdout or "").strip():
+        logger.warning("getnote search returned rc=%s stderr=%s kb=%s query=%r", proc.returncode, (proc.stderr or "")[:200], kb_id, query)
         return []
     try:
         payload = json.loads(proc.stdout)
@@ -1876,11 +1878,14 @@ def _build_raw_agent_prompt(clean_text: str, mention_name: str, response_mode: s
 
 
 
+def _normalize_response_mode(mode: str | None) -> str:
+    """Normalize product response mode to one of the two supported values."""
+    return "customer_service" if str(mode or "").lower() == "customer_service" else "group_assistant"
+
+
 def _mode_instruction(mode: str) -> str:
-    mode = str(mode or "group_assistant").lower()
-    if mode == "personal_assistant":
-        return "当前响应模式：自由。用自然轻松的群聊口吻回复；允许闲聊；如果用户只是闲聊，也给一个简短自然回应，不要套用客服澄清模板。"
-    if mode == "customer_service":
+    normalized = _normalize_response_mode(mode)
+    if normalized == "customer_service":
         return "当前响应模式：客服。用客服口吻，先确认诉求；信息不足时只问一个必要澄清问题；不要承诺、报价、授权或替负责人做决定。"
     return "当前响应模式：平衡。简短克制，只回答用户明确表达的问题；不主动扩展，不替负责人承诺。"
 
@@ -2046,7 +2051,7 @@ def generate_reply(message: Dict[str, Any] | str,
         context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
         selected_kbs = resolve_target_kb_ids(config, target)
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
-        response_mode = str((target_policy or {}).get("mode") or target.get("mode") or "group_assistant").lower()
+        response_mode = _normalize_response_mode((target_policy or {}).get("mode") or target.get("mode") or "group_assistant")
         # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
         query = _clean_query_for_fts(clean or raw_text)
         kb_layers = retrieve_knowledge_layers(query, config, target)
@@ -2061,10 +2066,29 @@ def generate_reply(message: Dict[str, Any] | str,
         )
         raw_kb_hits = (kb_layers.get("core") or []) + (kb_layers.get("scene") or [])
         payload_knowledge_hits = _knowledge_hits_to_payload(raw_kb_hits)
+        scene_hits = kb_layers.get("scene") or []
+        core_hits = kb_layers.get("core") or []
+        retrieval_debug = {
+            "mode": "raw_agent",
+            "selected_kbs": selected_kbs,
+            "core_hit_count": len(core_hits),
+            "scene_hit_count": len(scene_hits),
+        }
         logging.getLogger("reply_engine").warning(
             "[KB_DEBUG_RAW] enqueue hits count=%d target=%s",
             len(payload_knowledge_hits), target.get("username"),
         )
+        if response_mode == "customer_service" and not scene_hits:
+            return ReplyDecision(
+                True,
+                postcheck("我需要先查到相关资料才能准确回复。请补充具体产品或业务名称，或稍等负责人确认。"),
+                intent="kb_clarification",
+                risk_level="low",
+                need_human=True,
+                reason="customer_service_no_kb_hit",
+                wiki_hits=[],
+                retrieval_debug=retrieval_debug,
+            )
         llm_config = dict(config.get("reply_engine", config) or {})
         caps = get_capabilities() if get_capabilities else None
         has_local_vision = bool(caps.local_vision_mmx) if caps else False
@@ -2129,12 +2153,7 @@ def generate_reply(message: Dict[str, Any] | str,
                             "response_mode": response_mode,
                             "target_policy": target_policy or {},
                             "mode_instruction": _mode_instruction(response_mode),
-                            "retrieval_debug": {
-                                "mode": "raw_agent",
-                                "route": route_decision.route,
-                                "route_reason": route_decision.reason,
-                                "selected_kbs": selected_kbs,
-                            },
+                            "retrieval_debug": {**retrieval_debug, "route": route_decision.route, "route_reason": route_decision.reason},
                             "image_paths": image_paths,
                             "image_descriptions": image_descriptions,
                             "context_messages": payload_context_messages,
@@ -2171,21 +2190,12 @@ def generate_reply(message: Dict[str, Any] | str,
                                  risk_level="low", need_human=False,
                                  reason="raw_agent_empty_message_fallback",
                                  wiki_hits=[],
-                                 retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
-        if is_smalltalk and response_mode != "personal_assistant":
-            reply = "我先收到啦，需要我具体处理的话，可以补充一下问题。"
-            return ReplyDecision(True, postcheck(reply), intent="smalltalk",
-                                 risk_level="low", need_human=False,
-                                 reason="raw_agent_smalltalk_fallback",
-                                 wiki_hits=[],
-                                 retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
+                                 retrieval_debug=retrieval_debug)
         if _HAS_TASK_ROUTER:
             try:
                 local_type = message.get("local_type") if isinstance(message, dict) else None
                 route_name = getattr(route_decision, "route", "agent_provider")
                 route_reason = getattr(route_decision, "reason", "agent_provider")
-                if is_smalltalk and response_mode == "personal_assistant" and (route_decision is None or getattr(route_decision, "route", None) != _task_router.ROUTE_DEEP):  # type: ignore
-                    route_reason = "personal_smalltalk_agent"
                 job_key = "%s:%s" % (target.get("username", "unknown"), message.get("local_id", 0) if isinstance(message, dict) else 0)
                 group_key = target.get("username") or target.get("name") or "unknown"
                 payload_context_messages = context_messages[-10:] if isinstance(context_messages, list) else context_messages
@@ -2214,12 +2224,7 @@ def generate_reply(message: Dict[str, Any] | str,
                         "response_mode": response_mode,
                         "target_policy": target_policy or {},
                         "mode_instruction": _mode_instruction(response_mode),
-                        "retrieval_debug": {
-                            "mode": "raw_agent",
-                            "route": str(route_name or "agent_provider"),
-                            "route_reason": str(route_reason or "agent_provider"),
-                            "selected_kbs": selected_kbs,
-                        },
+                        "retrieval_debug": {**retrieval_debug, "route": str(route_name or "agent_provider"), "route_reason": str(route_reason or "agent_provider")},
                         "mention_name": mention_name,
                         "route": str(route_name or "agent_provider"),
                         "route_reason": str(route_reason or "agent_provider"),
@@ -2246,23 +2251,17 @@ def generate_reply(message: Dict[str, Any] | str,
                     need_human=False,
                     reason="agent_provider_enqueued",
                     wiki_hits=[],
-                    retrieval_debug={
-                        "mode": "raw_agent",
-                        "route": str(route_name or "agent_provider"),
-                        "route_reason": str(route_reason or "agent_provider"),
-                        "selected_kbs": selected_kbs,
-                    },
+                    retrieval_debug={**retrieval_debug, "route": str(route_name or "agent_provider"), "route_reason": str(route_reason or "agent_provider")},
                 )
             except Exception as e:
                 return ReplyDecision(True, "复杂处理服务暂不可用，我先收到。",
                                      intent="agent_job_enqueue_failed", risk_level="low", need_human=False,
                                      reason="agent_provider_enqueue_failed:%r" % (e,), wiki_hits=[],
-                                     retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
+                                     retrieval_debug=retrieval_debug)
         return ReplyDecision(True, "复杂处理服务暂不可用，我先收到。",
                              intent="agent_job_router_unavailable", risk_level="low", need_human=False,
                              reason="agent_job_router_unavailable", wiki_hits=[],
-                             retrieval_debug={"mode": "raw_agent", "selected_kbs": selected_kbs})
-
+                             retrieval_debug=retrieval_debug)
     if not clean:
         reply, intent, need_human = fallback_reply(clean, [])
         return ReplyDecision(True, postcheck(reply), intent=intent,

@@ -88,6 +88,15 @@ def now_text():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _audit_event(kind, target=None, payload=None):
+    """Best-effort audit write; never raises into the CLI flow."""
+    try:
+        import event_log
+        event_log.log_event(kind, target=target, payload=payload or {})
+    except Exception:
+        pass
+
+
 VALID_CATEGORIES = ("user", "admin")
 
 
@@ -126,6 +135,35 @@ def save_json_atomic(path, data):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+    # Audit every config/candidate write so unexpected emptying can be traced.
+    try:
+        import event_log
+        name = path.name
+        if name == "wechat_bot_targets.json":
+            event_log.log_event(
+                "config_write",
+                target=None,
+                payload={
+                    "path": str(path),
+                    "n_targets": len(data.get("targets") or []),
+                    "n_kbs": len(data.get("knowledge_bases") or {}),
+                    "default_triggers": list(data.get("default_triggers") or []),
+                },
+            )
+        elif name == "wechat_bot_candidates.json":
+            event_log.log_event(
+                "candidates_write",
+                target=None,
+                payload={
+                    "path": str(path),
+                    "enabled_count": sum(
+                        1 for c in (data.get("candidates") or []) if (c.get("status") or "") == "enabled"
+                    ),
+                    "n_candidates": len(data.get("candidates") or []),
+                },
+            )
+    except Exception:
+        pass
 
 
 def connect_ro(path):
@@ -307,10 +345,82 @@ def find_candidate(data, key):
     return None
 
 
-def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
-    if knowledge_bases and len(knowledge_bases) > 1:
-        raise ValueError("一个监听目标最多只能绑定一个知识库，当前收到 %d 个: %s" % (len(knowledge_bases), ", ".join(str(x) for x in knowledge_bases)))
+def _kb_source(spec):
+    spec = spec or {}
+    explicit = str(spec.get("source") or "").strip().lower()
+    if explicit:
+        return explicit
+    kb_type = str(spec.get("type") or "local").lower()
+    return "local_folder" if kb_type == "local" else kb_type
 
+
+def inspect_target(key, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
+    """Return target or pending candidate detail by name/username without mutating files."""
+    cfg = load_config(config_path)
+    data = load_candidates(candidates_path)
+    kbs = cfg.get("knowledge_bases") or {}
+    default_triggers = list(cfg.get("default_triggers") or [])
+
+    def _resolve_kb(kb_id):
+        spec = kbs.get(kb_id)
+        if not spec:
+            return {"id": kb_id, "exists": False, "type": None, "source": None,
+                    "enabled": False, "description": ""}
+        return {
+            "id": kb_id,
+            "exists": True,
+            "type": spec.get("type") or "local",
+            "source": _kb_source(spec),
+            "enabled": bool(spec.get("enabled", True)),
+            "description": spec.get("description") or "",
+        }
+
+    t = find_target(cfg, key)
+    if t:
+        return {
+            "kind": "target",
+            "target": dict(t),
+            "effective_triggers": list(t.get("triggers") or default_triggers),
+            "default_triggers": default_triggers,
+            "knowledge_bases": [_resolve_kb(kb_id) for kb_id in (t.get("knowledge_bases") or [])],
+        }
+    c = find_candidate(data, key)
+    if c:
+        return {
+            "kind": "candidate",
+            "candidate": dict(c),
+            "effective_triggers": default_triggers,
+            "default_triggers": default_triggers,
+            "knowledge_bases": [],
+        }
+    raise ValueError("target or candidate not found: %s" % key)
+
+
+def delete_target(key, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
+    """Hard delete configured target and reset matching candidate to pending if present."""
+    cfg = load_config(config_path)
+    data = load_candidates(candidates_path)
+    target = find_target(cfg, key)
+    if not target:
+        raise ValueError("target not found: %s" % key)
+    cfg["targets"] = [t for t in cfg.get("targets", []) if t is not target]
+    save_json_atomic(config_path, cfg)
+    username = target.get("username") or ""
+    name = target.get("name") or ""
+    touched = False
+    for c in data.get("candidates", []):
+        if c.get("username") == username or c.get("name") == name:
+            c["status"] = "pending"
+            c.pop("enabled_at", None)
+            c["updated_at"] = now_text()
+            touched = True
+    if touched:
+        data["updated_at"] = now_text()
+    save_json_atomic(candidates_path, data)
+    return dict(target)
+
+
+def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
     cfg = load_config(config_path)
     data = load_candidates(candidates_path)
 
@@ -319,8 +429,6 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         for kb in new_kbs or []:
             if kb not in merged:
                 merged.append(kb)
-        if len(merged) > 1:
-            raise ValueError("一个监听目标最多只能绑定一个知识库，当前合并后共 %d 个: %s" % (len(merged), ", ".join(str(x) for x in merged)))
         validate_knowledge_bases(merged, cfg=cfg)
         return merged
 
@@ -360,8 +468,6 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         save_json_atomic(candidates_path, data)
         return existing
     selected_kbs = knowledge_bases or cand.get("suggested_knowledge_bases") or []
-    if len(selected_kbs) > 1:
-        raise ValueError("一个监听目标最多只能绑定一个知识库，当前收到 %d 个: %s" % (len(selected_kbs), ", ".join(str(x) for x in selected_kbs)))
     validate_knowledge_bases(selected_kbs, cfg=cfg)
     target = {
         "name": cand.get("name") or username,
@@ -412,6 +518,32 @@ def set_target_field(key, field, value, config_path=CONFIG_PATH):
     if not t:
         raise ValueError("target not found: %s" % key)
     t[field] = value
+    save_json_atomic(config_path, cfg)
+    return t
+
+
+def set_target_mode_bundle(key, mode, config_path=CONFIG_PATH):
+    """Update target response mode and derived policy fields atomically."""
+    mode = str(mode or "").strip().lower()
+    if mode == "customer_service":
+        bundle = {
+            "mode": "customer_service",
+            "reply_policy": "knowledge_grounded",
+            "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
+            "context_policy": {"time_window_seconds": 120, "max_messages": 40, "sender_recent_limit": 6, "include_bot_recent": True},
+        }
+    else:
+        bundle = {
+            "mode": "group_assistant",
+            "reply_policy": "balanced",
+            "session_policy": {"timeout_seconds": 60, "max_turns": 3, "require_followup_intent": True},
+            "context_policy": {"time_window_seconds": 90, "max_messages": 30, "sender_recent_limit": 5, "include_bot_recent": True},
+        }
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    t.update(bundle)
     save_json_atomic(config_path, cfg)
     return t
 
@@ -682,8 +814,6 @@ def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
     t = find_target(cfg, key)
     if not t:
         raise ValueError("target not found: %s" % key)
-    if len(knowledge_bases or []) > 1:
-        raise ValueError("一个监听目标最多只能绑定一个知识库，当前收到 %d 个: %s" % (len(knowledge_bases), ", ".join(str(x) for x in knowledge_bases)))
     if replace:
         final_kbs = list(knowledge_bases)
     else:

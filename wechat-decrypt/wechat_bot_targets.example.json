@@ -14,7 +14,7 @@
       "last_local_id": 0,
       "enabled": true,
       "mode": "group_assistant",
-      "reply_policy": "conservative",
+      "reply_policy": "balanced",
       "triggers": [
         "@机器人名称"
       ],

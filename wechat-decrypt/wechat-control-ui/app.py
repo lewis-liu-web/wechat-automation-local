@@ -31,7 +31,15 @@ from api import (  # noqa: E402
     async_loop_status,
     agent_worker_status,
     agent_provider_health,
+    get_agent_job,
+    diagnose_kb,
+    run_dispatcher_once,
+    run_reconciler_once,
+    run_sender_once,
+    set_target_mode,
+    discover_hermes_profiles,
     list_agent_instances,
+    register_agent_instance,
     start_agent_instance,
     clear_triggers,
     create_agent_test_job,
@@ -71,6 +79,7 @@ from api import (  # noqa: E402
     stop_agent_worker,
     stop_async_loop,
     stop_monitor,
+    restart_monitor,
 )
 
 # --- 关闭所有 Streamlit 自带 UI 噪声（Deploy / 菜单 / GitHub / 工具栏） ---
@@ -286,9 +295,28 @@ def _load_data():
         st.session_state.default_triggers_result = get_default_triggers(base_url=base)
     except ControlAPIError:
         st.session_state.default_triggers_result = []
-
     st.session_state.data_loaded = True
 
+
+def _clear_data_cache() -> None:
+    """Remove the shared data-loaded flag so the next page render refetches."""
+    st.session_state.pop("data_loaded", None)
+
+
+def _poll_monitor_status(base: str, expected_running: bool, max_wait: float = 12.0, interval: float = 0.5) -> Dict[str, Any]:
+    """Poll /status until monitor_running matches expected_running or timeout."""
+    import time as _time
+    deadline = _time.time() + max_wait
+    last: Dict[str, Any] = {}
+    while _time.time() < deadline:
+        try:
+            last = status(base_url=base)
+        except ControlAPIError:
+            last = {}
+        if bool(last.get("monitor_running")) == expected_running:
+            break
+        _time.sleep(interval)
+    return last
 
 def _sidebar():
     with st.sidebar:
@@ -324,9 +352,9 @@ def _sidebar():
                         res = stop_monitor(base_url=base)
                         if res.get("ok"):
                             st.toast("已请求停止监听")
+                            st.session_state.status_result = _poll_monitor_status(base, expected_running=False)
                         else:
                             st.error("停止失败：%s" % (res.get("error") or "未知"))
-                        st.session_state.pop("status_result", None)
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("停止失败：%s" % (e,))
@@ -335,9 +363,9 @@ def _sidebar():
                         res = restart_monitor(base_url=base)
                         if res.get("ok"):
                             st.toast("已请求重启监听")
+                            st.session_state.status_result = _poll_monitor_status(base, expected_running=True)
                         else:
                             st.error("重启失败：%s" % (res.get("error") or "未知"))
-                        st.session_state.pop("status_result", None)
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("重启失败：%s" % (e,))
@@ -347,21 +375,25 @@ def _sidebar():
                         res = start_monitor(base_url=base)
                         if res.get("ok"):
                             st.toast("已请求启动监听")
+                            st.session_state.status_result = _poll_monitor_status(base, expected_running=True)
                         else:
                             st.error("启动失败：%s" % (res.get("error") or "未知"))
-                        st.session_state.pop("status_result", None)
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("启动失败：%s" % (e,))
                 mon_bc2.empty()
             st.markdown("**事件总数**")
             st.metric("event_log", total or 0)
+            st.markdown("**已启用目标**")
+            enabled_n = sum(1 for t in (st.session_state.get("targets_all") or []) if t.get("enabled"))
+            if enabled_n:
+                st.success("%d 个" % enabled_n)
+            else:
+                st.warning("0 个 — monitor 运行中但没有任何目标被监听")
         else:
             st.warning("状态读取失败")
-        st.divider()
         if st.button("🔄 刷新数据", use_container_width=True):
-            if "data_loaded" in st.session_state:
-                del st.session_state["data_loaded"]
+            _clear_data_cache()
             st.rerun()
         st.caption("agent-agnostic：UI 不依赖任何具体 agent 客户端。")
 
@@ -373,6 +405,7 @@ def _kv_table(rows, headers):
 
 def _page_overview():
     st.header("总览")
+    base = st.session_state.base_url
     stats = st.session_state.get("events_stats_result")
     if stats is None:
         st.error("统计加载失败")
@@ -407,15 +440,44 @@ def _page_overview():
         st.caption("暂无目标数据。")
 
     st.subheader("最近事件")
-    events = st.session_state.get("events_recent_result")
-    if events is None:
-        st.warning("事件读取失败")
-        return
+    since_label = st.selectbox("时间范围", ["全部", "最近 1 小时", "最近 24 小时", "最近 7 天"], key="overview_since")
+    kind_filter = st.selectbox("事件类型", ["全部"] + sorted(EVENT_KIND_LABELS.keys()), format_func=lambda v: "全部" if v == "全部" else _label(EVENT_KIND_LABELS, v), key="overview_kind")
+    all_targets = st.session_state.get("targets_all") or []
+    target_options = ["全部"] + sorted({str(t.get("name") or t.get("username") or "") for t in all_targets if t})
+    target_filter = st.selectbox("目标", target_options, key="overview_target")
+    limit = st.number_input("显示数量", min_value=50, max_value=500, value=100, step=50, key="overview_limit")
+
+    since_epoch = None
+    if since_label == "最近 1 小时":
+        since_epoch = time.time() - 3600
+    elif since_label == "最近 24 小时":
+        since_epoch = time.time() - 86400
+    elif since_label == "最近 7 天":
+        since_epoch = time.time() - 7 * 86400
+
+    try:
+        filtered_stats = events_stats(since=since_epoch, base_url=base) if since_epoch else stats
+        filtered_events = events_recent(
+            limit=int(limit),
+            kind=None if kind_filter == "全部" else kind_filter,
+            target=None if target_filter == "全部" else target_filter,
+            base_url=base,
+        )
+    except ControlAPIError as e:
+        st.error("事件读取失败：%s" % e)
+        filtered_stats = stats
+        filtered_events = st.session_state.get("events_recent_result") or []
+
+    by_kind = (filtered_stats or {}).get("by_kind") or by_kind
+    by_reason = (filtered_stats or {}).get("by_reason") or by_reason
+    by_target = (filtered_stats or {}).get("by_target") or by_target
+    events = filtered_events
+
     if not events:
         st.caption("暂无事件。")
         return
     rows = []
-    for e in events:
+    for idx, e in enumerate(events):
         payload = e.get("payload") or {}
         rows.append({
             "时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e.get("ts") or 0)),
@@ -425,6 +487,11 @@ def _page_overview():
             "发送人": e.get("sender") or "",
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.markdown("**事件详情**")
+    for idx, e in enumerate(events):
+        with st.expander("事件详情 #%s" % e.get("id", idx), expanded=False):
+            st.json(e)
 
 
 def _page_targets():
@@ -459,7 +526,7 @@ def _page_targets():
                 result.append(t)
         return result
 
-    col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+    col1, col2, col3, col4, col5, col6 = st.columns([2, 1, 1, 1, 2, 1])
     with col1:
         kind = st.selectbox(
             "筛选",
@@ -470,12 +537,12 @@ def _page_targets():
     with col2:
         st.write("")
         if st.button("刷新列表", use_container_width=True):
-            if "data_loaded" in st.session_state:
-                del st.session_state["data_loaded"]
+            _clear_data_cache()
             st.rerun()
     with col3:
         st.write("")
         include_contacts = st.checkbox("包含私聊", value=False, key="targets_include_contacts")
+        st.caption("仅影响扫描新目标")
     with col4:
         st.write("")
         if st.button("扫描新目标", use_container_width=True):
@@ -486,19 +553,39 @@ def _page_targets():
                 updated = int(res.get("updated") or 0)
                 discovered = int(res.get("discovered") or 0)
                 st.success("扫描完成：发现 %d 个，更新 %d 个，新增 %d 个" % (discovered, updated, added))
-                if "data_loaded" in st.session_state:
-                    del st.session_state["data_loaded"]
+                _clear_data_cache()
                 st.rerun()
             except ControlAPIError as e:
                 st.error("扫描失败：%s" % (e,))
+    with col5:
+        st.text_input(
+            "搜索 (name / username)",
+            value="",
+            key="targets_search",
+            placeholder="输入关键字过滤",
+        )
+    with col6:
+        st.write("")
+        st.toggle("仅看私聊", value=False, key="targets_private_only")
 
     targets = _filter_targets(all_targets, kind_map[kind])
+    private_only = bool(st.session_state.get("targets_private_only", False))
+    if private_only:
+        targets = [t for t in targets if (t.get("type") or "") != "group"]
+    search_q = (st.session_state.get("targets_search") or "").strip().lower()
+    if search_q:
+        targets = [
+            t for t in targets
+            if search_q in (t.get("name") or "").lower()
+            or search_q in (t.get("username") or "").lower()
+        ]
     if not targets:
         st.caption("没有匹配的目标。")
         return
 
-    for t in targets:
-        key = t.get("name") or t.get("username") or ""
+    for idx, t in enumerate(targets):
+        action_key = t.get("username") or t.get("name") or ""
+        widget_key = (t.get("username") or t.get("name") or "target_%d" % idx)
         status_label = "已启用" if t.get("enabled") else ("待启用" if t.get("is_candidate") or t.get("status") == "pending" else "已停用")
         cat = (t.get("category") or "user").strip().lower()
         cat_label = _label(CATEGORY_LABELS, cat)
@@ -537,24 +624,43 @@ def _page_targets():
                 mc[1].metric("触发词", len(t.get("triggers") or []))
                 mc[2].metric("知识库", len(t.get("knowledge_bases") or []))
                 mc[3].metric("状态", status_label)
-                # Category edit expander — only meaningful once the target is
-                # enabled; candidates get a category picker at enable time.
+                # Response-mode / session-policy editor; only meaningful once the target is enabled.
                 if t.get("enabled"):
+                    with st.expander("响应模式 / 会话策略", expanded=False):
+                        mode_options = [("平衡", "group_assistant"), ("客服", "customer_service")]
+                        valid_modes = {v for _, v in mode_options}
+                        current_mode = t.get("mode") or "group_assistant"
+                        if current_mode not in valid_modes:
+                            current_mode = "group_assistant"
+                        selected_label = st.selectbox(
+                            "响应模式",
+                            options=[label for label, _ in mode_options],
+                            index=[v for _, v in mode_options].index(current_mode),
+                            key=f"target_mode_{widget_key}",
+                        )
+                        selected_mode = dict(mode_options)[selected_label]
+                        if st.button("保存响应模式", key="save_mode_%s" % widget_key, use_container_width=False):
+                            try:
+                                set_target_mode(action_key, selected_mode, base_url=base)
+                                st.success("已切换响应模式为：%s" % selected_label)
+                                _clear_data_cache()
+                                st.rerun()
+                            except ControlAPIError as e:
+                                st.error("保存失败：%s" % (e,))
                     with st.expander("类别 / 管理员设置", expanded=False):
                         new_cat = st.radio(
                             "类别",
                             options=["user", "admin"],
                             index=1 if is_admin else 0,
                             format_func=lambda v: _label(CATEGORY_LABELS, v),
-                            key="cat_radio_%s" % key,
+                            key="cat_radio_%s" % widget_key,
                             horizontal=True,
                         )
-                        if st.button("保存类别", key="save_cat_%s" % key, use_container_width=False):
+                        if st.button("保存类别", key="save_cat_%s" % widget_key, use_container_width=False):
                             try:
-                                set_target_category(key, new_cat, base_url=base)
+                                set_target_category(action_key, new_cat, base_url=base)
                                 st.success("已设为 %s" % _label(CATEGORY_LABELS, new_cat))
-                                if "data_loaded" in st.session_state:
-                                    del st.session_state["data_loaded"]
+                                _clear_data_cache()
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
@@ -565,14 +671,13 @@ def _page_targets():
                             "窗口标题",
                             value=current_title,
                             placeholder=t.get("name") or "",
-                            key="cua_title_%s" % key,
+                            key="cua_title_%s" % widget_key,
                         )
-                        if st.button("保存标题覆盖", key="save_cua_title_%s" % key, use_container_width=False):
+                        if st.button("保存标题覆盖", key="save_cua_title_%s" % widget_key, use_container_width=False):
                             try:
-                                set_target_field(key, "cua_window_title", new_title.strip(), base_url=base)
+                                set_target_field(action_key, "cua_window_title", new_title.strip(), base_url=base)
                                 st.success("已保存")
-                                if "data_loaded" in st.session_state:
-                                    del st.session_state["data_loaded"]
+                                _clear_data_cache()
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
@@ -585,28 +690,31 @@ def _page_targets():
                         options=["user", "admin"],
                         index=1 if is_admin else 0,
                         format_func=lambda v: _label(CATEGORY_LABELS, v),
-                        key="enable_cat_%s" % key,
+                        key="enable_cat_%s" % widget_key,
                         label_visibility="collapsed",
                     )
-                    if st.button("启用", key="on_%s" % key, use_container_width=True):
+                    if st.button("启用", key="on_%s" % widget_key, use_container_width=True):
                         try:
-                            enable_target(key, category=enable_cat, base_url=base)
-                            st.success("已启用 %s（%s）" % (key, _label(CATEGORY_LABELS, enable_cat)))
+                            enable_target(action_key, category=enable_cat, base_url=base)
+                            st.success("已启用 %s（%s）" % (action_key, _label(CATEGORY_LABELS, enable_cat)))
+                            _clear_data_cache()
                             st.rerun()
                         except ControlAPIError as e:
                             st.error("启用失败：%s" % (e,))
                 if t.get("enabled"):
-                    if st.button("停用", key="off_%s" % key, use_container_width=True):
+                    if st.button("停用", key="off_%s" % widget_key, use_container_width=True):
                         try:
-                            disable_target(key, base_url=base)
-                            st.success("已停用 %s" % key)
+                            disable_target(action_key, base_url=base)
+                            st.success("已停用 %s" % action_key)
+                            _clear_data_cache()
                             st.rerun()
                         except ControlAPIError as e:
                             st.error("停用失败：%s" % (e,))
-                if st.button("删除", key="del_%s" % key, use_container_width=True):
+                if st.button("删除", key="del_%s" % widget_key, use_container_width=True):
                     try:
-                        delete_target(key, base_url=base)
-                        st.success("已删除 %s" % key)
+                        delete_target(action_key, base_url=base)
+                        st.success("已删除 %s" % action_key)
+                        _clear_data_cache()
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("删除失败：%s" % (e,))
@@ -629,8 +737,7 @@ def _page_triggers():
             words = [w.strip() for w in (default_text or "").splitlines() if w.strip()]
             try:
                 replace_default_triggers(words, base_url=base)
-                if "data_loaded" in st.session_state:
-                    del st.session_state["data_loaded"]
+                _clear_data_cache()
                 st.success("已保存 %d 个默认触发词" % len(words))
                 st.rerun()
             except ControlAPIError as e:
@@ -639,8 +746,7 @@ def _page_triggers():
         if st.button("清空默认触发词", use_container_width=True, key="clear_default_triggers"):
             try:
                 replace_default_triggers([], base_url=base)
-                if "data_loaded" in st.session_state:
-                    del st.session_state["data_loaded"]
+                _clear_data_cache()
                 st.success("已清空默认触发词")
                 st.rerun()
             except ControlAPIError as e:
@@ -656,46 +762,7 @@ def _page_triggers():
     target = targets[idx]
     key = target.get("name") or target.get("username") or ""
 
-    mode_options = [("自由", "personal_assistant"), ("平衡", "group_assistant"), ("客服", "customer_service")]
-    mode_label_map = {v: k for k, v in mode_options}
-    current_mode = target.get("mode") or "group_assistant"
-    selected_label = st.selectbox(
-        "响应模式",
-        options=[label for label, _ in mode_options],
-        index=[v for _, v in mode_options].index(current_mode),
-        key=f"target_mode_{key}",
-    )
-    selected_mode = dict(mode_options)[selected_label]
-    if selected_mode != current_mode:
-        try:
-            # Mode is a bundle: also overwrite derived policy fields so the switch takes effect immediately
-            mode_policy = {
-                "personal_assistant": {
-                    "reply_policy": "relaxed",
-                    "session_policy": {"timeout_seconds": 300, "max_turns": 10, "require_followup_intent": False},
-                    "context_policy": {"time_window_seconds": 180, "max_messages": 40, "sender_recent_limit": 8, "include_bot_recent": True},
-                },
-                "group_assistant": {
-                    "reply_policy": "conservative",
-                    "session_policy": {"timeout_seconds": 60, "max_turns": 3, "require_followup_intent": True},
-                    "context_policy": {"time_window_seconds": 90, "max_messages": 30, "sender_recent_limit": 5, "include_bot_recent": True},
-                },
-                "customer_service": {
-                    "reply_policy": "knowledge_grounded",
-                    "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
-                    "context_policy": {"time_window_seconds": 120, "max_messages": 40, "sender_recent_limit": 6, "include_bot_recent": True},
-                },
-            }[selected_mode]
-            set_target_field(key, "mode", selected_mode, base_url=base)
-            set_target_field(key, "reply_policy", mode_policy["reply_policy"], base_url=base)
-            set_target_field(key, "session_policy", mode_policy["session_policy"], base_url=base)
-            set_target_field(key, "context_policy", mode_policy["context_policy"], base_url=base)
-            st.success("已切换响应模式为：%s" % selected_label)
-            if "data_loaded" in st.session_state:
-                del st.session_state["data_loaded"]
-            st.rerun()
-        except ControlAPIError as e:
-            st.error("切换失败：%s" % e)
+    st.caption("响应模式请在「监听目标」页统一配置；本页只管理触发词。")
 
     info = {}
     try:
@@ -767,8 +834,7 @@ def _page_knowledge():
     targets = [t for t in (st.session_state.get("targets_all") or []) if not t.get("is_candidate")]
 
     if st.button("刷新"):
-        if "data_loaded" in st.session_state:
-            del st.session_state["data_loaded"]
+        _clear_data_cache()
         st.rerun()
 
     # ---- 顶部配置区：新增 + 绑定 ----
@@ -796,8 +862,7 @@ def _page_knowledge():
                         "description": new_desc.strip(),
                         "replace": False,
                     }, base_url=base)
-                    if "data_loaded" in st.session_state:
-                        del st.session_state["data_loaded"]
+                    _clear_data_cache()
                     st.success("已创建本地知识库")
                     st.rerun()
                 except ControlAPIError as e:
@@ -814,12 +879,48 @@ def _page_knowledge():
         target = targets[target_idx]
         target_key = target.get("name") or target.get("username") or ""
         kb_ids = [kb.get("id") for kb in kbs if kb.get("id")]
-        kb_source_by_id = {
-            kb.get("id"): str(kb.get("source") or ("local_folder" if (kb.get("type") or "local") == "local" else kb.get("type")) or "local_folder").lower()
-            for kb in kbs if kb.get("id")
-        }
+        def _kb_option_label(kb_id):
+            kb = {k.get("id"): k for k in kbs}.get(kb_id)
+            if not kb:
+                return kb_id
+            src = str(
+                kb.get("source")
+                or ("local_folder" if (kb.get("type") or "local") == "local" else kb.get("type"))
+                or "local_folder"
+            ).lower()
+            src_label = _label(KB_SOURCE_LABELS, src)
+            count = ""
+            kb_type = (kb.get("type") or "local").lower()
+            if kb_type == "local":
+                fc = kb.get("file_count")
+                if isinstance(fc, int) and fc:
+                    count = "文档 %d" % fc
+            elif kb_type in ("getnote", "ima"):
+                nc = kb.get("online_note_count")
+                fc2 = kb.get("online_file_count")
+                bits = []
+                if isinstance(nc, int) and nc:
+                    bits.append("笔记 %d" % nc)
+                if isinstance(fc2, int) and fc2:
+                    bits.append("文件 %d" % fc2)
+                if bits:
+                    count = "，".join(bits)
+            enabled = "已启用" if kb.get("enabled") else "已停用"
+            return "%s · %s · %s · %s" % (kb_id, src_label, count or "在线", enabled)
+        kb_source_by_id = {}
+        kb_type_by_id = {}
+        for kb in kbs:
+            kb_id = kb.get("id")
+            if not kb_id:
+                continue
+            kb_source_by_id[kb_id] = str(
+                kb.get("source")
+                or ("local_folder" if (kb.get("type") or "local") == "local" else kb.get("type"))
+                or "local_folder"
+            ).lower()
+            kb_type_by_id[kb_id] = str(kb.get("type") or "local").lower()
         current = [x for x in (target.get("knowledge_bases") or []) if x in kb_ids]
-        selected = st.multiselect("绑定知识库", options=kb_ids, default=current, key="kb_bind_select")
+        selected = st.multiselect("绑定知识库", options=kb_ids, default=current, key="kb_bind_select", format_func=_kb_option_label)
         selected_sources = {kb_source_by_id.get(x, "local_folder") for x in selected}
         if len(selected_sources) > 1:
             st.warning("一个监听目标只能绑定同源知识库。请只选同一个来源，例如只选 Obsidian、只选普通本地文件夹，或只选 Get笔记。")
@@ -832,12 +933,67 @@ def _page_knowledge():
                 return
             try:
                 replace_target_kbs(target_key, selected, base_url=base)
-                if "data_loaded" in st.session_state:
-                    del st.session_state["data_loaded"]
+                _clear_data_cache()
                 st.success("已保存绑定")
                 st.rerun()
             except ControlAPIError as e:
                 st.error("保存失败：%s" % (e,))
+
+        with st.expander("按目标模拟检索", expanded=False):
+            bound_kb_ids = [x for x in (target.get("knowledge_bases") or []) if x in kb_ids]
+            q = st.text_input("查询词（测试当前目标绑定的知识库）", key="target_kb_diag_query_%s" % target_key,
+                              placeholder="例如：押金怎么退")
+            if len(bound_kb_ids) == 0:
+                st.warning("当前目标未绑定知识库")
+            else:
+                diag_kb = bound_kb_ids[0]
+                if len(bound_kb_ids) > 1:
+                    diag_kb = st.selectbox(
+                        "选择要测试的知识库",
+                        options=bound_kb_ids,
+                        key="target_kb_diag_select_%s" % target_key,
+                        format_func=lambda kb_id: _kb_option_label(kb_id),
+                    )
+                diag_type = kb_type_by_id.get(diag_kb, "local")
+                diag_supported = diag_type == "local"
+                if not diag_supported:
+                    st.info("%s 暂不支持模拟检索/诊断，仅本地知识库（Obsidian/本地文件夹）支持。" % _label(KB_SOURCE_LABELS, kb_source_by_id.get(diag_kb, "local_folder")))
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("模拟检索", key="target_kb_search_%s" % target_key, use_container_width=True, disabled=not diag_supported):
+                        if not q.strip():
+                            st.warning("请先输入查询词")
+                        else:
+                            try:
+                                res = search_kb(diag_kb, q.strip(), base_url=base, limit=5)
+                                st.session_state["target_kb_search_result_%s" % target_key] = res
+                            except ControlAPIError as e:
+                                st.error("查询失败：%s" % (e,))
+                with c2:
+                    if st.button("诊断索引", key="target_kb_diag_%s" % target_key, use_container_width=True, disabled=not diag_supported):
+                        if not q.strip():
+                            st.warning("请先输入查询词")
+                        else:
+                            try:
+                                res = diagnose_kb(diag_kb, q.strip(), base_url=base)
+                                st.session_state["target_kb_diag_result_%s" % target_key] = res
+                            except ControlAPIError as e:
+                                st.error("诊断失败：%s" % (e,))
+            sres = st.session_state.get("target_kb_search_result_%s" % target_key)
+            if sres:
+                hits = sres.get("hits") or []
+                st.caption("命中 %d / %d 个文档" % (sres.get("matched_files", 0), sres.get("total_files", 0)))
+                if not hits:
+                    st.caption("没有命中。")
+                for h in hits:
+                    st.markdown("- **%s**（分数 %d）" % (h.get("rel_path"), h.get("score")))
+                    snippet = (h.get("snippet") or "").strip()
+                    if snippet:
+                        st.caption("  " + snippet[:160].replace("\n", " "))
+            dres = st.session_state.get("target_kb_diag_result_%s" % target_key)
+            if dres:
+                with st.expander("诊断结果", expanded=True):
+                    st.json(dres)
 
     st.divider()
 
@@ -1004,15 +1160,41 @@ def _page_knowledge():
                 with st.expander("测试检索 / 打开目录"):
                     q = st.text_input("查询词（测试这个知识库的检索效果）", key="kb_test_q_%s" % kb_id,
                                       placeholder="例如：押金怎么退")
-                    if st.button("查询", key="kb_test_search_%s" % kb_id, use_container_width=True):
-                        if not q.strip():
-                            st.warning("请先输入查询词")
-                        else:
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        if st.button("查询", key="kb_test_search_%s" % kb_id, use_container_width=True):
+                            if not q.strip():
+                                st.warning("请先输入查询词")
+                            else:
+                                try:
+                                    res = search_kb(kb_id, q.strip(), base_url=base, limit=5)
+                                    st.session_state["kb_test_result_%s" % kb_id] = res
+                                except ControlAPIError as e:
+                                    st.error("查询失败：%s" % (e,))
+                    with c2:
+                        if st.button("诊断索引", key="kb_diag_%s" % kb_id, use_container_width=True):
+                            if not q.strip():
+                                st.warning("请先输入查询词")
+                            else:
+                                try:
+                                    res = diagnose_kb(kb_id, q.strip(), base_url=base)
+                                    st.session_state["kb_diag_result_%s" % kb_id] = res
+                                except ControlAPIError as e:
+                                    st.error("诊断失败：%s" % (e,))
+                    with c3:
+                        if kb.get("source") == "obsidian":
+                            if st.button("打开 Obsidian", key="kb_obsidian_%s" % kb_id, use_container_width=True):
+                                try:
+                                    open_kb_obsidian(kb_id, base_url=base)
+                                    st.success("已打开 Obsidian")
+                                except ControlAPIError as e:
+                                    st.error("打开失败：%s" % (e,))
+                        elif st.button("打开目录", key="kb_open_%s" % kb_id, use_container_width=True):
                             try:
-                                res = search_kb(kb_id, q.strip(), base_url=base, limit=5)
-                                st.session_state["kb_test_result_%s" % kb_id] = res
+                                open_kb(kb_id, base_url=base)
+                                st.success("已打开目录")
                             except ControlAPIError as e:
-                                st.error("查询失败：%s" % (e,))
+                                st.error("打开失败：%s" % (e,))
                     tres = st.session_state.get("kb_test_result_%s" % kb_id)
                     if tres:
                         hits = tres.get("hits") or []
@@ -1024,12 +1206,10 @@ def _page_knowledge():
                             snippet = (h.get("snippet") or "").strip()
                             if snippet:
                                 st.caption("  " + snippet[:160].replace("\n", " "))
-                    if st.button("打开目录", key="kb_open_%s" % kb_id, use_container_width=True):
-                        try:
-                            open_kb(kb_id, base_url=base)
-                            st.success("已打开目录")
-                        except ControlAPIError as e:
-                            st.error("打开失败：%s" % (e,))
+                    dres = st.session_state.get("kb_diag_result_%s" % kb_id)
+                    if dres:
+                        with st.expander("诊断结果", expanded=True):
+                            st.json(dres)
 
 
 def _job_status_label(value):
@@ -1156,16 +1336,23 @@ def _page_agent_jobs():
             st.caption("当前没有积压。")
 
     st.subheader("Agent 自动处理池")
-    st.caption("推荐只用这一块：把可用 Agent 加入自动处理池，系统会自动派任务、轮询结果、发回微信。同一个群仍然串行，多个群可以并发。")
+    st.caption("推荐只用这一块：把可用 Hermes profile/worker 加入自动处理池，系统会自动派任务、轮询结果、发回微信。同一个群仍然串行，多个群可以并发。")
     try:
         instances = list_agent_instances(base_url=base)
     except ControlAPIError as e:
         st.error("读取 agent 实例失败：%s" % (e,))
         instances = []
+    try:
+        discovered_profiles = discover_hermes_profiles(base_url=base)
+    except ControlAPIError as e:
+        st.warning("发现 Hermes profile/worker 失败：%s" % (e,))
+        discovered_profiles = []
+    configured_ids = {str(inst.get("id") or "") for inst in instances}
+    available_instances = list(instances) + [p for p in discovered_profiles if str(p.get("id") or "") not in configured_ids]
 
     with st.container(border=True):
-        if not instances:
-            st.caption("未在 wechat_bot_targets.json 的 agent_provider.instances 找到实例配置。")
+        if not available_instances:
+            st.caption("未在 wechat_bot_targets.json 的 agent_provider.instances 找到实例配置，也未发现可用 Hermes profile/worker。")
         else:
             pool_rows = []
             for row in (pool_state.get("instances") or []):
@@ -1186,24 +1373,26 @@ def _page_agent_jobs():
             if pool_rows:
                 st.dataframe(pool_rows, hide_index=True, use_container_width=True)
                 st.caption("状态说明：空闲=已上岗可接任务；处理中=正在跑任务；离线=不可用；可上岗=健康但尚未加入自动处理池。")
+
             options = []
-            for inst in instances:
+            for inst in available_instances:
                 iid = str(inst.get("id") or "")
-                label = str(inst.get("label") or iid or "实例")
+                label = str(inst.get("label") or inst.get("profile") or iid or "实例")
                 kind = str(inst.get("provider") or inst.get("type") or "genericagent")
-                kind_label = {"genericagent": "GenericAgent", "hermes": "Hermes", "echo": "Echo"}.get(kind, kind)
-                options.append(f"{label} · {kind_label} · id={iid}")
+                kind_label = {"genericagent": "GenericAgent", "hermes": "Hermes profile/worker", "echo": "Echo"}.get(kind, kind)
+                source_label = "已配置" if iid in configured_ids else "已发现"
+                options.append(f"{label} · {kind_label} · {source_label} · id={iid}")
             selected_idx = st.selectbox(
-                "选择 agent 实例",
+                "选择 Hermes profile/worker",
                 options=list(range(len(options))),
                 format_func=lambda i: options[i] if 0 <= i < len(options) else "",
                 key="agent_pool_selected",
             )
-            inst = instances[selected_idx] if 0 <= selected_idx < len(instances) else None
+            inst = available_instances[selected_idx] if 0 <= selected_idx < len(available_instances) else None
             if inst is not None:
                 iid = str(inst.get("id") or "")
                 kind = str(inst.get("provider") or inst.get("type") or "genericagent")
-                kind_label = {"genericagent": "GenericAgent", "hermes": "Hermes", "echo": "Echo"}.get(kind, kind)
+                kind_label = {"genericagent": "GenericAgent", "hermes": "Hermes profile/worker", "echo": "Echo"}.get(kind, kind)
                 bridge = inst.get("bridge_url") or inst.get("bridge_cwd") or inst.get("hermes_home") or "-"
                 extras = []
                 if inst.get("profile"):
@@ -1212,7 +1401,7 @@ def _page_agent_jobs():
                     extras.append("model=" + str(inst.get("model")))
                 if inst.get("toolsets"):
                     extras.append("toolsets=" + str(inst.get("toolsets")))
-                st.caption("id=%s · 配置=%s%s" % (iid, bridge, (" · " + " · ".join(extras)) if extras else ""))
+                st.caption("id=%s · 类型=%s · 配置=%s%s" % (iid, kind_label, bridge, (" · " + " · ".join(extras)) if extras else ""))
 
                 pool_by_id = {str(row.get("id") or ""): row for row in (pool_state.get("instances") or [])}
                 selected_pool = pool_by_id.get(iid) or {}
@@ -1227,7 +1416,7 @@ def _page_agent_jobs():
                     st.caption("当前任务：#%s · %s · %s" % (cur.get("id"), cur.get("target_name"), cur.get("status")))
 
                 st.markdown("**自动处理池控制**")
-                st.caption("加入后，这个实例会参与自动接单。停止按钮会停止整个自动处理池。")
+                st.caption("已发现但未配置的 Hermes profile/worker 会在点击加入时写入 agent_provider.instances；不会自动改配置。停止按钮会停止整个自动处理池。")
                 loop_cfg = (loop_state.get("config") or {}) if isinstance(loop_state, dict) else {}
                 loop_inst = str(loop_cfg.get("instance_id") or "")
                 if loop_running:
@@ -1237,6 +1426,8 @@ def _page_agent_jobs():
                 l1, l2, l3 = st.columns(3)
                 if l1.button("加入自动处理池", key="m5_loop_start_%s" % iid, use_container_width=True):
                     try:
+                        if iid not in configured_ids:
+                            register_agent_instance(inst, base_url=base)
                         res = start_async_loop(instance_id=iid, base_url=base)
                         if res.get("running"):
                             st.success("已加入自动处理池")
@@ -1246,11 +1437,16 @@ def _page_agent_jobs():
                     except ControlAPIError as e:
                         st.error("加入失败：%s" % (e,))
                 if l2.button("检查这个实例", key="pool_hc_%s" % iid, use_container_width=True):
-                    h = selected_pool.get("health") or {}
+                    try:
+                        h = agent_provider_health(provider=kind, instance_id=iid, base_url=base)
+                        st.session_state["agent_last_health"] = h
+                    except ControlAPIError as e:
+                        h = {"ok": False, "ready": False, "error": str(e)}
+                        st.session_state["agent_last_health"] = h
                     if h.get("ok") or h.get("ready"):
                         st.success("可用 · provider=%s · workers=%s" % (h.get("provider") or kind, h.get("workers") or 0))
                     else:
-                        st.warning("不可用：%s" % (h.get("error") or "未知原因"))
+                        st.warning("未在自动池中或暂未检测：%s" % (h.get("error") or "可点击加入自动处理池进行注册和启动"))
                 if l3.button("停止自动处理池", key="m5_loop_stop_%s" % iid, use_container_width=True):
                     try:
                         res = stop_async_loop(base_url=base)
@@ -1258,6 +1454,28 @@ def _page_agent_jobs():
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("停止自动处理失败：%s" % (e,))
+
+                with st.expander("调试：单步推进队列", expanded=False):
+                    st.caption("仅排查任务调度问题。不会自动持续运行。")
+                    s1, s2, s3 = st.columns(3)
+                    if s1.button("派发一次", key="dbg_dispatch_%s" % iid, use_container_width=True):
+                        try:
+                            res = run_dispatcher_once(instance_id=iid, provider=kind, base_url=base)
+                            st.json(res)
+                        except ControlAPIError as e:
+                            st.error("派发失败：%s" % (e,))
+                    if s2.button("轮询一次", key="dbg_reconcile_%s" % iid, use_container_width=True):
+                        try:
+                            res = run_reconciler_once(base_url=base)
+                            st.json(res)
+                        except ControlAPIError as e:
+                            st.error("轮询失败：%s" % (e,))
+                    if s3.button("发送一次", key="dbg_send_%s" % iid, use_container_width=True):
+                        try:
+                            res = run_sender_once(base_url=base)
+                            st.json(res)
+                        except ControlAPIError as e:
+                            st.error("发送失败：%s" % (e,))
 
                 with st.expander("旧同步 worker（调试用，不推荐日常使用）", expanded=False):
                     st.caption("这是早期方案：单独启动一个同步 worker。日常请使用上面的“自动处理池”。")
@@ -1268,6 +1486,8 @@ def _page_agent_jobs():
                     c_old1, c_old2 = st.columns(2)
                     if c_old1.button("启动旧 worker", key="pool_up_%s" % iid, use_container_width=True):
                         try:
+                            if iid not in configured_ids:
+                                register_agent_instance(inst, base_url=base)
                             res = start_agent_instance(iid, timeout=float(pool_timeout), worker_count=1, base_url=base)
                             st.success("旧 worker 已启动 · %s" % (res.get("action") or "started"))
                             st.rerun()
@@ -1285,14 +1505,20 @@ def _page_agent_jobs():
     st.caption("用一条测试任务确认：创建任务 → 被处理 → 返回结果，这个流程是否正常。")
     with st.form("agent_test_job_form"):
         prompt = st.text_area("测试内容", value="请用一句话说明今天上海天气适合穿什么", height=90)
-        fc1, fc2, fc3 = st.columns(3)
-        provider = fc1.selectbox("测试模式", ["echo", "genericagent"], format_func=_provider_label, key="agent_test_provider")
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        provider = fc1.selectbox("测试模式", ["echo", "genericagent", "hermes"], format_func=_provider_label, key="agent_test_provider")
         group_key = fc2.text_input("测试分组", value="manual-test", help="用于区分不同批次测试，可不改。")
         sender = fc3.text_input("操作人", value="tester")
+        enabled_targets = [t for t in (st.session_state.get("targets_all") or []) if t.get("enabled")]
+        target_options = ["不绑定目标"] + ["%s（%s）" % (t.get("name") or "?", t.get("username") or "") for t in enabled_targets]
+        target_idx = fc4.selectbox("绑定目标", options=list(range(len(target_options))),
+                                   format_func=lambda i: target_options[i], key="agent_test_target")
+        selected_target = enabled_targets[target_idx - 1] if target_idx > 0 else None
         submitted = st.form_submit_button("开始测试", use_container_width=True)
         if submitted:
             try:
-                res = create_agent_test_job(prompt, provider=provider, group_key=group_key, sender=sender, base_url=base)
+                res = create_agent_test_job(prompt, provider=provider, group_key=group_key, sender=sender,
+                                            target=selected_target, base_url=base)
                 job = res.get("job") or {}
                 st.success("测试任务已创建。下一步：如果后台处理服务已运行，任务会自动开始；也可以用下方“立即处理一次”。")
                 st.table([{
@@ -1309,7 +1535,7 @@ def _page_agent_jobs():
     with st.expander("高级操作：立即处理一次", expanded=False):
         st.caption("用于排查“任务已创建但没有自动处理”的情况。普通使用无需操作。只执行一次处理检查，不会持续后台运行。")
         wc1, wc2, wc3 = st.columns([1, 1, 2])
-        worker_provider = wc1.selectbox("处理模式", ["echo", "genericagent"], format_func=_provider_label, key="agent_worker_provider")
+        worker_provider = wc1.selectbox("处理模式", ["echo", "genericagent", "hermes"], format_func=_provider_label, key="agent_worker_provider")
         one_shot_timeout = wc2.number_input("最长等待时间", min_value=3, max_value=600, value=240, step=1, key="agent_worker_once_timeout")
         if wc3.button("立即处理一次", use_container_width=True, key="agent_worker_once"):
             try:
@@ -1408,8 +1634,14 @@ def _page_agent_jobs():
                     raw_out = (j.get("payload") or {}).get("agent_raw_output")
                     if raw_out:
                         st.caption("Agent 原始输出：%s" % str(raw_out)[:300])
-                    c1, c2, c3, c4 = st.columns(4)
-                    if c1.button("忽略", key="dismiss_%s" % job_id, use_container_width=True):
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    if c1.button("查看完整任务", key="view_job_%s" % job_id, use_container_width=True):
+                        try:
+                            detail = get_agent_job(int(job_id), base_url=base)
+                            st.session_state["agent_job_detail_%s" % job_id] = detail
+                        except ControlAPIError as e:
+                            st.error("读取失败：%s" % (e,))
+                    if c2.button("忽略", key="dismiss_%s" % job_id, use_container_width=True):
                         try:
                             res = dismiss_job(int(job_id), base_url=base)
                             if res.get("action") == "dismissed":
@@ -1419,7 +1651,7 @@ def _page_agent_jobs():
                                 st.warning("忽略失败：%s" % (res.get("error") or "未知"))
                         except ControlAPIError as e:
                             st.error("忽略失败：%s" % (e,))
-                    if c2.button("拉取结果", key="recover_%s" % job_id, use_container_width=True):
+                    if c3.button("拉取结果", key="recover_%s" % job_id, use_container_width=True):
                         try:
                             res = recover_job_result(int(job_id), send=False, base_url=base)
                             if res.get("action") == "recovered":
@@ -1430,7 +1662,7 @@ def _page_agent_jobs():
                                 st.warning("还没找到可发送结果：%s" % (detail.get("error") or "未知"))
                         except ControlAPIError as e:
                             st.error("拉取失败：%s" % (e,))
-                    if c3.button("拉取并发送", key="recover_send_%s" % job_id, use_container_width=True):
+                    if c4.button("拉取并发送", key="recover_send_%s" % job_id, use_container_width=True):
                         try:
                             res = recover_job_result(int(job_id), send=True, base_url=base)
                             if res.get("action") == "recovered" and (res.get("send_result") or {}).get("sent"):
@@ -1443,7 +1675,7 @@ def _page_agent_jobs():
                                 st.warning("还没找到可发送结果：%s" % (detail.get("error") or "未知"))
                         except ControlAPIError as e:
                             st.error("拉取并发送失败：%s" % (e,))
-                    if j.get("result_text") and c4.button("补发已有", key="retry_send_%s" % job_id, use_container_width=True):
+                    if j.get("result_text") and c5.button("补发已有", key="retry_send_%s" % job_id, use_container_width=True):
                         try:
                             res = retry_job_send(int(job_id), base_url=base)
                             if res.get("action") == "sent":
@@ -1453,6 +1685,10 @@ def _page_agent_jobs():
                                 st.warning("发送失败：%s" % (res.get("send_result", {}).get("reason") or "未知"))
                         except ControlAPIError as e:
                             st.error("重试失败：%s" % (e,))
+                    detail = st.session_state.get("agent_job_detail_%s" % job_id)
+                    if detail:
+                        with st.expander("完整任务 JSON", expanded=False):
+                            st.json(detail)
 
         sendable_jobs = [
             j for j in rows
@@ -1480,8 +1716,14 @@ def _page_agent_jobs():
                     raw_out = (j.get("payload") or {}).get("agent_raw_output")
                     if raw_out:
                         st.caption("Agent 原始输出：%s" % str(raw_out)[:300])
-                    s1, s2 = st.columns(2)
-                    if s1.button("补发已有结果", key="send_done_%s" % job_id, use_container_width=True):
+                    s1, s2, s3 = st.columns(3)
+                    if s1.button("查看完整任务", key="view_done_%s" % job_id, use_container_width=True):
+                        try:
+                            detail = get_agent_job(int(job_id), base_url=base)
+                            st.session_state["agent_job_detail_%s" % job_id] = detail
+                        except ControlAPIError as e:
+                            st.error("读取失败：%s" % (e,))
+                    if s2.button("补发已有结果", key="send_done_%s" % job_id, use_container_width=True):
                         try:
                             res = retry_job_send(int(job_id), base_url=base)
                             if res.get("action") == "sent":
@@ -1491,7 +1733,7 @@ def _page_agent_jobs():
                                 st.warning("发送失败：%s" % (res.get("send_result", {}).get("reason") or "未知"))
                         except ControlAPIError as e:
                             st.error("发送失败：%s" % (e,))
-                    if s2.button("忽略", key="dismiss_done_%s" % job_id, use_container_width=True):
+                    if s3.button("忽略", key="dismiss_done_%s" % job_id, use_container_width=True):
                         try:
                             res = dismiss_job(int(job_id), base_url=base)
                             if res.get("action") == "dismissed":
@@ -1501,6 +1743,10 @@ def _page_agent_jobs():
                                 st.warning("忽略失败：%s" % (res.get("error") or "未知"))
                         except ControlAPIError as e:
                             st.error("忽略失败：%s" % (e,))
+                    detail = st.session_state.get("agent_job_detail_%s" % job_id)
+                    if detail:
+                        with st.expander("完整任务 JSON", expanded=False):
+                            st.json(detail)
 
     # Auto-refresh logic
     if auto_refresh:
@@ -1534,8 +1780,7 @@ def main():
     last_url = st.session_state.get("last_base_url", current_url)
     if current_url != last_url:
         st.session_state.last_base_url = current_url
-        if "data_loaded" in st.session_state:
-            del st.session_state["data_loaded"]
+        _clear_data_cache()
 
     _load_data()
     _sidebar()

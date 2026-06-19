@@ -89,11 +89,21 @@ class TestSingleSourceBinding(unittest.TestCase):
         reg.save_json_atomic(cand_path, {"version": 1, "candidates": []})
         return td, cfg_path, cand_path
 
-    def test_bind_wiki_rejects_multiple_kbs(self):
+    def test_bind_wiki_rejects_mixed_source_kbs(self):
         _, cfg_path, _ = self._tmp_config()
         with self.assertRaises(ValueError) as ctx:
             reg.bind_wiki("wxid_a", ["scene.a", "online.g"], replace=True, config_path=cfg_path)
-        self.assertIn("最多只能绑定一个知识库", str(ctx.exception))
+        self.assertIn("同源", str(ctx.exception))
+
+    def test_bind_wiki_accepts_same_source_multiple_kbs(self):
+        td, cfg_path, _ = self._tmp_config()
+        p = Path(td.name) / "kb2"
+        p.mkdir()
+        cfg = reg.load_config(cfg_path)
+        cfg["knowledge_bases"]["scene.b"] = {"type": "local", "path": str(p), "enabled": True}
+        reg.save_json_atomic(cfg_path, cfg)
+        t = reg.bind_wiki("wxid_a", ["scene.a", "scene.b"], replace=True, config_path=cfg_path)
+        self.assertEqual(sorted(t["knowledge_bases"]), ["scene.a", "scene.b"])
 
     def test_bind_wiki_rejects_unknown_kb(self):
         _, cfg_path, _ = self._tmp_config()
@@ -111,22 +121,38 @@ class TestSingleSourceBinding(unittest.TestCase):
         _, cfg_path, _ = self._tmp_config()
         t = reg.bind_wiki("wxid_a", ["online.g"], replace=True, config_path=cfg_path)
         self.assertEqual(t["knowledge_bases"], ["online.g"])
-    def test_bind_wiki_append_to_existing_raises(self):
+    def test_bind_wiki_append_to_existing_raises_on_mixed_source(self):
         _, cfg_path, _ = self._tmp_config()
         with self.assertRaises(ValueError) as ctx:
             reg.bind_wiki("wxid_a", ["online.g"], replace=False, config_path=cfg_path)
-        # Appending a second KB is rejected (either by source mixing or by count limit).
-        self.assertTrue(
-            "最多只能绑定一个知识库" in str(ctx.exception) or "混用" in str(ctx.exception)
-        )
-    def test_enable_candidate_rejects_multiple_kbs(self):
-        _, cfg_path, cand_path = self._tmp_config()
+        self.assertIn("同源", str(ctx.exception))
+
+    def test_bind_wiki_append_to_existing_accepts_same_source(self):
+        td, cfg_path, _ = self._tmp_config()
+        p = Path(td.name) / "kb2"
+        p.mkdir()
         cfg = reg.load_config(cfg_path)
-        cfg["candidates"] = [{"username": "wxid_b", "name": "群B", "status": "pending"}]
+        cfg["knowledge_bases"]["scene.b"] = {"type": "local", "path": str(p), "enabled": True}
         reg.save_json_atomic(cfg_path, cfg)
+        t = reg.bind_wiki("wxid_a", ["scene.b"], replace=False, config_path=cfg_path)
+        self.assertEqual(sorted(t["knowledge_bases"]), ["scene.a", "scene.b"])
+    def test_enable_candidate_rejects_mixed_source_kbs(self):
+        _, cfg_path, cand_path = self._tmp_config()
+        reg.save_json_atomic(cand_path, {"version": 1, "candidates": [{"username": "wxid_b", "name": "群B", "status": "pending"}]})
         with self.assertRaises(ValueError) as ctx:
             reg.enable_candidate("wxid_b", knowledge_bases=["scene.a", "online.g"], config_path=cfg_path, candidates_path=cand_path)
-        self.assertIn("最多只能绑定一个知识库", str(ctx.exception))
+        self.assertIn("同源", str(ctx.exception))
+
+    def test_enable_candidate_accepts_same_source_multiple_kbs(self):
+        td, cfg_path, cand_path = self._tmp_config()
+        p = Path(td.name) / "kb2"
+        p.mkdir()
+        cfg = reg.load_config(cfg_path)
+        cfg["knowledge_bases"]["scene.b"] = {"type": "local", "path": str(p), "enabled": True}
+        reg.save_json_atomic(cfg_path, cfg)
+        reg.save_json_atomic(cand_path, {"version": 1, "candidates": [{"username": "wxid_b", "name": "群B", "status": "pending"}]})
+        t = reg.enable_candidate("wxid_b", knowledge_bases=["scene.a", "scene.b"], config_path=cfg_path, candidates_path=cand_path)
+        self.assertEqual(sorted(t["knowledge_bases"]), ["scene.a", "scene.b"])
 
 class TestDisableLocalKb(unittest.TestCase):
     def test_disable_local_kb_skips_local_scene_retrieval(self):

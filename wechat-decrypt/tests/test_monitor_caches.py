@@ -186,7 +186,7 @@ class WaitSentConfirmationRefreshTests(unittest.TestCase):
         self.assertIsNone(monitor._target_raw_db_path({'db': '/etc/passwd'}, cfg))
         self.assertIsNone(monitor._target_raw_db_path({'db': '../x.db'}, cfg))
 class SessionCloseModeTests(unittest.TestCase):
-    """Session keyword-close should be disabled in personal_assistant/free mode."""
+    """Session keyword-close now applies to all supported modes; legacy personal_assistant normalizes to balanced."""
 
     def setUp(self):
         monitor._active_sessions.clear()
@@ -194,7 +194,7 @@ class SessionCloseModeTests(unittest.TestCase):
     def tearDown(self):
         monitor._active_sessions.clear()
 
-    def _make_target(self, mode="personal_assistant"):
+    def _make_target(self, mode="group_assistant"):
         return {
             "name": "bot群聊测试",
             "username": "47965620946@chatroom",
@@ -210,17 +210,16 @@ class SessionCloseModeTests(unittest.TestCase):
             "sender_username": "lewis4438136",
         }
 
-    def test_free_mode_keeps_session_on_casual_close_keyword(self):
+    def test_legacy_personal_mode_normalizes_to_balanced_session_close(self):
         cfg = {"targets": [self._make_target("personal_assistant")]}
         t = cfg["targets"][0]
         msg = self._make_msg("@飞扬的跟屁虫 聊聊天")
         monitor._activate_session(t, msg, cfg)
         key = monitor._session_key(t, msg)
         self.assertIn(key, monitor._active_sessions)
-        # Casual phrase containing "好啦" should NOT close session in free mode
-        followup = self._make_msg("无所谓好不好啦")
-        self.assertTrue(monitor._is_in_session(t, followup, cfg))
-        self.assertIn(key, monitor._active_sessions)
+        followup = self._make_msg("好了")
+        self.assertFalse(monitor._is_in_session(t, followup, cfg))
+        self.assertNotIn(key, monitor._active_sessions)
 
     def test_balanced_mode_closes_session_on_close_keyword(self):
         cfg = {"targets": [self._make_target("group_assistant")]}
@@ -233,53 +232,16 @@ class SessionCloseModeTests(unittest.TestCase):
         self.assertFalse(monitor._is_in_session(t, followup, cfg))
         self.assertNotIn(key, monitor._active_sessions)
 
+    def test_customer_service_mode_closes_session_on_close_keyword(self):
+        cfg = {"targets": [self._make_target("customer_service")]}
+        t = cfg["targets"][0]
+        msg = self._make_msg("@飞扬的跟屁虫 介绍一下")
+        monitor._activate_session(t, msg, cfg)
+        key = monitor._session_key(t, msg)
+        self.assertIn(key, monitor._active_sessions)
+        followup = self._make_msg("好了")
+        self.assertFalse(monitor._is_in_session(t, followup, cfg))
+        self.assertNotIn(key, monitor._active_sessions)
 
 if __name__ == '__main__':
     unittest.main()
-class SessionCloseModeTests(unittest.TestCase):
-    """Session keyword-close should be disabled in personal_assistant/free mode."""
-
-    def setUp(self):
-        monitor._active_sessions.clear()
-
-    def tearDown(self):
-        monitor._active_sessions.clear()
-
-    def _make_target(self, mode="personal_assistant"):
-        return {
-            "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
-            "db": "message_0.db",
-            "table": "Msg_abc",
-            "mode": mode,
-        }
-
-    def _make_msg(self, text, sender_id=7):
-        return {
-            "message_content": "lewis4438136:\n%s" % text,
-            "real_sender_id": sender_id,
-            "sender_username": "lewis4438136",
-        }
-
-    def test_free_mode_keeps_session_on_casual_close_keyword(self):
-        cfg = {"targets": [self._make_target("personal_assistant")]}
-        t = cfg["targets"][0]
-        msg = self._make_msg("@飞扬的跟屁虫 聊聊天")
-        monitor._activate_session(t, msg, cfg)
-        key = monitor._session_key(t, msg)
-        self.assertIn(key, monitor._active_sessions)
-        # Casual phrase containing "好啦" should NOT close session in free mode
-        followup = self._make_msg("无所谓好不好啦")
-        self.assertTrue(monitor._is_in_session(t, followup, cfg))
-        self.assertIn(key, monitor._active_sessions)
-
-    def test_balanced_mode_closes_session_on_close_keyword(self):
-        cfg = {"targets": [self._make_target("group_assistant")]}
-        t = cfg["targets"][0]
-        msg = self._make_msg("@飞扬的跟屁虫 介绍一下")
-        monitor._activate_session(t, msg, cfg)
-        key = monitor._session_key(t, msg)
-        self.assertIn(key, monitor._active_sessions)
-        followup = self._make_msg("好了")
-        self.assertFalse(monitor._is_in_session(t, followup, cfg))
-        self.assertNotIn(key, monitor._active_sessions)

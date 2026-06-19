@@ -162,8 +162,8 @@ def decide(target: Dict[str, Any], msg: Dict[str, Any],
     policy = (event_context or {}).get("target_policy") if isinstance(event_context, dict) else None
     if not isinstance(policy, dict):
         policy = {}
-    mode = str(policy.get("mode") or "group_assistant").lower()
-    reply_policy = str(policy.get("reply_policy") or "conservative").lower()
+    raw_mode = str(policy.get("mode") or "group_assistant").lower()
+    mode = "customer_service" if raw_mode == "customer_service" else "group_assistant"
     session_active = bool(isinstance(event_context, dict) and (event_context.get("session_active") or event_context.get("session_state") == "active"))
     session_state = str((event_context or {}).get("session_state") or "").lower()
     trigger_matched = bool((event_context or {}).get("trigger_matched"))
@@ -191,21 +191,8 @@ def decide(target: Dict[str, Any], msg: Dict[str, Any],
         plan.confidence = 0.9
         return plan
 
-    # 3. Mode-specific decision.
-    if mode == "personal_assistant":
-        # Default reply, but skip tiny acks that are clearly social noise.
-        if _is_ack_only(text) and not has_images:
-            plan.reason = "ack_only_private"
-            plan.reply_mode = "silent"
-            plan.confidence = 0.85
-            return plan
-        plan.should_reply = True
-        plan.reply_mode = "answer"
-        plan.confidence = 0.9
-        plan.reason = "personal_default_reply"
-        plan.skip_to = "agent"
-        return plan
 
+    # 3. Mode-specific decision.
     if mode == "customer_service":
         # Reply only on explicit trigger or clear question in active session.
         if trigger_matched:

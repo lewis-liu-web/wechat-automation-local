@@ -101,6 +101,84 @@ def cmd_dec(target_db=None, out_dir=None, keys_file=None, db_dir=None, json_mode
     safe_print("开始解密微信数据库。若提示缺少密钥，请先执行：python manage_targets.py key")
     return _run_script(DECRYPT_SCRIPT, args)
 
+def cmd_decrypt_status(json_mode=False):
+    """Show read-only status of key extraction and decryption; never print keys."""
+    import config as _config
+
+    if not os.path.exists(_config.CONFIG_FILE):
+        result = {"ok": False, "reason": "config_missing"}
+        if json_mode:
+            print_json(result)
+        else:
+            safe_print("decrypt-status: config missing")
+        return 0
+
+    # load_config may print auto-detect messages even with write_missing=False;
+    # suppress them so JSON output stays clean.
+    import io as _io
+    _stdout_buf = sys.stdout
+    try:
+        sys.stdout = _io.StringIO()
+        cfg = _config.load_config(exit_on_missing=False, write_missing=False)
+    finally:
+        sys.stdout = _stdout_buf
+    db_dir = cfg.get("db_dir", "")
+    keys_file = cfg.get("keys_file", "")
+    decrypted_dir = cfg.get("decrypted_dir", "")
+
+    keys = {}
+    if keys_file and os.path.exists(keys_file):
+        try:
+            with open(keys_file, encoding="utf-8") as f:
+                keys = json.load(f)
+        except Exception:
+            keys = {}
+
+    keys_count = sum(1 for k in keys if isinstance(k, str) and not k.startswith("_"))
+    keys_match_db_dir = False
+    if isinstance(keys.get("_db_dir"), str) and isinstance(db_dir, str):
+        keys_match_db_dir = os.path.normcase(os.path.normpath(keys["_db_dir"])) == os.path.normcase(os.path.normpath(db_dir))
+
+    decrypted_db_count = 0
+    decrypted_total_bytes = 0
+    if decrypted_dir and os.path.isdir(decrypted_dir):
+        try:
+            for root, _dirs, files in os.walk(decrypted_dir):
+                for fname in files:
+                    if fname.endswith(".db"):
+                        fpath = os.path.join(root, fname)
+                        try:
+                            decrypted_total_bytes += os.path.getsize(fpath)
+                            decrypted_db_count += 1
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
+    result = {
+        "ok": True,
+        "db_dir": db_dir,
+        "keys_file": keys_file,
+        "keys_count": keys_count,
+        "keys_match_db_dir": keys_match_db_dir,
+        "decrypted_dir": decrypted_dir,
+        "decrypted_db_count": decrypted_db_count,
+        "decrypted_total_bytes": decrypted_total_bytes,
+    }
+
+    if json_mode:
+        print_json(result)
+    else:
+        safe_print("db_dir: {db_dir}".format(**result))
+        safe_print("keys_file: {keys_file}".format(**result))
+        safe_print("keys_count: {keys_count}".format(**result))
+        safe_print("keys_match_db_dir: {keys_match_db_dir}".format(**result))
+        safe_print("decrypted_dir: {decrypted_dir}".format(**result))
+        safe_print("decrypted_db_count: {decrypted_db_count}".format(**result))
+        safe_print("decrypted_total_bytes: {decrypted_total_bytes}".format(**result))
+
+    return 0
+
 
 def cmd_setup(admin=False, json_mode=False):
     if admin:
@@ -351,6 +429,18 @@ def main(argv=None):
     p.add_argument("key", help="target name or WeChat username")
     p.add_argument("--json", action="store_true")
 
+    # trigger-default-* = manage global default_triggers
+    p = sub.add_parser("trigger-default-list", help="list global default trigger keywords")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("trigger-default-replace", help="replace global default trigger keywords")
+    p.add_argument("words", nargs="+", help="new default trigger keywords")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("trigger-default-clear", help="clear global default trigger keywords")
+    p.add_argument("--json", action="store_true")
+
+
     # legacy alias: `trigger key [words ...] [--set|--remove|--clear]`
     p = sub.add_parser("trigger", aliases=["triggers", "kw", "keyword"], help="legacy alias; prefer trigger-list/add/remove/replace/clear")
     p.add_argument("key", help="target name or WeChat username")
@@ -399,8 +489,8 @@ def main(argv=None):
     p.add_argument("id", help="knowledge base alias")
     p.add_argument("--json", action="store_true")
 
-    # kb = bind-wiki (single KB source per target)
-    p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind a single knowledge base alias to a target")
+    # kb = bind-wiki (same-source KBs per target)
+    p = sub.add_parser("kb", aliases=["bind-wiki"], help="bind one or more same-source knowledge base aliases to a target")
     p.add_argument("key")
     p.add_argument("wiki", nargs="+")
     p.add_argument("--replace", action="store_true")
@@ -417,6 +507,54 @@ def main(argv=None):
     p.add_argument("--query", "-q", default="", help="sample query to test against the index")
     p.add_argument("--json", action="store_true")
 
+    # target-* = target CRUD
+    p = sub.add_parser("target-show", help="show target details including triggers and knowledge bases")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("target-delete", help="delete a configured target")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("--yes", action="store_true", help="confirm deletion")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("target-field", help="set an arbitrary field on a target")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("field", help="field name to set")
+    p.add_argument("value", help="value to set; parsed as JSON if it looks like JSON")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("target-mode", help="set target response mode")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("mode", choices=["group_assistant", "customer_service"], help="response mode")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("target-category", help="set target business category")
+    p.add_argument("key", help="target name or WeChat username")
+    p.add_argument("category", choices=["user", "admin"], help="business category")
+    p.add_argument("--json", action="store_true")
+
+    # kb-enable / kb-disable / kb-delete / kb-search
+    p = sub.add_parser("kb-enable", help="enable a knowledge base alias")
+    p.add_argument("id", help="knowledge base alias")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("kb-disable", help="disable a knowledge base alias")
+    p.add_argument("id", help="knowledge base alias")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("kb-delete", help="delete a knowledge base alias")
+    p.add_argument("id", help="knowledge base alias")
+    p.add_argument("--remove-files", action="store_true", help="also remove local KB directory files")
+    p.add_argument("--yes", action="store_true", help="confirm deletion")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("kb-search", help="search a local knowledge base")
+    p.add_argument("id", help="local knowledge base alias")
+    p.add_argument("query", help="search query")
+    p.add_argument("--limit", type=int, default=5, help="max results")
+    p.add_argument("--json", action="store_true")
+
+
     # db decrypt lifecycle
     p = sub.add_parser("init", aliases=["cfg"], help="initialize/confirm config.json and auto-detected db_dir")
     p.add_argument("--json", action="store_true")
@@ -429,6 +567,8 @@ def main(argv=None):
     p.add_argument("--out-dir", help="output directory; default from config.json")
     p.add_argument("--keys-file", help="keys json path; default from config.json")
     p.add_argument("--db-dir", help="raw db_storage path; default from config.json")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("decrypt-status", help="show read-only status of keys and decrypted databases")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("setup", aliases=["bootstrap"], help="init + extract keys + decrypt all databases")
@@ -460,6 +600,8 @@ def main(argv=None):
             return cmd_key(json_mode=args.json)
         if cmd in ("dec", "decrypt"):
             return cmd_dec(target_db=args.target_db, out_dir=args.out_dir, keys_file=args.keys_file, db_dir=args.db_dir, json_mode=args.json)
+        if cmd == "decrypt-status":
+            return cmd_decrypt_status(json_mode=args.json)
         if cmd in ("setup", "bootstrap"):
             return cmd_setup(admin=args.admin, json_mode=args.json)
         if cmd in ("refresh", "rf"):
@@ -613,6 +755,32 @@ def main(argv=None):
                 safe_print("已清空触发词: %s" % out.get("name"))
             return 0
 
+        # -- trigger-default-* --
+        if cmd == "trigger-default-list":
+            words = reg.get_default_triggers()
+            if args.json:
+                print_json({"ok": True, "default_triggers": words})
+            else:
+                safe_print("default_triggers: %s" % (", ".join(words) or "(empty)"))
+            return 0
+
+        if cmd == "trigger-default-replace":
+            words = reg.set_default_triggers(list(args.words))
+            if args.json:
+                print_json({"ok": True, "action": "replaced", "default_triggers": words})
+            else:
+                safe_print("已替换默认触发词: %s" % ", ".join(words))
+            return 0
+
+        if cmd == "trigger-default-clear":
+            words = reg.set_default_triggers([])
+            if args.json:
+                print_json({"ok": True, "action": "cleared", "default_triggers": words})
+            else:
+                safe_print("已清空默认触发词")
+            return 0
+
+
         # -- legacy `trigger key [words] [--set|--remove|--clear]` --
         if cmd in ("trigger", "triggers", "kw", "keyword"):
             if args.clear:
@@ -742,8 +910,6 @@ def main(argv=None):
             return 0
 
         if cmd in ("kb", "bind-wiki"):
-            if len(args.wiki) > 1:
-                raise ValueError("一个监听目标最多只能绑定一个知识库；收到 %d 个: %s" % (len(args.wiki), ", ".join(args.wiki)))
             out = reg.bind_wiki(args.key, args.wiki, replace=args.replace)
             if args.json:
                 print_json(out)
@@ -778,6 +944,136 @@ def main(argv=None):
                     safe_print("样例FTS查询: %s" % info.get("sample_fts_query"))
                     safe_print("样例命中数: %d" % len(info.get("sample_hits", [])))
             return 0
+
+        # -- target-show / target-delete / target-field / target-mode / target-category --
+        if cmd == "target-show":
+            info = reg.inspect_target(args.key)
+            if args.json:
+                print_json({"ok": True, **info})
+            else:
+                safe_print("kind: %s" % info.get("kind"))
+                if info.get("kind") == "target":
+                    t = info.get("target") or {}
+                    safe_print("name: %s" % t.get("name"))
+                    safe_print("username: %s" % t.get("username"))
+                    safe_print("enabled: %s" % t.get("listen_enabled"))
+                    safe_print("category: %s" % t.get("category", "user"))
+                    safe_print("mode: %s" % t.get("mode", "group_assistant"))
+                    safe_print("knowledge_bases: %s" % ", ".join(str(k) for k in (t.get("knowledge_bases") or [])))
+                    safe_print("effective_triggers: %s" % ", ".join(info.get("effective_triggers") or []))
+                elif info.get("kind") == "candidate":
+                    c = info.get("candidate") or {}
+                    safe_print("name: %s" % c.get("name"))
+                    safe_print("username: %s" % c.get("username"))
+                    safe_print("status: %s" % c.get("status"))
+                    safe_print("effective_triggers: %s" % ", ".join(info.get("effective_triggers") or []))
+                safe_print("default_triggers: %s" % ", ".join(info.get("default_triggers") or []))
+            return 0
+
+        if cmd == "target-delete":
+            if not args.yes:
+                if args.json:
+                    print_json({"ok": False, "message": "add --yes to delete target"})
+                else:
+                    safe_print("add --yes to delete target")
+                return 2
+            out = reg.delete_target(args.key)
+            _audit_event("target_delete", target=out.get("name"), payload={"username": out.get("username")})
+            if args.json:
+                print_json({"ok": True, "action": "deleted", "target": out})
+            else:
+                safe_print("已删除目标: %s (%s)" % (out.get("name"), out.get("username")))
+            return 0
+
+        if cmd == "target-field":
+            raw = args.value
+            stripped = raw.strip()
+            if not stripped:
+                value = raw
+            elif stripped[0] in "{[\"" or stripped in ("true", "false", "null") or stripped[0].isdigit() or stripped[0] == "-":
+                try:
+                    value = json.loads(stripped)
+                except Exception:
+                    value = raw
+            else:
+                value = raw
+            out = reg.set_target_field(args.key, args.field, value)
+            _audit_event("target_field", target=out.get("name"), payload={"field": args.field, "value": value})
+            if args.json:
+                print_json({"ok": True, "action": "set", "field": args.field, "target": out})
+            else:
+                safe_print("已设置 %s.%s = %s" % (out.get("name"), args.field, value))
+            return 0
+
+        if cmd == "target-mode":
+            out = reg.set_target_mode_bundle(args.key, args.mode)
+            _audit_event("target_mode", target=out.get("name"), payload={"mode": args.mode})
+            if args.json:
+                print_json({"ok": True, "action": "set", "mode": args.mode, "target": out})
+            else:
+                safe_print("已设置 %s mode = %s" % (out.get("name"), args.mode))
+            return 0
+
+        if cmd == "target-category":
+            out = reg.set_category(args.key, args.category)
+            _audit_event("target_category", target=out.get("name"), payload={"category": args.category})
+            if args.json:
+                print_json({"ok": True, "action": "set", "category": args.category, "target": out})
+            else:
+                safe_print("已设置 %s category = %s" % (out.get("name"), args.category))
+            return 0
+
+        # -- kb-enable / kb-disable / kb-delete / kb-search --
+        if cmd == "kb-enable":
+            out = reg.set_knowledge_base_enabled(args.id, True)
+            if args.json:
+                print_json({"ok": True, "action": "enabled", "knowledge_base": out})
+            else:
+                safe_print("已启用知识库: %s" % out.get("id"))
+            return 0
+
+        if cmd == "kb-disable":
+            out = reg.set_knowledge_base_enabled(args.id, False)
+            if args.json:
+                print_json({"ok": True, "action": "disabled", "knowledge_base": out})
+            else:
+                safe_print("已禁用知识库: %s" % out.get("id"))
+            return 0
+
+        if cmd == "kb-delete":
+            if not args.yes:
+                if args.json:
+                    print_json({"ok": False, "message": "add --yes to delete knowledge base"})
+                else:
+                    safe_print("add --yes to delete knowledge base")
+                return 2
+            out = reg.delete_knowledge_base(args.id, remove_files=args.remove_files)
+            _audit_event("kb_delete", payload={"id": args.id, "remove_files": args.remove_files})
+            if args.json:
+                print_json({"ok": True, "action": "deleted", "knowledge_base": out})
+            else:
+                safe_print("已删除知识库: %s" % out.get("id"))
+            return 0
+
+        if cmd == "kb-search":
+            try:
+                result = reg.search_local_kb(args.id, args.query, limit=args.limit)
+            except ValueError as e:
+                if args.json:
+                    print_json({"ok": False, "message": str(e)})
+                else:
+                    safe_print("ERROR: %s" % e)
+                return 1
+            hits = result.get("hits") or [] if isinstance(result, dict) else []
+            if args.json:
+                print_json({"ok": True, "knowledge_base": args.id, "query": args.query, "results": result})
+            else:
+                safe_print("知识库 '%s' 查询 '%s' 返回 %d 条结果:" % (args.id, args.query, len(hits)))
+                for r in hits:
+                    safe_print("  - %s (score=%s) %s" % (r.get("rel_path", "?"), r.get("score", "?"), (r.get("snippet") or "")[:80]))
+            return 0
+
+
 
         safe_print("Unknown command: %s" % cmd)
         return 1

@@ -102,13 +102,8 @@ def _invalidate_contact_cache(path) -> None:
 
 
 MODE_DEFAULTS = {
-    'personal_assistant': {
-        'reply_policy': 'relaxed',
-        'session_policy': {'timeout_seconds': 300, 'max_turns': 10, 'require_followup_intent': False},
-        'context_policy': {'time_window_seconds': 180, 'max_messages': 40, 'sender_recent_limit': 8, 'include_bot_recent': True},
-    },
     'group_assistant': {
-        'reply_policy': 'conservative',
+        'reply_policy': 'balanced',
         'session_policy': {'timeout_seconds': 60, 'max_turns': 3, 'require_followup_intent': True},
         'context_policy': {'time_window_seconds': 90, 'max_messages': 30, 'sender_recent_limit': 5, 'include_bot_recent': True},
     },
@@ -162,7 +157,7 @@ def resolve_target_policy(cfg, target):
     text/image/voice/file are input capabilities, not separate modes.
     """
     mode = str(target.get('mode') or cfg.get('mode') or 'group_assistant').lower()
-    if mode not in MODE_DEFAULTS:
+    if mode == 'personal_assistant' or mode not in MODE_DEFAULTS:
         mode = 'group_assistant'
     policy = _deep_merge(MODE_DEFAULTS[mode], {})
     policy = _deep_merge(policy, cfg.get('policy') or {})
@@ -253,7 +248,7 @@ def _is_in_session(t, msg, cfg):
     session_policy = policy.get('session_policy') or {}
     text = _message_text(msg)
     if sess and time.time() < sess.get('expires_at', 0):
-        if policy.get('mode') != 'personal_assistant' and _looks_like_session_close(text):
+        if _looks_like_session_close(text):
             log('session_close key=%s reason=close_intent text=%r' % (key, text[:80]))
             _active_sessions.pop(key, None)
             return False

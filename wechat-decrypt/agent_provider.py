@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -43,7 +44,67 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-import re
+
+def _normalize_hermes_profile_id(profile: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile or "").strip()).strip("-._")
+    return "hermes-%s" % (safe or "default")
+
+
+def parse_hermes_profile_list(output: str) -> List[Dict[str, Any]]:
+    """Parse `hermes profile list` table output into provider instance dicts."""
+    profiles: List[Dict[str, Any]] = []
+    for raw in str(output or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("Profile") or line.startswith("─"):
+            continue
+        active = line.startswith("◆")
+        if active:
+            line = line[1:].strip()
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        profile = parts[0].strip()
+        model = parts[1].strip()
+        gateway_status = parts[2].strip() if len(parts) >= 3 else ""
+        alias = parts[3].strip() if len(parts) >= 4 else ""
+        if alias == "—":
+            alias = ""
+        label = alias or profile
+        profiles.append({
+            "id": _normalize_hermes_profile_id(profile),
+            "label": label,
+            "provider": "hermes",
+            "profile": profile,
+            "worker_id": label,
+            "model": model,
+            "gateway_status": "" if gateway_status == "—" else gateway_status,
+            "alias": alias,
+            "active": active,
+            "source": "discovered",
+        })
+    return profiles
+
+
+def discover_hermes_profiles(cli_path: str = "hermes", timeout: float = 5.0) -> List[Dict[str, Any]]:
+    """Discover local Hermes profiles without mutating project config."""
+    try:
+        proc = subprocess.run(
+            [str(cli_path or "hermes"), "profile", "list"],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(timeout or 5.0)),
+            encoding="utf-8",
+            errors="replace",
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+    except Exception as exc:
+        logger.warning("failed to discover Hermes profiles: %s", exc)
+        return []
+    if proc.returncode != 0:
+        logger.warning("hermes profile list failed rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:200])
+        return []
+    return parse_hermes_profile_list(proc.stdout or "")
+
 
 _NOISE_LINE_PATTERNS = [
     re.compile(r"^Initializing\b", re.IGNORECASE),

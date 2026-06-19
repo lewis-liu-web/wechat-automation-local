@@ -158,8 +158,6 @@ python wiki_dry_run.py --target "群组名称" --query "如何申请权限？"
 }
 ```
 
-## CLI 命令参考
-
 ### `manage_targets.py`
 
 | 命令 | 别名 | 说明 |
@@ -170,19 +168,48 @@ python wiki_dry_run.py --target "群组名称" --query "如何申请权限？"
 | `on` | `enable` | 按显示名称启用目标。 |
 | `off` | `disable` | 停用目标。 |
 | `re` | `reenable` | 重新启用目标。 |
+| `target-show` | — | 查看目标详情。 |
+| `target-delete` | — | 删除目标（需 `--yes`）。 |
+| `target-field` | — | 设置目标任意字段。 |
+| `target-mode` | — | 设置响应模式：`group_assistant` / `customer_service`。 |
+| `target-category` | — | 设置目标类别：`user` / `admin`。 |
 | `trigger` | `triggers`, `kw`, `keyword` | 添加、删除或查看触发词。 |
+| `trigger-default-list` | — | 查看全局默认触发词。 |
+| `trigger-default-replace` | — | 替换全局默认触发词。 |
+| `trigger-default-clear` | — | 清空全局默认触发词。 |
 | `kb-list` | `kbs`, `wiki-list` | 列出可用知识库。 |
 | `kb-add` | `wiki-add` | 注册知识库 alias 或 hook。 |
 | `kb-local` | `wiki-local` | 创建本地目录型知识库。 |
 | `kb-import` | `wiki-import` | 向本地知识库导入文件。 |
 | `kb-open` | `wiki-open` | 打开本地知识库目录。 |
 | `kb-info` | `wiki-info` | 查看知识库详情与统计。 |
-| `kb` | `bind-wiki` | 将知识库绑定到目标。 |
+| `kb-enable` | — | 启用知识库。 |
+| `kb-disable` | — | 禁用知识库。 |
+| `kb-delete` | — | 删除知识库（需 `--yes`）。 |
+| `kb-search` | — | 检索本地知识库。 |
+| `kb` | `bind-wiki` | 将同源知识库绑定到目标。 |
+| `decrypt-status` | — | 查看解密状态（只读，不打印密钥）。 |
 | `refresh` | `rf` | 刷新目标元数据和消息状态。 |
 | `start` | — | 启动监听守护进程。 |
 | `stop` | — | 停止监听守护进程。 |
 | `restart` | — | 重启监听守护进程。 |
 | `status` | — | 查看监听状态。 |
+
+### `wechat-auto` 包入口
+
+安装后可使用统一入口：
+
+```bash
+wechat-auto decrypt-status --json
+wechat-auto target-show "<target>" --json
+wechat-auto trigger-default-list
+wechat-auto kb-search <kb_id> <query> --limit 5
+wechat-auto agent profiles
+wechat-auto agent on <instance_id>
+wechat-auto agent off <instance_id>
+```
+
+> 使用 `wechat-auto <命令> --help` 查看完整参数；所有删除命令必须显式加 `--yes`。
 
 ### `wechat_bot_monitor.py`
 

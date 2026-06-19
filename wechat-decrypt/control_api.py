@@ -57,6 +57,7 @@ from agent_provider import (  # noqa: E402
     AgentResult,
     EchoAgentProvider,
     HermesProvider,
+    discover_hermes_profiles,
     list_agent_instances,
     provider_from_config,
 )
@@ -66,7 +67,6 @@ import target_registry as reg  # noqa: E402
 DEFAULT_PORT = 18590
 DEFAULT_HOST = "127.0.0.1"
 _SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-DEFAULT_HERMES_INSTANCE_IDS = ["hermes-worker1", "hermes-worker2"]
 
 _ASYNC_LOOP_LOCK = threading.RLock()
 _ASYNC_LOOP_STOP = threading.Event()
@@ -186,6 +186,11 @@ class ControlHandler(BaseHTTPRequestHandler):
             kind = (params.get("kind") or ["all"])[0]
             targets, candidates = _list_targets_by_kind(kind)
             return _ok(count=len(targets), targets=targets, candidates=candidates)
+        if method == "GET" and (m := _match(path, "/targets/{key}")):
+            try:
+                return _ok(**reg.inspect_target(m[0], config_path=reg.CONFIG_PATH, candidates_path=reg.CANDIDATES_PATH))
+            except ValueError as e:
+                return _err(str(e), status=404)
         if method == "POST" and path == "/targets/scan":
             include_contacts = (params.get("include_contacts") or ["false"])[0].lower() in ("1", "true", "yes")
             return _call_cli(["scan"] + (["--include-contacts"] if include_contacts else []) + ["--json"])
@@ -206,6 +211,10 @@ class ControlHandler(BaseHTTPRequestHandler):
             if not field:
                 return _err("field is required")
             return _ok(action="field_updated", target=reg.set_target_field(m[0], field, value))
+        if method == "POST" and (m := _match(path, "/targets/{key}/mode")):
+            mode = str(body.get("mode") or "").strip().lower()
+            mode = "customer_service" if mode == "customer_service" else "group_assistant"
+            return _ok(action="mode_updated", target=reg.set_target_mode_bundle(m[0], mode, config_path=reg.CONFIG_PATH))
         if method == "DELETE" and (m := _match(path, "/targets/{key}")):
             return _ok(action="deleted", target=_delete_target(m[0]))
 
@@ -258,6 +267,12 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(jobs=agent_jobs.list_jobs(status=status, group_key=group_key, limit=limit))
         if method == "GET" and path == "/agent/jobs/stats":
             return _ok(stats=agent_jobs.count_jobs())
+        if method == "GET" and (m := _match(path, "/agent/jobs/{id}")):
+            job_id = int(m[0])
+            job = agent_jobs.get_job(job_id)
+            if not job:
+                return _err("job not found: %d" % job_id, status=404)
+            return _ok(job=job)
         if method == "POST" and path == "/agent/jobs/test":
             prompt = str(body.get("prompt") or "").strip()
             if not prompt:
@@ -356,6 +371,10 @@ class ControlHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/agent/instances":
             cfg = reg.load_config()
             return _ok(instances=list_agent_instances(cfg))
+        if method == "GET" and path == "/agent-providers/hermes/profiles":
+            return _ok(profiles=discover_hermes_profiles())
+        if method == "POST" and path == "/agent/instances":
+            return _ok(**_register_agent_instance(body.get("instance") if isinstance(body, dict) else None))
         if method == "GET" and path == "/agent/pool/status":
             return _ok(**_agent_pool_status())
         if method == "POST" and (m := _match(path, "/agent/instance/{id}/start")):
@@ -405,6 +424,10 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(**_async_loop_start(body))
         if method == "POST" and path == "/agent/async-loop/stop":
             return _ok(**_async_loop_stop())
+        if method == "POST" and (m := _match(path, "/agent/instance/{id}/on-duty")):
+            return _ok(**_async_loop_start({"instance_id": str(m[0])}))
+        if method == "POST" and (m := _match(path, "/agent/instance/{id}/off-duty")):
+            return _ok(**_async_loop_remove_instance(str(m[0])))
 
         # ---- knowledge bases ----
         if method == "GET" and path == "/kbs":
@@ -455,6 +478,11 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return _ok(action="imported", **result)
             except Exception as e:
                 return _err("import failed: %s" % (e,))
+        if method == "GET" and (m := _match(path, "/kbs/{key}/info")):
+            info = reg.get_kb_info(m[0], config_path=reg.CONFIG_PATH)
+            if not info:
+                return _err("knowledge base not found: %s" % m[0], status=404)
+            return _ok(knowledge_base=info)
         if method == "GET" and (m := _match(path, "/kbs/{key}/search")):
             q = str((params.get("q") or [""])[0]).strip()
             limit = int((params.get("limit") or ["5"])[0])
@@ -474,8 +502,6 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return _err("diagnose failed: %s" % (e,))
         if method == "POST" and (m := _match(path, "/targets/{key}/kbs/replace")):
             kbs = list(body.get("knowledge_bases") or [])
-            if len(kbs) > 1:
-                return _err("一个监听目标最多只能绑定一个知识库；收到 %d 个: %s" % (len(kbs), ", ".join(kbs)))
             return _ok(action="bound", target=reg.bind_wiki(m[0], kbs, replace=True))
 
         return _err("not found: %s %s" % (method, path), status=404)
@@ -545,51 +571,16 @@ class ControlHandler(BaseHTTPRequestHandler):
 def _delete_target(key: str):
     """Delete a configured target by name or username.
 
-    We do not have a registry helper for hard delete yet, so we operate on
-    the config file directly with a guard.
+    Delegates to target_registry.delete_target() so the CLI and HTTP surface
+    share exactly the same hard-delete + candidate-reset logic.
     """
-    from target_registry import (
-        CANDIDATES_PATH,
-        CONFIG_PATH,
-        find_target,
-        load_config,
-        load_candidates,
-        now_text,
-        save_json_atomic,
-    )
-    cfg = load_config(CONFIG_PATH)
-    t = find_target(cfg, key)
-    if not t:
-        raise ValueError("target not found: %s" % key)
-    before = len(cfg.get("targets") or [])
-    cfg["targets"] = [x for x in (cfg.get("targets") or [])
-                      if not (x.get("name") == key or x.get("username") == key)]
-    after = len(cfg.get("targets") or [])
-    if before == after:
-        raise ValueError("target not removed: %s" % key)
-    save_json_atomic(CONFIG_PATH, cfg)
-    # Also reset the candidate so the same group can be re-found by scan.
-    try:
-        cdata = load_candidates(CANDIDATES_PATH)
-        username = t.get("username") or key
-        touched = False
-        for c in cdata.get("candidates") or []:
-            if (c.get("username") or "").lower() == username.lower():
-                if c.get("status") != "pending":
-                    c["status"] = "pending"
-                    c["updated_at"] = now_text()
-                touched = True
-        if touched:
-            cdata["updated_at"] = now_text()
-            save_json_atomic(CANDIDATES_PATH, cdata)
-    except Exception:
-        pass
+    from target_registry import delete_target
+    t = delete_target(key)
     try:
         event_log.log_event("target_delete", target=key, payload={"name": t.get("name")})
     except Exception:
         pass
     return t
-
 
 def _list_targets_by_kind(kind: str):
     """Return (targets, candidates) for the requested kind.
@@ -604,10 +595,11 @@ def _list_targets_by_kind(kind: str):
     for t in targets:
         row = dict(t)
         row.setdefault("status", "enabled" if t.get("enabled") else "disabled")
+        row.setdefault("type", "group" if (t.get("username") or "").endswith("@chatroom") else "contact")
         rows.append(row)
-    pending_rows: list = []
     if kind in ("all", "pending"):
-        configured_users = {(t.get("username") or "").lower() for t in targets}
+        pending_rows: list = []
+        configured_users = {(t.get("username") or "").lower() for t in rows}
         for c in candidates:
             username = (c.get("username") or "")
             if not username:
@@ -643,6 +635,43 @@ def _list_targets_by_kind(kind: str):
     else:
         rows = rows + pending_rows
     return rows, candidates
+
+
+def _register_agent_instance(instance: Any) -> Dict[str, Any]:
+    if not isinstance(instance, dict):
+        raise ValueError("instance must be an object")
+    instance_id = str(instance.get("id") or "").strip()
+    provider = str(instance.get("provider") or instance.get("type") or "").strip().lower()
+    if not instance_id:
+        raise ValueError("instance.id is required")
+    if provider not in ("hermes", "genericagent", "echo"):
+        raise ValueError("unsupported instance provider: %s" % (provider or "(empty)"))
+    normalized = dict(instance)
+    normalized["id"] = instance_id
+    normalized["provider"] = provider
+    if provider == "hermes" and not str(normalized.get("profile") or "").strip():
+        raise ValueError("hermes instance profile is required")
+    cfg = reg.load_config(reg.CONFIG_PATH)
+    ap_cfg = cfg.setdefault("agent_provider", {})
+    if not isinstance(ap_cfg, dict):
+        ap_cfg = {}
+        cfg["agent_provider"] = ap_cfg
+    instances = ap_cfg.setdefault("instances", [])
+    if not isinstance(instances, list):
+        instances = []
+        ap_cfg["instances"] = instances
+    for idx, existing in enumerate(instances):
+        if isinstance(existing, dict) and str(existing.get("id") or "").strip() == instance_id:
+            merged = dict(existing)
+            for key, value in normalized.items():
+                if value not in (None, ""):
+                    merged[key] = value
+            instances[idx] = merged
+            reg.save_json_atomic(reg.CONFIG_PATH, cfg)
+            return {"created": False, "instance": merged}
+    instances.append(normalized)
+    reg.save_json_atomic(reg.CONFIG_PATH, cfg)
+    return {"created": True, "instance": normalized}
 
 
 def _build_agent_provider(provider_name: str | None = None, instance_id: str | None = None):
@@ -968,6 +997,39 @@ def _async_sender_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             "results": results, "duration": round(time.time() - t0, 3)}
 
 
+def _async_loop_remove_instance(instance_id: str) -> Dict[str, Any]:
+    """Remove one instance from the async-loop on-duty set; stop loop if none remain."""
+    instance_id = str(instance_id)
+    with _ASYNC_LOOP_LOCK:
+        thread = _ASYNC_LOOP_THREAD
+        running = bool(thread and thread.is_alive() and not _ASYNC_LOOP_STOP.is_set())
+        cfg: Dict[str, Any] = _ASYNC_LOOP_STATE.get("config") or {}
+        ids = list(cfg.get("instance_ids") or [])
+        if not ids and cfg.get("instance_id"):
+            ids = [x.strip() for x in str(cfg["instance_id"]).split(",") if x.strip()]
+        on_duty = instance_id in ids
+        if running and on_duty:
+            ids = [x for x in ids if x != instance_id]
+            if ids:
+                cfg["instance_ids"] = ids
+                cfg["instance_id"] = ids[0] if len(ids) == 1 else ",".join(ids)
+                cur_max = int(cfg.get("max_global_dispatching") or 1)
+                cfg["max_global_dispatching"] = max(1, min(cur_max, len(ids)))
+                _ASYNC_LOOP_STATE["config"] = cfg
+                action = "removed"
+            else:
+                _ASYNC_LOOP_STOP.set()
+                _ASYNC_LOOP_STATE["stopped_at"] = time.time()
+                action = "stopping"
+        elif not running:
+            action = "not_running"
+        else:
+            action = "not_on_duty"
+    # Build status snapshot outside the lock to avoid re-entrant deadlock.
+    status = _async_loop_status()
+    return {"action": action, "instance_id": instance_id, **status}
+
+
 def _async_loop_status() -> Dict[str, Any]:
     with _ASYNC_LOOP_LOCK:
         state = dict(_ASYNC_LOOP_STATE)
@@ -988,7 +1050,18 @@ def _async_loop_start(body: Dict[str, Any]) -> Dict[str, Any]:
     if raw_instance_id:
         requested_instance_ids = [x.strip() for x in str(raw_instance_id).split(",") if x.strip()]
     else:
-        requested_instance_ids = list(DEFAULT_HERMES_INSTANCE_IDS)
+        cfg = reg.load_config(reg.CONFIG_PATH)
+        registered = [
+            str(inst.get("id") or "").strip()
+            for inst in list_agent_instances(cfg)
+            if isinstance(inst, dict) and str(inst.get("id") or "").strip()
+        ]
+        discovered = [
+            str(profile.get("id") or "").strip()
+            for profile in discover_hermes_profiles()
+            if isinstance(profile, dict) and str(profile.get("id") or "").strip()
+        ]
+        requested_instance_ids = registered or discovered
     instance_id = requested_instance_ids[0] if len(requested_instance_ids) == 1 else ",".join(requested_instance_ids)
     with _ASYNC_LOOP_LOCK:
         if _ASYNC_LOOP_THREAD and _ASYNC_LOOP_THREAD.is_alive():
