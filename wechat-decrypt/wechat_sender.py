@@ -897,6 +897,19 @@ def send_reply_backend(text: str, log: Optional[LogFn] = None) -> bool:
     return preserved
 
 
+def _cua_list_windows_json(timeout: float = 10) -> Optional[dict]:
+    """Run `cua-driver list_windows --json` without popping a console window.
+
+    Returns the parsed JSON dict or ``None`` on failure.
+    """
+    import json
+    try:
+        proc = _cua_run(['cua-driver', 'list_windows', '--json'], timeout=timeout)
+        return json.loads(proc.stdout or '{}')
+    except Exception:
+        return None
+
+
 def _cua_run(cmd: list, timeout: float = 10, log: Optional[LogFn] = None) -> 'subprocess.CompletedProcess[str]':
     """Run cua-driver CLI without popping a console window on Windows."""
     import subprocess
@@ -1708,15 +1721,7 @@ def _cua_find_active_session_item_uiautomation(hwnd: int, names, log: Optional[L
 
 def _cua_list_wechat_window_ids() -> set:
     """Return the set of (pid, hwnd) for usable main WeChat top-level windows."""
-    import json
-    try:
-        result = subprocess.run(
-            ['cua-driver', 'list_windows', '--json'],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        data = json.loads(result.stdout or '{}')
-    except Exception:
-        return set()
+    data = _cua_list_windows_json() or {}
     out = set()
     for w in data.get('windows') or []:
         app_name = (w.get('app_name') or '').lower()
@@ -1731,19 +1736,13 @@ def _cua_list_wechat_window_ids() -> set:
 
 def _cua_window_area(pid: int, window_id: int) -> Optional[int]:
     """Return the pixel area of a window from cua-driver's list_windows output."""
-    import json
-    try:
-        result = subprocess.run(
-            ['cua-driver', 'list_windows', '--json'],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        data = json.loads(result.stdout or '{}')
-        for w in data.get('windows') or []:
-            if int(w.get('pid', 0)) == pid and int(w.get('window_id', 0)) == window_id:
-                bounds = w.get('bounds') or {}
-                return int(bounds.get('width', 0)) * int(bounds.get('height', 0))
-    except Exception:
-        pass
+    data = _cua_list_windows_json()
+    if not data:
+        return None
+    for w in data.get('windows') or []:
+        if int(w.get('pid', 0)) == pid and int(w.get('window_id', 0)) == window_id:
+            bounds = w.get('bounds') or {}
+            return int(bounds.get('width', 0)) * int(bounds.get('height', 0))
     return None
 
 
@@ -1776,7 +1775,9 @@ def _cua_find_any_separate_window(main_hwnd: int, log: Optional[LogFn] = None) -
     if best:
         return best[1], best[2]
     return None
-def _cua_pop_out_chat(target: Optional[dict], cfg: Optional[dict] = None,
+
+
+def _cua_pop_out_chat(target: Optional[dict] = None, cfg: Optional[dict] = None,
                       log: Optional[LogFn] = None) -> Optional[Tuple[int, int]]:
     """Pop out an independent chat window for ``target`` from the main WeChat window.
 
@@ -2233,19 +2234,15 @@ def _cua_set_input_value_uiautomation(window_id: int, text: str,
 
 def _cua_window_title_from_handle(pid: int, window_id: int) -> Optional[str]:
     """Return the title of a window from cua-driver's list_windows output."""
-    import json
-    try:
-        result = subprocess.run(
-            ['cua-driver', 'list_windows', '--json'],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        data = json.loads(result.stdout or '{}')
-        for w in data.get('windows') or []:
-            if int(w.get('pid', 0)) == pid and int(w.get('window_id', 0)) == window_id:
-                return str(w.get('title') or '')
-    except Exception:
-        pass
+    data = _cua_list_windows_json()
+    if not data:
+        return None
+    for w in data.get('windows') or []:
+        if int(w.get('pid', 0)) == pid and int(w.get('window_id', 0)) == window_id:
+            return str(w.get('title') or '')
     return None
+
+
 def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
                                    cfg: Optional[dict] = None,
                                    log: Optional[LogFn] = None) -> SendResult:
@@ -2292,11 +2289,25 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
 
     # Prefer raw UIA ValuePattern: cua-driver set_value CLI loses element
     # cache across invocations, so uiautomation is more reliable here.
-    # We intentionally do *not* restore the window from a minimised state:
-    # Qt WeChat accepts ValuePattern writes while minimised, so keeping it
-    # minimised avoids any visible pop-up.
+    # If the separate window is minimised, briefly restore it without
+    # activation so the UIA tree is reachable, then re-minimise afterwards
+    # to keep the send visually silent.
+    was_minimised = False
+    try:
+        import ctypes
+        if ctypes.windll.user32.IsIconic(window_id):
+            was_minimised = True
+            SW_SHOWNOACTIVATE = 4
+            ctypes.windll.user32.ShowWindow(window_id, SW_SHOWNOACTIVATE)
+            _log(log, 'cua separate window: restored minimised window hwnd=%s without activation' % window_id)
+            time.sleep(0.05)
+    except Exception as e:
+        _log(log, 'cua separate window: check/restore minimised failed: %r' % e)
+
+    value_set = False
     if _cua_set_input_value_uiautomation(window_id, text, log=log):
         attempted.append('cua_set_input_value_uiautomation')
+        value_set = True
     else:
         input_idx = _find_chat_input_edit(tree_markdown)
         if input_idx is None:
@@ -2308,12 +2319,33 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
             return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
                              reason='cua_set_input_value_failed')
         attempted.append('cua_set_input_value')
-    time.sleep(0.1)
-    if not _cua_press_key(pid, window_id, 'return', log=log):
-        _restore()
-        return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
-                         reason='cua_press_enter_failed')
-    attempted.append('cua_press_enter')
+        value_set = True
+
+    if was_minimised and value_set:
+        try:
+            time.sleep(0.1)
+            if not _cua_press_key(pid, window_id, 'return', log=log):
+                _restore()
+                return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
+                                 reason='cua_press_enter_failed')
+            attempted.append('cua_press_enter')
+            # Re-minimise to honour the silent-send contract.
+            try:
+                import ctypes
+                SW_MINIMIZE = 6
+                ctypes.windll.user32.ShowWindow(window_id, SW_MINIMIZE)
+                _log(log, 'cua separate window: re-minimised window hwnd=%s' % window_id)
+            except Exception as e:
+                _log(log, 'cua separate window: re-minimise failed: %r' % e)
+        except Exception as e:
+            _log(log, 'cua separate window: send after restore failed: %r' % e)
+    else:
+        time.sleep(0.1)
+        if not _cua_press_key(pid, window_id, 'return', log=log):
+            _restore()
+            return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
+                             reason='cua_press_enter_failed')
+        attempted.append('cua_press_enter')
     _restore()
     dt = time.time() - t0
     _log(log, 'cua separate send completed attempted=%s dt=%.3fs' % (attempted, dt))

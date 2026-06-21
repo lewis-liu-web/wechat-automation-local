@@ -338,6 +338,21 @@ def _read_and_init_config(path) -> dict:
         t.setdefault('reply_template', '')
     return cfg
 
+def _apply_decrypted_dirs(cfg: dict) -> None:
+    """Point module-level decrypted DB paths to the configured directory.
+
+    The monitor may be launched from a checkout directory while config.json
+    points decrypted output elsewhere (e.g. a dedicated data directory).
+    Without this, fetch_new_for_db reads stale local copies.
+    """
+    global DECRYPTED_MESSAGE_DIR, DECRYPTED_CONTACT_DB
+    ddir = cfg.get('decrypted_dir')
+    if not ddir:
+        return
+    dpath = Path(ddir).resolve()
+    DECRYPTED_MESSAGE_DIR = dpath / 'message'
+    DECRYPTED_CONTACT_DB = dpath / 'contact' / 'contact.db'
+
 
 def load_config(path=CONFIG_PATH):
     """Load and initialize wechat_bot_targets.json, cached by mtime.
@@ -878,12 +893,13 @@ def main():
     ap.add_argument('--no-save-state', action='store_true', help='do not write last_local_id back to config')
     ap.add_argument('--sync-on-start', action='store_true', help='run decrypt once before baseline; heavier but refreshes DB')
     ap.add_argument('--sync-each-cycle', action='store_true', help='HEAVY: run decrypt every poll cycle; not recommended')
-    ap.add_argument('--no-fast-refresh', action='store_true', help='disable lightweight target DB refresh each cycle')
+    ap.add_argument('--no-fast-refresh', action='store_true', help='disable lightweight target refresh each cycle')
     ap.add_argument('--fast-refresh-force-start', action='store_true', help='force lightweight refresh before baseline')
     args = ap.parse_args()
 
     config_path = Path(args.config).resolve()
     cfg = load_config(config_path)
+    _apply_decrypted_dirs(cfg)
     interval = float(args.interval if args.interval is not None else cfg.get('poll_interval', 3))
     targets = enabled_targets(cfg)
     log('monitor start targets=%d dbs=%s interval=%.1fs dry_run=%s sync_on_start=%s sync_each_cycle=%s fast_refresh=%s' % (

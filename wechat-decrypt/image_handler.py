@@ -490,7 +490,17 @@ def mmx_recognize_image(image_path: str, prompt: str = "简要的描述一下图
 
     cmd = [mmx_cli, 'vision', 'describe', '--image', image_path, '--prompt', prompt]
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=120, shell=False)
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
+        r = subprocess.run(
+            cmd, capture_output=True, timeout=120, shell=False,
+            startupinfo=startupinfo, creationflags=creationflags,
+        )
         stdout = _decode_cli_output(r.stdout) if r.stdout else ''
         stderr = _decode_cli_output(r.stderr) if r.stderr else ''
         if r.returncode == 0:
@@ -542,7 +552,17 @@ def run_vision_hook(image_path: str, hook_cmd: list[str] | str, timeout: int = 1
         cmd = list(hook_cmd) + [image_path]
 
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=timeout, shell=False)
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
+        r = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, shell=False,
+            startupinfo=startupinfo, creationflags=creationflags,
+        )
         stdout = _decode_cli_output(r.stdout) if r.stdout else ''
         stderr = _decode_cli_output(r.stderr) if r.stderr else ''
         if r.returncode == 0:
