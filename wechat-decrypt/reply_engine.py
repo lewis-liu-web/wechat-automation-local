@@ -24,6 +24,10 @@ import argparse
 import sqlite3
 import shlex
 from typing import Any, Dict, Iterable, List, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
+
 import base64
 import urllib.request
 import urllib.error
@@ -88,6 +92,31 @@ def _call_minimax_vlm(image_path: str, user_prompt: str = "简要的描述一下
     except Exception:
         return None
 
+
+def _prepend_vision_description(raw_text: str, desc: str) -> str:
+    """把图片描述拼接到用户消息前。"""
+    return f"{raw_text or ''}\n\n【系统识别：用户发送了图片，图片内容如下】{desc}".strip()
+
+def _try_llm_vision(image_path: str, raw_text: str) -> str:
+    """本地 VLM 识别图片并返回拼接后的文本（失败返回原文本）。"""
+    desc = _call_minimax_vlm(image_path)
+    if desc:
+        return _prepend_vision_description(raw_text, desc)
+    logger.warning("vision llm_vision failed: %s", image_path)
+    return raw_text
+
+
+def _try_vision_hook(image_path: str, hook_cmd: list[str] | str, raw_text: str) -> str:
+    """调用用户自定义 hook 识别图片并返回拼接后的文本（失败返回原文本）。"""
+    try:
+        from image_handler import run_vision_hook
+        desc = run_vision_hook(image_path, hook_cmd)
+        if desc and not desc.startswith("[Vision Hook Error]"):
+            return _prepend_vision_description(raw_text, desc)
+        logger.warning("vision hook failed: %s", desc)
+    except Exception as e:
+        logger.warning("vision hook exception: %r", e)
+    return raw_text
 
 def _resolve_image_for_message(message: Dict[str, Any], config: Dict[str, Any]) -> str | None:
     """对图片消息解码并调用VLM理解，返回图片描述文本。
@@ -992,7 +1021,18 @@ def _retrieve_getnote_kb(query: str, spec: Dict[str, Any], limit: int) -> List[K
         env["GETNOTE_API_KEY"] = os.environ.get(api_key_env, "")
     timeout = float(spec.get("timeout") or 25)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=env,
+            startupinfo=startupinfo, creationflags=creationflags,
+        )
     except Exception as exc:
         logger.warning("getnote search failed for kb=%s query=%r: %s", kb_id, query, exc)
         return []
@@ -1053,7 +1093,18 @@ def _retrieve_hook_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Know
     env["KB_LIMIT"] = str(per_limit)
     timeout = float(spec.get("timeout") or 25)
     try:
-        proc = subprocess.run([exe], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=env)
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run(
+            [exe], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=env,
+            startupinfo=startupinfo, creationflags=creationflags,
+        )
     except Exception:
         return []
     if proc.returncode != 0 or not (proc.stdout or "").strip():
@@ -1351,9 +1402,17 @@ def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
         # agentmain.py writes task output under <code_root>/temp/<task> and does not support --temp_root.
         # Keep archive/temp_root config for callers that manage files externally, but do not pass it to CLI.
         cmd = [sys.executable, str(agentmain), "--task", task, "--input", input_text, "--llm_no", llm_no]
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
         proc = subprocess.Popen(
             cmd, cwd=str(code_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace"
+            text=True, encoding="utf-8", errors="replace",
+            startupinfo=startupinfo, creationflags=creationflags,
         )
         out_path = code_root / "temp" / task / "output.txt"
         deadline = time.time() + timeout
@@ -1458,6 +1517,13 @@ def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[st
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
+        startupinfo = None
+        creationflags = 0
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            creationflags = subprocess.CREATE_NO_WINDOW
         r = subprocess.run(
             cmd,
             input=stdin_data,
@@ -1467,6 +1533,8 @@ def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[st
             errors="replace",
             timeout=timeout,
             env=env,
+            startupinfo=startupinfo,
+            creationflags=creationflags,
         )
     except Exception:
         return None
@@ -2016,33 +2084,13 @@ def generate_reply(message: Dict[str, Any] | str,
     # image recognition is delegated to the agent; WeChat side only passes paths.
     if image_paths and isinstance(message, dict) and not raw_agent_mode:
         vision_mode = (target.get("vision") or {}).get("mode", "agent_llm")
-        if vision_mode == "agent_llm":
-            # Pass image_paths to provider payload; agent decides how to handle
-            pass
-        elif vision_mode == "llm_vision":
-            # Direct LLM vision call if provider supports it
-            try:
-                from image_handler import mmx_recognize_image
-                desc = mmx_recognize_image(image_paths[0], prompt="简要的描述一下图片内容")
-                if desc and not desc.startswith("[VLM Error]"):
-                    raw_text = f"{raw_text or ''}\n\n【系统识别：用户发送了图片，图片内容如下】{desc}".strip()
-                else:
-                    import logging
-                    logging.getLogger('reply_engine').warning('vision llm_vision failed: %s', desc)
-            except Exception as e:
-                import logging
-                logging.getLogger('reply_engine').warning('vision llm_vision exception: %r', e)
+        if vision_mode == "llm_vision":
+            raw_text = _try_llm_vision(image_paths[0], raw_text)
         elif vision_mode == "hook":
-            # Call user-configured hook command
-            try:
-                from image_handler import run_vision_hook
-                hook_cmd = (target.get("vision") or {}).get("hook_cmd")
-                if hook_cmd and image_paths:
-                    desc = run_vision_hook(image_paths[0], hook_cmd)
-                    if desc and not desc.startswith("[Vision Hook Error]"):
-                        raw_text = f"{raw_text or ''}\n\n【系统识别：用户发送了图片，图片内容如下】{desc}".strip()
-            except Exception:
-                pass
+            hook_cmd = (target.get("vision") or {}).get("hook_cmd")
+            if hook_cmd:
+                raw_text = _try_vision_hook(image_paths[0], hook_cmd, raw_text)
+        # agent_llm (default): image_paths flow into provider payload, agent handles vision
     triggers = target.get("triggers") or config.get("default_triggers") or DEFAULT_TRIGGERS
     clean = strip_triggers(raw_text, triggers)
     mention_name = _extract_mention_name(message)
