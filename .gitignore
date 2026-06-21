@@ -65,7 +65,6 @@ wechat-decrypt/temp/
 update_backup_*/
 remote_update/
 pywechat_probe/
-.omkc/
 
 # Private bot knowledge and chat-derived samples
 wechat-decrypt/wiki/groups/
@@ -86,3 +85,11 @@ tmp*.ai.py
 Thumbs.db
 .vscode/
 .idea/
+
+# Spec workflow and local tool artifacts
+openspec/
+.codegraph/
+.omp/
+.omkc/
+*.kb_index.sqlite
+CLAUDE.md
