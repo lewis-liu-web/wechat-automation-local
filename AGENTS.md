@@ -31,3 +31,13 @@ This workspace is a local WeChat automation/research project. The current produc
 - `docs/`: project notes, status snapshots, design decisions.
 - `pywechat_probe/`, `source_read/`: research/probe material; keep source-like notes, ignore generated artifacts.
 - Runtime outputs, images, logs, DBs, temp replies, backups, caches should stay untracked.
+
+
+## Development vs runtime directories
+
+- `wechat-automation-local/` is the git repository and development workspace.
+- `CD-only/wechat-decrypt/` is the current runtime/test deployment copy.
+- Source of truth is the git repo; deploy by syncing `wechat-decrypt/` to `CD-only/wechat-decrypt/`.
+- Always start `control_api` and `wechat_bot_monitor` from the **runtime directory** (`CD-only/wechat-decrypt/`).
+- Do not manually start the monitor from the git repo directory; otherwise `STOP_FILE`, config paths, and log files drift between the two copies and stop/restart commands fail silently.
+- After code changes: sync to `CD-only`, restart `control_api`, and verify `/status` before asking the user to test the UI.

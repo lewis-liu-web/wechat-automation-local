@@ -173,13 +173,25 @@ class ControlHandler(BaseHTTPRequestHandler):
                 ts=time.time(),
             )
 
+        # ---- helper: wait for monitor process state ----
+        def _wait_for_monitor(running: bool, timeout: float = 30.0, interval: float = 0.5) -> None:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if bool(_monitor_pids()) == running:
+                    break
+                time.sleep(interval)
+
         # ---- monitor control ----
         if method == "POST" and path == "/monitor/start":
             return _call_cli(["start", "--json"])
         if method == "POST" and path == "/monitor/stop":
-            return _call_cli(["stop", "--json"])
+            resp = _call_cli(["stop", "--json"])
+            _wait_for_monitor(running=False, timeout=30.0)
+            return resp
         if method == "POST" and path == "/monitor/restart":
-            return _call_cli(["restart", "--json"])
+            resp = _call_cli(["restart", "--json"])
+            _wait_for_monitor(running=True, timeout=30.0)
+            return resp
 
         # ---- targets ----
         if method == "GET" and path == "/targets":
