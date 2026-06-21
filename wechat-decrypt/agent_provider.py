@@ -783,6 +783,8 @@ class HermesProvider:
             args += ["-q", f"@{prompt_path}"]
         else:
             args += ["-q", "-"]
+        # Non-interactive / embedded mode: suppress TUI/spinner and auto-accept hooks
+        args += ["-Q", "--source", "tool", "--accept-hooks"]
         if self.model:
             args += ["-m", self.model]
         if self.toolsets:
@@ -831,6 +833,9 @@ class HermesProvider:
                 f.write(full_prompt)
                 prompt_file = Path(f.name)
             
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
             proc = subprocess.run(
                 self._args(prompt_path=str(prompt_file)),
                 capture_output=True,
@@ -840,6 +845,7 @@ class HermesProvider:
                 encoding="utf-8",
                 errors="replace",
                 creationflags=_NO_WINDOW_FLAGS,
+                startupinfo=startupinfo,
             )
         except subprocess.TimeoutExpired:
             return AgentResult(False, "timeout", error="hermes chat timed out",
