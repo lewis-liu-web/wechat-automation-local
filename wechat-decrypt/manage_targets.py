@@ -321,10 +321,11 @@ def cmd_stop(json_mode=False):
 
 def cmd_restart(json_mode=False):
     cmd_stop(json_mode=json_mode)
-    waited = 0
-    while _is_monitor_running() and waited < 12:
+    # Wait for the monitor to exit. The monitor only checks STOP_FILE once per
+    # poll cycle (poll_interval seconds), so give it enough headroom.
+    deadline = time.time() + 30
+    while _is_monitor_running() and time.time() < deadline:
         time.sleep(0.5)
-        waited += 1
     return cmd_start(json_mode=json_mode)
 
 

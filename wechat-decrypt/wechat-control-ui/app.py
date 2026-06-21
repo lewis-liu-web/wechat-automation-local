@@ -355,6 +355,7 @@ def _sidebar():
                             st.session_state.status_result = _poll_monitor_status(base, expected_running=False)
                         else:
                             st.error("停止失败：%s" % (res.get("error") or "未知"))
+                        _clear_data_cache()
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("停止失败：%s" % (e,))
@@ -366,6 +367,7 @@ def _sidebar():
                             st.session_state.status_result = _poll_monitor_status(base, expected_running=True)
                         else:
                             st.error("重启失败：%s" % (res.get("error") or "未知"))
+                        _clear_data_cache()
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("重启失败：%s" % (e,))
@@ -378,6 +380,7 @@ def _sidebar():
                             st.session_state.status_result = _poll_monitor_status(base, expected_running=True)
                         else:
                             st.error("启动失败：%s" % (res.get("error") or "未知"))
+                        _clear_data_cache()
                         st.rerun()
                     except ControlAPIError as e:
                         st.error("启动失败：%s" % (e,))
