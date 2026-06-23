@@ -660,17 +660,15 @@ def _load_ljqctrl(cfg: Optional[dict] = None):
                 return mod
         except Exception:
             continue
-    # Auto-discover ljqCtrl from common GA paths before giving up
+    # Auto-discover ljqCtrl from common relative paths before giving up
     import sys
     _script_dir = os.path.dirname(os.path.abspath(__file__))
-    _ga_paths = [
+    _ljqctrl_extra_paths = [
         os.path.join(_script_dir, '../memory'),
         os.path.join(_script_dir, '../../memory'),
         os.path.join(_script_dir, '../../../memory'),
-        'D:/Program Files/GenericAgent/GenericAgent-main/memory',
-        'D:/Program Files/GenericAgent/GenericAgent-sub-wechat/memory',
     ]
-    for _p in _ga_paths:
+    for _p in _ljqctrl_extra_paths:
         _ap = os.path.abspath(_p)
         if _ap not in sys.path and os.path.isdir(_ap):
             sys.path.insert(0, _ap)

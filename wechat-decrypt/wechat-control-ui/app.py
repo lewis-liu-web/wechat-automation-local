@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Streamlit V1 微信机器人控制台。
 
-V1 只与本地 control_api (18590) 通信 — 不直接 import 监听、GenericAgent
-或任何 agent 客户端。换 agent 不影响 UI。
+V1 只与本地 control_api (18590) 通信 — 不直接 import 监听或任何 agent 客户端。
+换 agent 不影响 UI。
 """
 from __future__ import annotations
 
@@ -1244,7 +1244,6 @@ def _send_status_label(value):
 def _provider_label(value):
     return {
         "echo": "安全测试（不调用真实模型）",
-        "genericagent": "真实处理能力（GenericAgent）",
         "hermes": "Hermes 本地 Agent",
     }.get(str(value or ""), str(value or "—"))
 
@@ -1381,21 +1380,8 @@ def _page_agent_jobs():
             for inst in available_instances:
                 iid = str(inst.get("id") or "")
                 label = str(inst.get("label") or inst.get("profile") or iid or "实例")
-                kind = str(inst.get("provider") or inst.get("type") or "genericagent")
-                kind_label = {"genericagent": "GenericAgent", "hermes": "Hermes profile/worker", "echo": "Echo"}.get(kind, kind)
-                source_label = "已配置" if iid in configured_ids else "已发现"
-                options.append(f"{label} · {kind_label} · {source_label} · id={iid}")
-            selected_idx = st.selectbox(
-                "选择 Hermes profile/worker",
-                options=list(range(len(options))),
-                format_func=lambda i: options[i] if 0 <= i < len(options) else "",
-                key="agent_pool_selected",
-            )
-            inst = available_instances[selected_idx] if 0 <= selected_idx < len(available_instances) else None
-            if inst is not None:
-                iid = str(inst.get("id") or "")
-                kind = str(inst.get("provider") or inst.get("type") or "genericagent")
-                kind_label = {"genericagent": "GenericAgent", "hermes": "Hermes profile/worker", "echo": "Echo"}.get(kind, kind)
+                kind = str(inst.get("provider") or inst.get("type") or "hermes")
+                kind_label = {"hermes": "Hermes profile/worker", "echo": "Echo"}.get(kind, kind)
                 bridge = inst.get("bridge_url") or inst.get("bridge_cwd") or inst.get("hermes_home") or "-"
                 extras = []
                 if inst.get("profile"):
@@ -1509,7 +1495,7 @@ def _page_agent_jobs():
     with st.form("agent_test_job_form"):
         prompt = st.text_area("测试内容", value="请用一句话说明今天上海天气适合穿什么", height=90)
         fc1, fc2, fc3, fc4 = st.columns(4)
-        provider = fc1.selectbox("测试模式", ["echo", "genericagent", "hermes"], format_func=_provider_label, key="agent_test_provider")
+        provider = fc1.selectbox("测试模式", ["echo", "hermes"], format_func=_provider_label, key="agent_test_provider")
         group_key = fc2.text_input("测试分组", value="manual-test", help="用于区分不同批次测试，可不改。")
         sender = fc3.text_input("操作人", value="tester")
         enabled_targets = [t for t in (st.session_state.get("targets_all") or []) if t.get("enabled")]
@@ -1538,7 +1524,7 @@ def _page_agent_jobs():
     with st.expander("高级操作：立即处理一次", expanded=False):
         st.caption("用于排查“任务已创建但没有自动处理”的情况。普通使用无需操作。只执行一次处理检查，不会持续后台运行。")
         wc1, wc2, wc3 = st.columns([1, 1, 2])
-        worker_provider = wc1.selectbox("处理模式", ["echo", "genericagent", "hermes"], format_func=_provider_label, key="agent_worker_provider")
+        worker_provider = wc1.selectbox("处理模式", ["echo", "hermes"], format_func=_provider_label, key="agent_worker_provider")
         one_shot_timeout = wc2.number_input("最长等待时间", min_value=3, max_value=600, value=240, step=1, key="agent_worker_once_timeout")
         if wc3.button("立即处理一次", use_container_width=True, key="agent_worker_once"):
             try:
@@ -1616,7 +1602,7 @@ def _page_agent_jobs():
         if abnormal_jobs:
             st.markdown("---")
             st.markdown("**异常任务（可恢复、忽略或补发）**")
-            st.caption('拉取结果会从 GenericAgent 历史会话里找回超时后完成的回复；忽略后任务状态会变为"已取消"。')
+            st.caption('拉取结果会从 agent 历史会话里找回超时后完成的回复；忽略后任务状态会变为"已取消"。')
             if st.button("一键忽略全部异常任务", key="dismiss_all_abnormal", type="secondary"):
                 job_ids = [int(j["id"]) for j in abnormal_jobs if j.get("id")]
                 res = dismiss_jobs_batch(job_ids, base_url=base)

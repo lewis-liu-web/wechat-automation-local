@@ -149,8 +149,8 @@ python wiki_dry_run.py --target "群组名称" --query "如何申请权限？"
       "wiki": "product-docs",
       "reply_engine": {
         "provider": "command",
-        "cmd": ["python", "genericagent_command_bridge.py"],
-        "input_format": "json",
+        "cmd": ["hermes", "chat", "-q", "{prompt}"],
+        "input_format": "plain",
         "timeout": 120
       }
     }

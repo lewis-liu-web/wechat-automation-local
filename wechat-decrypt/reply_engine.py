@@ -1230,7 +1230,7 @@ def _clean_agent_output(text: str) -> str:
     text = text or ""
     text = text.replace("[ROUND END]", "")
     text = re.sub(r"<summary>[\s\S]*?</summary>", "", text).strip()
-    # GenericAgent may include planning/prose before the final WeChat reply,
+    # Agent output may include planning/prose before the final WeChat reply,
     # e.g. "Since ... I'll give ... @张三 正文". Prefer the last @-reply span.
     mention_spans = list(re.finditer(r"@[\w\-\u4e00-\u9fff]+\s+[^\n]+", text))
     from_mention = False
@@ -1249,203 +1249,7 @@ def _clean_agent_output(text: str) -> str:
     return " ".join(useful).strip() if from_mention else " ".join(useful[-3:]).strip()
 
 
-_LOCAL_LLM_CLIENTS: Dict[str, Any] = {}
-_LOCAL_LLM_LOCK = threading.Lock()
 
-
-def _resolve_code_root(config: Dict[str, Any]) -> Path | None:
-    """Resolve external agent runtime root used to import llmcore in-process."""
-    cfg_root = config.get("code_root")
-    if cfg_root:
-        p = Path(cfg_root).expanduser().resolve()
-        return p if p.exists() else None
-    # Attempt to locate via the wechat-auto CLI entry point (pip-installed)
-    try:
-        import shutil
-        exe = shutil.which("wechat-auto")
-        if exe:
-            p = Path(exe).resolve().parent
-            # If installed in Scripts/ or bin/, go up one level
-            if p.name.lower() in ("scripts", "bin"):
-                p = p.parent
-            return p if p.exists() else None
-    except Exception:
-        pass
-    # Project root detection fallback: two levels up from this file.
-    p = Path(__file__).resolve().parents[2]
-    return p if p.exists() else None
-
-
-def _load_local_llm_client(config: Dict[str, Any]):
-    """Build one GenericAgent llmcore client without spawning agentmain/subagent."""
-    code_root = _resolve_code_root(config)
-    if code_root is None:
-        return None
-    cache_key = f"{code_root}|{config.get('llm_no', 0)}"
-    with _LOCAL_LLM_LOCK:
-        cached = _LOCAL_LLM_CLIENTS.get(cache_key)
-        if cached is not None:
-            return cached
-        llmcore_path = code_root / "llmcore.py"
-        if not llmcore_path.exists():
-            return None
-        root_str = str(code_root)
-        if root_str not in sys.path:
-            sys.path.insert(0, root_str)
-        try:
-            from llmcore import (  # type: ignore
-                reload_mykeys, LLMSession, ToolClient, ClaudeSession, MixinSession,
-                NativeToolClient, NativeClaudeSession, NativeOAISession,
-            )
-            mykeys, _changed = reload_mykeys()
-            sessions: List[Any] = []
-            for key, cfg in mykeys.items():
-                if not any(x in key for x in ["api", "config", "cookie"]):
-                    continue
-                try:
-                    if "native" in key and "claude" in key:
-                        sessions.append(NativeToolClient(NativeClaudeSession(cfg=cfg)))
-                    elif "native" in key and "oai" in key:
-                        sessions.append(NativeToolClient(NativeOAISession(cfg=cfg)))
-                    elif "claude" in key:
-                        sessions.append(ToolClient(ClaudeSession(cfg=cfg)))
-                    elif "oai" in key:
-                        sessions.append(ToolClient(LLMSession(cfg=cfg)))
-                    elif "mixin" in key:
-                        sessions.append({"mixin_cfg": cfg})
-                except Exception:
-                    continue
-            for i, sess in enumerate(list(sessions)):
-                if isinstance(sess, dict) and "mixin_cfg" in sess:
-                    try:
-                        mixin = MixinSession(sessions, sess["mixin_cfg"])
-                        if isinstance(mixin._sessions[0], (NativeClaudeSession, NativeOAISession)):
-                            sessions[i] = NativeToolClient(mixin)
-                        else:
-                            sessions[i] = ToolClient(mixin)
-                    except Exception:
-                        sessions[i] = None
-            sessions = [s for s in sessions if s is not None and not isinstance(s, dict)]
-            if not sessions:
-                return None
-            llm_no = int(config.get("llm_no", 0) or 0)
-            client = sessions[llm_no % len(sessions)]
-            _LOCAL_LLM_CLIENTS[cache_key] = client
-            return client
-        except Exception:
-            return None
-
-
-def _call_local_llm_provider(prompt: str, config: Dict[str, Any]) -> str | None:
-    provider = str(config.get("provider") or "").lower()
-    if provider and provider not in {"genericagent_local", "genericagent_llmcore", "genericagent_subagent"}:
-        return None
-    client = _load_local_llm_client(config)
-    if client is None:
-        return None
-    input_text = (
-        "你是群聊小助手。请根据下面的群消息、本地wiki片段和边界约束，"
-        "只输出一段可以直接发送到微信群的中文回复；不要解释过程，不要使用工具，不要写summary。\n\n"
-        + prompt
-    )
-    messages = [{"role": "user", "content": input_text}]
-    timeout = float(config.get("llm_timeout", 120))
-    result = {"resp": None, "done": False, "error": None}
-
-    def _consume():
-        try:
-            gen = client.chat(messages, tools=[])
-            try:
-                while True:
-                    next(gen)
-            except StopIteration as e:
-                result["resp"] = e.value
-            except Exception as e:
-                result["error"] = e
-        except Exception as e:
-            result["error"] = e
-        result["done"] = True
-
-    t = threading.Thread(target=_consume, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-
-    if not result["done"]:
-        return None
-    if result["error"]:
-        return None
-    resp = result.get("resp")
-    if resp is not None and getattr(resp, "content", None):
-        return postcheck(str(resp.content).strip())
-    return None
-
-
-def _call_subagent_provider(prompt: str, config: Dict[str, Any]) -> str | None:
-    if not config.get("use_subagent", False):
-        return None
-    code_root = _resolve_code_root(config)
-    if code_root is None:
-        return None
-    agentmain = code_root / "agentmain.py"
-    if not agentmain.exists():
-        return None
-    task_prefix = str(config.get("subagent_task_prefix") or "wechat_reply")
-    task = f"{task_prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-    llm_no = str(config.get("llm_no", 1))
-    timeout = float(config.get("llm_timeout", 120))
-    input_text = (
-        "你是群聊小助手。请根据下面的群消息、本地wiki片段和边界约束，"
-        "只输出一段可以直接发送到微信群的中文回复；不要解释过程，不要使用工具，不要写summary。\n\n"
-        + prompt
-    )
-    try:
-        # agentmain.py writes task output under <code_root>/temp/<task> and does not support --temp_root.
-        # Keep archive/temp_root config for callers that manage files externally, but do not pass it to CLI.
-        cmd = [sys.executable, str(agentmain), "--task", task, "--input", input_text, "--llm_no", llm_no]
-        startupinfo = None
-        creationflags = 0
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creationflags = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.Popen(
-            cmd, cwd=str(code_root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            startupinfo=startupinfo, creationflags=creationflags,
-        )
-        out_path = code_root / "temp" / task / "output.txt"
-        deadline = time.time() + timeout
-        polled = False
-        while time.time() < deadline:
-            time.sleep(0.5)
-            if out_path.exists():
-                polled = True
-                text = out_path.read_text(encoding="utf-8", errors="replace")
-                if "[ROUND END]" in text:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                    return _clean_agent_output(text)
-        # timeout: gracefully terminate
-        if not polled and proc.poll() is None:
-            # maybe output not created yet, fallback to stdout on quick failure
-            try:
-                out, err = proc.communicate(timeout=10)
-                return _clean_agent_output(out) if out and out.strip() else None
-            except Exception:
-                pass
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-        if out_path.exists():
-            text = out_path.read_text(encoding="utf-8", errors="replace")
-            if text.strip():
-                return _clean_agent_output(text)
-    except Exception:
-        return None
-    return None
 
 
 def _extract_command_reply(out: str) -> str | None:
@@ -1478,8 +1282,8 @@ def _extract_command_reply(out: str) -> str | None:
 def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
     """Call an external agent app through a tiny stdin/stdout protocol.
 
-    This is the product-friendly path for users who already have OpenClaw,
-    Hermes, GenericAgent, or any other agent app configured with its own LLM.
+    This is the product-friendly path for users who already have
+    Hermes or any other agent app configured with its own LLM.
 
     Supported config:
       provider: "command"
@@ -1591,165 +1395,11 @@ def _post_http_agent_body(config: Dict[str, Any], body: Dict[str, Any]) -> Dict[
         return None
 
 
-def _genericagent_bridge_request(method: str, url: str, body: Dict[str, Any] | None = None, timeout: float = 30) -> Dict[str, Any] | None:
-    data = json.dumps(body or {}, ensure_ascii=False).encode("utf-8") if body is not None else None
-    headers = {"Accept": "application/json"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_body = resp.read().decode("utf-8", errors="replace")
-            if not resp_body:
-                return {}
-            parsed = json.loads(resp_body)
-            return parsed if isinstance(parsed, dict) else {"value": parsed}
-    except Exception as e:
-        import logging
-        logging.getLogger("reply_engine").warning("genericagent_bridge request failed %s %s: %r", method, url, e)
-        return None
-
-
-def _last_assistant_message(messages: List[Dict[str, Any]], min_id: int = 0) -> Dict[str, Any] | None:
-    for msg in reversed(messages or []):
-        try:
-            msg_id = int(msg.get("id") or 0)
-        except Exception:
-            msg_id = 0
-        if msg.get("role") == "assistant" and msg_id > min_id:
-            return msg
-    return None
-
-
-def _json_safe(value: Any) -> Any:
-    seen: set[int] = set()
-
-    def _convert(item: Any) -> Any:
-        if isinstance(item, (bytes, bytearray)):
-            return f"<bytes {len(item)}>"
-        if isinstance(item, dict):
-            oid = id(item)
-            if oid in seen:
-                return "<circular>"
-            seen.add(oid)
-            try:
-                return {str(k): _convert(v) for k, v in item.items()}
-            finally:
-                seen.discard(oid)
-        if isinstance(item, (list, tuple)):
-            oid = id(item)
-            if oid in seen:
-                return ["<circular>"]
-            seen.add(oid)
-            try:
-                return [_convert(v) for v in item]
-            finally:
-                seen.discard(oid)
-        return item
-
-    return _convert(value)
-
-
-
-
-def _load_skill_prompt(skill_name: str | None = None) -> str:
-    """Load a project-local skill prompt by name."""
-    name = skill_name or "wechat_task"
-    try:
-        from skills import load_skill
-        return load_skill(name)
-    except Exception:
-        return ""
-
-
-def _knowledge_hits_to_payload(hits: List[Any]) -> List[Dict[str, Any]]:
-    """Convert KnowledgeHit objects or tuples to serializable dicts."""
-    out: List[Dict[str, Any]] = []
-    for h in hits:
-        if isinstance(h, KnowledgeHit):
-            out.append({
-                "source": h.source,
-                "kb_id": h.kb_id,
-                "scope": h.scope,
-                "rel_path": h.rel_path,
-                "label": h.label,
-                "score": h.score,
-                "content": h.content,
-            })
-        elif isinstance(h, (list, tuple)) and len(h) >= 2:
-            out.append({"source": "local", "kb_id": "", "rel_path": str(h[0]), "label": str(h[0]), "content": str(h[1])})
-        else:
-            out.append({"source": "unknown", "kb_id": "", "rel_path": "", "label": str(h), "content": str(h)})
-    return out
-
-def _call_genericagent_bridge(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
-    """Use GenericAgent's existing frontends/desktop_bridge.py HTTP API.
-
-    Bridge contract:
-      POST /session/new -> {sessionId}
-      POST /session/{sid}/prompt -> {accepted, userMessageId}
-      GET  /session/{sid}/messages -> assistant message list
-    """
-    base_url = str(config.get("bridge_url") or config.get("agent_url") or "http://127.0.0.1:14168").rstrip("/")
-    timeout = float(config.get("agent_timeout", config.get("bridge_timeout", 60)))
-    poll_interval = float(config.get("bridge_poll_interval", 1.0))
-    max_wait = float(config.get("bridge_max_wait", timeout))
-    cwd = config.get("bridge_cwd") or config.get("cwd")
-
-    session_id = str(config.get("bridge_session_id") or "").strip()
-    if not session_id:
-        session_body = {"cwd": cwd} if cwd else {}
-        created = _genericagent_bridge_request("POST", f"{base_url}/session/new", session_body, timeout=timeout)
-        session_id = str((created or {}).get("sessionId") or "")
-    if not session_id:
-        return None
-
-    rich_prompt = prompt
-    if payload:
-        payload = _json_safe(payload)
-        rich_prompt = (
-            f"{prompt}\n\n"
-            "[WECHAT_RAW_PAYLOAD_JSON]\n"
-            f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
-            "[/WECHAT_RAW_PAYLOAD_JSON]"
-        )
-
-    submitted = _genericagent_bridge_request(
-        "POST",
-        f"{base_url}/session/{session_id}/prompt",
-        {"prompt": rich_prompt},
-        timeout=timeout,
-    )
-    if not submitted or submitted.get("accepted") is not True:
-        return None
-    try:
-        user_msg_id = int(submitted.get("userMessageId") or submitted.get("seq") or 0)
-    except Exception:
-        user_msg_id = 0
-
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        time.sleep(max(0.2, poll_interval))
-        data = _genericagent_bridge_request(
-            "GET",
-            f"{base_url}/session/{session_id}/messages?after={user_msg_id}&limit=20",
-            None,
-            timeout=min(timeout, 10),
-        )
-        assistant_msg = _last_assistant_message((data or {}).get("messages") or [], min_id=user_msg_id)
-        if assistant_msg:
-            content = str(assistant_msg.get("content") or "").strip()
-            return content or None
-    return None
-
-
 def _call_http_agent(prompt: str, config: Dict[str, Any], payload: Dict[str, Any] | None = None) -> str | None:
     """Call an external agent via HTTP POST.
 
     This is the product-friendly path for users who already have
-    OpenClaw, Hermes, GenericAgent, or any other agent app running
-    with an HTTP endpoint.
-
+    Hermes or any other agent app running with an HTTP endpoint.
     Supported config:
       provider: "http_agent"
       agent_url: "http://localhost:8000/chat"
@@ -1826,21 +1476,6 @@ def call_llm_provider(prompt: str, config: Dict[str, Any] | None = None, payload
             return postcheck(http_reply)
         return None
 
-    if provider == "genericagent_bridge":
-        bridge_reply = _call_genericagent_bridge(prompt, config, payload)
-        if bridge_reply:
-            return postcheck(_clean_agent_output(bridge_reply))
-        return None
-
-    # Existing GA in-process adapter stays available as just another agent app.
-    local = _call_local_llm_provider(prompt, config)
-    if local:
-        return local
-    # Backward-compatible escape hatch only; sub-wechat should not spawn subagent during normal replies.
-    if config.get("allow_subagent_fallback", False):
-        sub = _call_subagent_provider(prompt, config)
-        if sub:
-            return sub
     # Legacy command fallback for older configs without provider="command".
     cmd_reply = _call_command_provider(prompt, config, payload)
     if cmd_reply:
@@ -1896,11 +1531,6 @@ def _extract_mention_name(message: Dict[str, Any] | str) -> str:
         raw = str(message.get("message_content") or message.get("content") or "")
     else:
         raw = str(message or "")
-    # Group messages in decrypted DB commonly start with: sender:\ncontent.
-    m = re.match(r"^([^:\n]{1,80}):\n", raw)
-    if m:
-        return m.group(1).strip().lstrip("@")
-    return ""
 
 
 

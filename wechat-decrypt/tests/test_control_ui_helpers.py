@@ -27,6 +27,5 @@ def test_send_status_label_maps_known_status():
 
 def test_provider_label_maps_known_providers():
     assert app._provider_label("echo") == "安全测试（不调用真实模型）"
-    assert app._provider_label("genericagent") == "真实处理能力（GenericAgent）"
     assert app._provider_label("hermes") == "Hermes 本地 Agent"
     assert app._provider_label("unknown") == "unknown"

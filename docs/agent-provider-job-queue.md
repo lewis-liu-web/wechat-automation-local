@@ -27,7 +27,7 @@ The product should treat agent apps as scarce execution resources, like employee
 WeChat listener -> job board -> dispatcher -> available agent worker -> result -> WeChat send
 ```
 
-This is inspired by GenericAgent's agent team worker / BBS idea, but we should not copy its natural-language claiming flow directly. We need product-owned state, locks, timeouts, and send guarantees.
+This is inspired by multi-agent task-board patterns, but we should not copy a natural-language claiming flow directly. We need product-owned state, locks, timeouts, and send guarantees.
 
 ## Non-goals
 
@@ -65,7 +65,7 @@ All deep-agent jobs carry a project-local skill prompt that defines the WeChat t
 - Loaded at runtime by `reply_engine._load_skill_prompt()` and injected into the job payload as `skill_name` and `skill_prompt`.
 - The provider's `_build_wechat_deep_prompt()` places the skill text at the top of the agent prompt.
 
-This keeps agent behavior consistent across GenericAgent bridge and Hermes CLI providers without changing external agent code.
+This keeps agent behavior consistent across provider implementations (Hermes CLI) without changing external agent code.
 
 ## Knowledge Context in Job Payload
 
@@ -96,6 +96,7 @@ Deep-agent job payloads produced by `reply_engine.generate_reply()` include:
 | `context_messages` | list | Recent group chat context |
 | `mention_name` | str | Sender to prefix in final reply |
 | `target` | dict | Target id/name/username/table |
+
 Free mode should mean "complex tasks may upgrade to deep agents", not "all messages go to a general agent".
 
 ## User Experience Contract
@@ -194,7 +195,7 @@ If affected rows is `0`, another worker already claimed it.
 
 ## AgentProvider Interface
 
-Business code should depend on a provider protocol, not on GenericAgent, Hermes, OpenClaw, or any concrete app.
+Business code should depend on a provider protocol, not on Hermes, OpenClaw, or any concrete app.
 
 Minimal interface:
 
@@ -228,8 +229,8 @@ Suggested result shape:
   "reply_text": "@用户 分析结论是……",
   "error": "",
   "latency": 12.3,
-  "provider": "genericagent",
-  "worker_id": "ga-1"
+  "provider": "hermes",
+  "worker_id": "hermes-wechat-bot-worker1"
 }
 ```
 
@@ -241,38 +242,24 @@ Provider result rules:
 
 ## Provider Roadmap
 
-### M1: GenericAgentProvider
+### M1: HermesProvider
 
-Use the current GenericAgent bridge as the first provider because it already exists in the environment.
+Use Hermes as the first concrete provider.
 
 Scope:
 
-- health check against `desktop_bridge.py`.
-- run one deep job with fixed WeChat reply prompt/protocol.
+- health check against Hermes CLI / profile list.
+- run one deep job with the fixed WeChat reply prompt/protocol.
+- support text jobs first, then image jobs.
 - clean output and enforce `postcheck`.
 - timeout and failure reporting.
 - worker count starts at `1`.
 
-Do not rely on GenericAgent team BBS for product state in M1. The BBS idea is useful, but job state belongs to wechat-auto.
+Do not rely on a multi-agent BBS for product state in M1. The task-board idea is useful, but job state belongs to wechat-auto.
 
-### M2: HermesProvider
+### M2: Provider Pool
 
-Add Hermes after the queue/provider boundary is stable.
-
-Probe requirements:
-
-- health check.
-- run text job.
-- run image job.
-- timeout/cancel behavior.
-- structured result or reliable text extraction.
-- multiple instance support and isolation behavior.
-
-If Hermes has stronger multi-instance support, it can become the default deep provider later.
-
-### M3: Provider Pool
-
-Add provider worker pool only after metrics show need.
+Add a provider worker pool only after metrics show need.
 
 Start with:
 
@@ -288,7 +275,7 @@ deep_worker_count = 2
 
 Do not scale by group count. Scale by queue pressure, timeout rate, and worker utilization.
 
-### M4: Lanes
+### M3: Lanes
 
 Split by capability when needed:
 
@@ -298,11 +285,11 @@ deep_llm_lane: image, chart, summary, analysis
 desktop_lane: real desktop/browser/clipboard tasks, concurrency = 1
 ```
 
-### M5: Async Dispatch / Poll / Send
+### M4: Async Dispatch / Poll / Send
 
-Decision: after multi-agent worker pool is available, move GenericAgent production execution away from synchronous `run()` waiting and into a three-stage asynchronous flow.
+Decision: after the provider worker pool is available, move production execution away from synchronous `run()` waiting and into a three-stage asynchronous flow.
 
-Why: local timeouts only stop the WeChat project's waiting loop. They do not stop GenericAgent's actual run, so a timed-out job may still consume external agent resources and may later produce a valid result. The product should therefore treat GenericAgent as an external executor that is submitted to, polled, and reconciled, not as a blocking function call.
+Why: local timeouts only stop the WeChat project's waiting loop. They do not stop Hermes' actual run, so a timed-out job may still consume external agent resources and may later produce a valid result. The product should therefore treat Hermes as an external executor that is submitted to, polled, and reconciled, not as a blocking function call.
 
 Recommended flow:
 
@@ -328,16 +315,16 @@ Stage ownership:
 
 | Stage | Responsibility | User impact |
 | --- | --- | --- |
-| dispatcher | claim queued jobs, submit to GenericAgent, store external refs, then release local worker quickly | local queue is not blocked by long agent runs |
-| reconciler | poll submitted/running external sessions, extract final reply, update `result_text` | late GenericAgent results become visible and recoverable |
+| dispatcher | claim queued jobs, submit to Hermes, store external refs, then release local worker quickly | local queue is not blocked by long agent runs |
+| reconciler | poll submitted/running external sessions, extract final reply, update `result_text` | late Hermes results become visible and recoverable |
 | sender | scan `done + send_status=pending`, atomically send to WeChat, mark sent/send_failed | sending is separated from agent success/failure |
 
 Suggested additional fields:
 
 | Field | Purpose |
 | --- | --- |
-| `external_provider` | selected external executor, e.g. `genericagent` |
-| `external_session_id` | GenericAgent `sessionId` |
+| `external_provider` | selected external executor, e.g. `hermes` |
+| `external_session_id` | Hermes `sessionId` |
 | `external_user_msg_id` | prompt message id, used to find later assistant output |
 | `external_status` | submitted/running/done/failed/cancelled/unknown |
 | `submitted_at` | external submit time |
@@ -358,12 +345,12 @@ poll(external_session_id, external_user_msg_id) -> { status, reply_text, result_
 cancel(external_session_id) -> bool
 ```
 
-Concurrency rules must still count external in-flight jobs. Releasing the local worker after `submit()` must not mean unlimited GenericAgent prompts. Initial defaults:
+Concurrency rules must still count external in-flight jobs. Releasing the local worker after `submit()` must not mean unlimited Hermes prompts. Initial defaults:
 
 ```text
 global_external_concurrency = 1
 per_group_external_concurrency = 1
-each job gets its own GenericAgent session
+each job gets its own Hermes session
 ```
 
 Timeout semantics:
@@ -375,17 +362,17 @@ Timeout semantics:
 Minimal implementation order:
 
 1. Add fields and keep the current synchronous worker for compatibility.
-2. Implement `GenericAgentProvider.submit()` and `poll()` while preserving `run()` for smoke tests.
+2. Implement `HermesProvider.submit()` and `poll()` while preserving `run()` for smoke tests.
 3. Add dispatcher `run-once`: `queued -> dispatching -> submitted`.
 4. Add reconciler `run-once`: `submitted/agent_running -> done/failed/expired`.
 5. Add sender `run-once`: `done + pending -> sent/send_failed`.
-6. Replace the current synchronous GenericAgent worker loop with dispatcher + reconciler + sender loops.
+6. Replace the current synchronous provider worker loop with dispatcher + reconciler + sender loops.
 
 This avoids desktop resource conflicts while allowing non-desktop deep tasks to scale.
 
-## GenericAgent Team Worker Lessons
+## Agent Worker / Task Board Lessons
 
-GenericAgent has a useful BBS/mapreduce pattern:
+Multi-agent task-board patterns have a useful map/reduce flow:
 
 ```text
 BBS posts -> workers poll -> worker claims -> worker executes -> worker posts result
@@ -407,7 +394,7 @@ Things not to copy directly for WeChat product execution:
 - result posts need parsing and can include reports/logs.
 - it does not know WeChat group ordering, message ids, send confirmation, or wrong-group risk.
 
-If we later build `GenericAgentTeamProvider`, use BBS only as the external agent communication channel. Keep `agent_jobs.sqlite` as the product source of truth.
+If we later build a `TeamAgentProvider`, use BBS only as the external agent communication channel. Keep `agent_jobs.sqlite` as the product source of truth.
 
 ## Safety
 
@@ -474,11 +461,11 @@ Events to log:
 
 - Route smalltalk and safety locally.
 - Route image/chart/summary/free-analysis requests to `deep_agent` jobs.
-- Keep current inline GenericAgent path as fallback during migration.
+- Keep the current inline agent path as fallback during migration.
 
-### Step 3: GenericAgentProvider
+### Step 3: HermesProvider
 
-- Move current bridge call into provider module.
+- Move the current Hermes CLI bridge call into the provider module.
 - Use a strict WeChat reply prompt.
 - Enforce timeout and output cleaning.
 
@@ -504,19 +491,18 @@ Events to log:
 ```json
 {
   "agent_provider": {
-    "default": "genericagent",
+    "default": "hermes",
     "fallback": [],
     "deep_worker_count": 1,
     "per_group_concurrency": 1,
     "ack_after_seconds": 6,
     "deep_task_timeout": 90,
     "providers": {
-      "genericagent": {
-        "enabled": true,
-        "bridge_url": "http://127.0.0.1:14168"
-      },
       "hermes": {
-        "enabled": false
+        "enabled": true,
+        "cli_path": "hermes",
+        "hermes_home": "${HERMES_HOME}",
+        "profile": "wechat-bot-worker1"
       }
     }
   }
@@ -536,7 +522,7 @@ Events to log:
 Implement in this order:
 
 1. `agent_jobs.sqlite` + dispatcher state machine.
-2. GenericAgent provider as the first concrete provider.
+2. Hermes provider as the first concrete provider.
 3. Same-group serial + global deep concurrency of `1`.
 4. Ack/timeout UX.
 5. Control UI visibility.

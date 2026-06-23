@@ -374,12 +374,12 @@ def dismiss_jobs_batch(job_ids: List[int], base_url: str = DEFAULT_BASE_URL) -> 
 
 def recover_job_result(job_id: int, send: bool = False,
                        base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
-    """Recover a late GenericAgent result, optionally send it back to WeChat."""
+    """Recover a late agent result, optionally send it back to WeChat."""
     return _request("POST", "/agent/jobs/%d/recover-result" % job_id,
                     base_url=base_url, body={"send": bool(send)}, timeout=30)
 
 
-def agent_provider_health(provider: str = "genericagent",
+def agent_provider_health(provider: str = "hermes",
                           instance_id: Optional[str] = None,
                           base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     params: Dict[str, Any] = {"provider": provider}

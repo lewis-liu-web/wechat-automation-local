@@ -11,7 +11,7 @@ WeChat Automation Local connects to the decrypted local WeChat database, listens
 - **Receive**: Incremental polling of the decrypted local WeChat database (`wechat-decrypt/wechat_bot_monitor.py`). This is faster and more complete than UI Automation polling, especially for multi-target monitoring and historical context.
 - **Decide**: Per-target triggers, default triggers, category filters, and reply mode selection.
 - **Retrieve**: Bind local Markdown wikis, online knowledge bases, or custom hooks to individual targets.
-- **Generate**: Template/rule replies, LLM providers, or local agent workers (GenericAgent, Hermes, echo test provider).
+- **Generate**: Template/rule replies, LLM providers, or local agent workers (Hermes, echo test provider).
 - **Send**: Foreground WeChat automation with OCR, search, clipboard/Enter, and physical click fallback paths.
 
 ## Key features

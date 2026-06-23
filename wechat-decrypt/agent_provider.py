@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Agent provider protocol and first GenericAgent bridge implementation.
+"""Agent provider protocol and Hermes CLI implementation.
 
-This module is the provider boundary for deep WeChat jobs.  It does not enqueue
+This module is the provider boundary for deep WeChat jobs. It does not enqueue
 or send WeChat messages; callers pass a job payload and receive a structured
 result that can be post-checked and sent by the product layer.
 """
@@ -415,278 +415,6 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
     )
 
 
-class GenericAgentProvider:
-    """Provider backed by GenericAgent's desktop_bridge.py HTTP API."""
-
-    name = "genericagent"
-
-    def __init__(self, bridge_url: str = "http://127.0.0.1:14168",
-                 bridge_cwd: str | None = None,
-                 session_id: str | None = None,
-                 poll_interval: float = 1.0,
-                 worker_id: str = "genericagent-bridge-1") -> None:
-        self.bridge_url = str(bridge_url or "http://127.0.0.1:14168").rstrip("/")
-        self.bridge_cwd = bridge_cwd
-        self.session_id = (session_id or "").strip()
-        self.poll_interval = max(0.2, float(poll_interval or 1.0))
-        self.worker_id = worker_id
-
-    def health(self) -> ProviderHealth:
-        try:
-            data = _http_json("GET", f"{self.bridge_url}/status", None, timeout=5) or {}
-            ready = bool(data.get("ready"))
-            return ProviderHealth(ok=ready, provider=self.name, ready=ready,
-                                  workers=1 if ready else 0, raw=data)
-        except Exception as e:
-            return ProviderHealth(ok=False, provider=self.name, ready=False, error=repr(e), workers=0)
-
-    def list_workers(self) -> List[WorkerStatus]:
-        h = self.health()
-        status = "idle" if h.ok else "unavailable"
-        return [WorkerStatus(worker_id=self.worker_id, provider=self.name, status=status)]
-
-    def _ensure_session(self, timeout: float) -> str:
-        if self.session_id:
-            return self.session_id
-        body = {"cwd": self.bridge_cwd} if self.bridge_cwd else {}
-        created = _http_json("POST", f"{self.bridge_url}/session/new", body, timeout=timeout) or {}
-        sid = str(created.get("sessionId") or "")
-        if not sid:
-            raise RuntimeError("GenericAgent bridge did not return sessionId")
-        return sid
-
-    def run(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
-        t0 = time.time()
-        max_wait = max(1.0, float(timeout or job.get("timeout") or 90))
-        raw_payload = job.get("payload")
-        payload_for_timeout = raw_payload if isinstance(raw_payload, dict) else {}
-        if payload_for_timeout.get("image_paths"):
-            max_wait = max(max_wait, 240.0)
-        try:
-            session_id = self._ensure_session(timeout=min(max_wait, 30))
-            payload = dict(job)
-            payload["payload"] = _json_safe(payload.get("payload") or {})
-            prompt = _build_wechat_deep_prompt(payload)
-            rich_prompt = (
-                f"{prompt}\n\n"
-                "[WECHAT_AGENT_JOB_JSON]\n"
-                f"{json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)}\n"
-                "[/WECHAT_AGENT_JOB_JSON]"
-            )
-            submitted = _http_json(
-                "POST",
-                f"{self.bridge_url}/session/{urllib.parse.quote(session_id)}/prompt",
-                {"prompt": rich_prompt},
-                timeout=min(max_wait, 30),
-            ) or {}
-            if submitted.get("accepted") is not True:
-                return AgentResult(False, "failed", error="GenericAgent bridge rejected job",
-                                   latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                                   raw=submitted)
-            try:
-                user_msg_id = int(submitted.get("userMessageId") or submitted.get("seq") or 0)
-            except Exception:
-                user_msg_id = 0
-            bridge_meta = {"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id}
-
-            deadline = time.time() + max_wait
-            last_data: Dict[str, Any] | None = None
-            while time.time() < deadline:
-                time.sleep(self.poll_interval)
-                data = _http_json(
-                    "GET",
-                    f"{self.bridge_url}/session/{urllib.parse.quote(session_id)}/messages?after={user_msg_id}&limit=20",
-                    None,
-                    timeout=min(max_wait, 10),
-                ) or {}
-                last_data = data
-                assistant_msg = _last_assistant_message(data.get("messages") or [], min_id=user_msg_id)
-                if assistant_msg:
-                    content = str(assistant_msg.get("content") or "").strip()
-                    reply = postcheck(_clean_agent_output(content))
-                    if not reply:
-                        return AgentResult(False, "failed", error="agent returned no sendable reply",
-                                            latency=time.time() - t0, provider=self.name,
-                                           worker_id=self.worker_id, raw={**bridge_meta, "assistant": assistant_msg})
-                    return AgentResult(True, "done", reply_text=reply, latency=time.time() - t0,
-                                        provider=self.name, worker_id=self.worker_id,
-                                       raw={**bridge_meta, "assistant": assistant_msg})
-            return AgentResult(False, "timeout", error="agent timed out",
-                                latency=time.time() - t0, provider=self.name,
-                               worker_id=self.worker_id, raw={**bridge_meta, "last_data": last_data or {}})
-        except (urllib.error.URLError, TimeoutError) as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-        except Exception as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-
-    def recover(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
-        """Recover a completed bridge reply for a job that timed out locally."""
-        t0 = time.time()
-        wait = max(1.0, float(timeout or 10))
-        raw_payload = job.get("payload")
-        payload: Dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
-        job_id = int(job.get("id") or 0)
-        job_key = str(job.get("job_key") or "")
-        session_id = str(payload.get("bridge_session_id") or "").strip()
-        try:
-            user_msg_id = int(payload.get("bridge_user_msg_id") or 0)
-        except Exception:
-            user_msg_id = 0
-
-        try:
-            if not session_id:
-                sessions = _http_json("GET", f"{self.bridge_url}/sessions", None, timeout=wait) or {}
-                for sess in sessions.get("sessions") or []:
-                    sid = str(sess.get("sessionId") or sess.get("id") or "")
-                    if not sid:
-                        continue
-                    data = _http_json(
-                        "GET",
-                        f"{self.bridge_url}/session/{urllib.parse.quote(sid)}/messages?limit=20",
-                        None,
-                        timeout=min(wait, 10),
-                    ) or {}
-                    for msg in data.get("messages") or []:
-                        if msg.get("role") != "user":
-                            continue
-                        content = str(msg.get("content") or "")
-                        if (job_id and f'"id": {job_id}' in content) or (job_key and job_key in content):
-                            session_id = sid
-                            try:
-                                user_msg_id = int(msg.get("id") or user_msg_id or 0)
-                            except Exception:
-                                pass
-                            break
-                    if session_id:
-                        break
-            if not session_id:
-                return AgentResult(False, "failed", error="bridge session not found", latency=time.time() - t0,
-                                   provider=self.name, worker_id=self.worker_id)
-
-            data = _http_json(
-                "GET",
-                f"{self.bridge_url}/session/{urllib.parse.quote(session_id)}/messages?limit=20",
-                None,
-                timeout=min(wait, 10),
-            ) or {}
-            assistant_msg = _last_assistant_message(data.get("messages") or [], min_id=user_msg_id)
-            if not assistant_msg:
-                return AgentResult(False, "failed", error="assistant reply not found", latency=time.time() - t0,
-                                   provider=self.name, worker_id=self.worker_id,
-                                   raw={"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id})
-            reply = _sendable_reply_from_assistant(str(assistant_msg.get("content") or ""))
-            if not reply:
-                return AgentResult(False, "failed", error="no sendable recovered reply", latency=time.time() - t0,
-                                   provider=self.name, worker_id=self.worker_id,
-                                   raw={"bridge_session_id": session_id, "assistant": assistant_msg})
-            return AgentResult(True, "done", reply_text=reply, latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id,
-                               raw={"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id,
-                                    "assistant": assistant_msg})
-        except Exception as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-
-    def submit(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
-        """Submit a job to GenericAgent bridge and return immediately with session info.
-        
-        This is the first phase of M5 async flow: just submit the prompt, don't wait for result.
-        Returns AgentResult with raw containing bridge_session_id and bridge_user_msg_id.
-        """
-        t0 = time.time()
-        wait = max(1.0, float(timeout or 30))
-        try:
-            session_id = self._ensure_session(timeout=min(wait, 15))
-            payload = dict(job)
-            payload["payload"] = _json_safe(payload.get("payload") or {})
-            prompt = _build_wechat_deep_prompt(payload)
-            rich_prompt = (
-                f"{prompt}\n\n"
-                "[WECHAT_AGENT_JOB_JSON]\n"
-                f"{json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)}\n"
-                "[/WECHAT_AGENT_JOB_JSON]"
-            )
-            submitted = _http_json(
-                "POST",
-                f"{self.bridge_url}/session/{urllib.parse.quote(session_id)}/prompt",
-                {"prompt": rich_prompt},
-                timeout=min(wait, 15),
-            ) or {}
-            if submitted.get("accepted") is not True:
-                return AgentResult(False, "failed", error="GenericAgent bridge rejected job",
-                                   latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                                   raw=submitted)
-            try:
-                user_msg_id = int(submitted.get("userMessageId") or submitted.get("seq") or 0)
-            except Exception:
-                user_msg_id = 0
-            return AgentResult(True, "submitted", reply_text="",
-                               latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                               raw={"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id})
-        except (urllib.error.URLError, TimeoutError) as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-        except Exception as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-
-    def poll(self, external_session_id: str, external_user_msg_id: int,
-             timeout: float | None = None) -> AgentResult:
-        """Poll GenericAgent bridge for a completed assistant reply.
-        
-        This is the second phase of M5 async flow: check if the agent has finished.
-        Returns AgentResult with status="done" if reply found, status="running" if still in progress.
-        """
-        t0 = time.time()
-        wait = max(1.0, float(timeout or 10))
-        session_id = str(external_session_id or "").strip()
-        try:
-            user_msg_id = int(external_user_msg_id or 0)
-        except Exception:
-            user_msg_id = 0
-        if not session_id:
-            return AgentResult(False, "failed", error="missing external_session_id",
-                               latency=time.time() - t0, provider=self.name, worker_id=self.worker_id)
-        try:
-            data = _http_json(
-                "GET",
-                f"{self.bridge_url}/session/{urllib.parse.quote(session_id)}/messages?after={user_msg_id}&limit=20",
-                None,
-                timeout=min(wait, 10),
-            ) or {}
-            assistant_msg = _last_assistant_message(data.get("messages") or [], min_id=user_msg_id)
-            if not assistant_msg:
-                # Still running, no reply yet
-                return AgentResult(False, "running", reply_text="",
-                                   latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                                   raw={"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id})
-            content = str(assistant_msg.get("content") or "").strip()
-            reply = postcheck(_clean_agent_output(content))
-            if not reply:
-                return AgentResult(False, "failed", error="agent returned no sendable reply",
-                                   latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                                   raw={"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id,
-                                        "assistant": assistant_msg})
-            return AgentResult(True, "done", reply_text=reply,
-                               latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                               raw={"bridge_session_id": session_id, "bridge_user_msg_id": user_msg_id,
-                                    "assistant": assistant_msg})
-        except (urllib.error.URLError, TimeoutError) as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-        except Exception as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
-                               provider=self.name, worker_id=self.worker_id)
-
-    def cancel(self, job_id: str) -> bool:
-        # The bridge exposes session cancel, but M1 jobs do not own sessions yet.
-        # Keep the provider protocol stable and add targeted cancellation when
-        # async external job ids are introduced.
-        return False
-
-
 class EchoAgentProvider:
     """Deterministic local provider for worker smoke tests and dry-runs."""
 
@@ -735,16 +463,13 @@ class EchoAgentProvider:
 class HermesProvider:
     """Provider backed by hermes-agent's `hermes chat` CLI one-shot invocation.
 
-    Hermes has no GenericAgent-style HTTP bridge. Instead we spawn
-    `hermes chat -q "<prompt>"` and read the final reply from stdout.
-    The profile is selected via the `HERMES_HOME` environment variable, which
-    is hermes's profile-aware home directory. Each worker process binds to
-    one profile so multiple instances can run in parallel without clobbering
-    each other's memory, sessions, or toolsets.
+    Hermes has no HTTP bridge. Instead we spawn `hermes chat -q "<prompt>"`
+    and read the final reply from stdout. The profile is selected via the
+    `HERMES_HOME` environment variable, which is hermes's profile-aware home
+    directory. Each worker process binds to one profile so multiple instances
+    can run in parallel without clobbering each other's memory, sessions, or
+    toolsets.
     """
-
-    name = "hermes"
-
     def __init__(self,
                  cli_path: str = "hermes",
                  hermes_home: str | None = None,
@@ -1042,7 +767,7 @@ def provider_from_config(config: Dict[str, Any] | None = None,
     providers: Dict[str, Any] = raw_providers if isinstance(raw_providers, dict) else {}
     raw_instances = provider_cfg.get("instances")
     instances: List[Dict[str, Any]] = raw_instances if isinstance(raw_instances, list) else []
-    default_name = str(provider_cfg.get("default") or "genericagent").lower()
+    default_name = str(provider_cfg.get("default") or "hermes").lower()
 
     chosen: Dict[str, Any] | None = None
     if instance_id:
@@ -1056,7 +781,7 @@ def provider_from_config(config: Dict[str, Any] | None = None,
             raise ValueError(f"unknown agent_provider instance: {instance_id}")
 
     if chosen is not None:
-        kind = str(chosen.get("provider") or chosen.get("type") or "genericagent").lower()
+        kind = str(chosen.get("provider") or chosen.get("type") or "hermes").lower()
         worker_id = str(chosen.get("worker_id") or chosen.get("id") or kind)
         if kind == "echo":
             return EchoAgentProvider(worker_id=worker_id)
@@ -1071,14 +796,7 @@ def provider_from_config(config: Dict[str, Any] | None = None,
                 worker_id=worker_id,
                 extra_args=cfg_h.get("extra_args") or [],
             )
-        if kind != "genericagent":
-            raise ValueError(f"unsupported provider: {kind}")
-        return GenericAgentProvider(
-            bridge_url=str(chosen.get("bridge_url") or "http://127.0.0.1:14168"),
-            bridge_cwd=chosen.get("bridge_cwd"),
-            poll_interval=float(chosen.get("bridge_poll_interval") or 1.0),
-            worker_id=worker_id,
-        )
+        raise ValueError(f"unsupported provider: {kind}")
 
     # Legacy single-provider path used by older callers.
     if default_name == "echo":
@@ -1094,17 +812,7 @@ def provider_from_config(config: Dict[str, Any] | None = None,
             worker_id=str(cfg_h.get("worker_id") or "hermes-1"),
             extra_args=cfg_h.get("extra_args") or [],
         )
-    if default_name != "genericagent":
-        raise ValueError(f"unsupported provider for M1: {default_name}")
-    raw_ga_cfg = providers.get("genericagent")
-    ga_cfg: Dict[str, Any] = raw_ga_cfg if isinstance(raw_ga_cfg, dict) else {}
-    raw_reply_engine = cfg.get("reply_engine")
-    reply_engine: Dict[str, Any] = raw_reply_engine if isinstance(raw_reply_engine, dict) else {}
-    return GenericAgentProvider(
-        bridge_url=str(ga_cfg.get("bridge_url") or reply_engine.get("bridge_url") or "http://127.0.0.1:14168"),
-        bridge_cwd=ga_cfg.get("bridge_cwd") or reply_engine.get("bridge_cwd"),
-        poll_interval=float(ga_cfg.get("bridge_poll_interval") or reply_engine.get("bridge_poll_interval") or 1.0),
-    )
+    raise ValueError(f"unsupported provider for M1: {default_name}")
 
 
 def list_agent_instances(config: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
@@ -1117,5 +825,5 @@ def list_agent_instances(config: Dict[str, Any] | None = None) -> List[Dict[str,
 
 
 if __name__ == "__main__":
-    provider = GenericAgentProvider()
+    provider = HermesProvider()
     print(json.dumps(provider.health().to_dict(), ensure_ascii=False, indent=2, default=str))

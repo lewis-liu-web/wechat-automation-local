@@ -115,7 +115,7 @@ def _build_agent_parser(sub) -> argparse.ArgumentParser:
 
     p = _agent_cmd("register", "Register a new agent instance")
     p.add_argument("--id", required=True, help="instance id")
-    p.add_argument("--provider", required=True, choices=["hermes", "genericagent", "echo"])
+    p.add_argument("--provider", required=True, choices=["hermes", "echo"])
     p.add_argument("--profile", help="Hermes profile name (required for provider=hermes)")
     p.add_argument("--label")
     p.add_argument("--model")
@@ -136,7 +136,7 @@ def _build_agent_parser(sub) -> argparse.ArgumentParser:
     p.add_argument("--instance-id", help="instance id(s) to start loop with, comma-separated")
 
     p = _agent_cmd("health", "Check agent provider health")
-    p.add_argument("--provider", choices=["echo", "genericagent", "hermes"], default="genericagent")
+    p.add_argument("--provider", choices=["echo", "hermes"], default="hermes")
     p.add_argument("--instance-id")
 
     p = _agent_cmd("jobs", "List agent jobs")
@@ -149,7 +149,7 @@ def _build_agent_parser(sub) -> argparse.ArgumentParser:
 
     p = _agent_cmd("job-test", "Create a test agent job")
     p.add_argument("--prompt", required=True)
-    p.add_argument("--provider", choices=["echo", "genericagent", "hermes"], default="echo")
+    p.add_argument("--provider", choices=["echo", "hermes"], default="echo")
     p.add_argument("--target")
     p.add_argument("--sender")
     p.add_argument("--priority", type=int)
@@ -161,7 +161,7 @@ def _build_agent_parser(sub) -> argparse.ArgumentParser:
     p = _agent_cmd("job-retry-send", "Retry sending a completed job's result")
     p.add_argument("job_id", type=int)
 
-    p = _agent_cmd("job-recover", "Recover a late GenericAgent result")
+    p = _agent_cmd("job-recover", "Recover a late agent result")
     p.add_argument("job_id", type=int)
     p.add_argument("--send", action="store_true", help="also send the recovered result to WeChat")
 

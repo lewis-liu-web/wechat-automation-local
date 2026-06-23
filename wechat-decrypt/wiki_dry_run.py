@@ -39,7 +39,7 @@ def main():
     print('hits:', len(hits))
     for h in hits:
         print(f'  [{h.scope}] {h.label} score={h.score} path={h.rel_path}')
-    run_cfg = cfg if args.llm else dict(cfg, reply_engine={**(cfg.get('reply_engine') or {}), 'use_subagent': False})
+    run_cfg = cfg if args.llm else dict(cfg, reply_engine={**(cfg.get('reply_engine') or {})})
     decision = generate_reply(args.query, target, run_cfg)
     print(json.dumps(decision.to_dict(), ensure_ascii=False, indent=2))
 

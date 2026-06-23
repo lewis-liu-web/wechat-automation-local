@@ -234,7 +234,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
     def test_generate_reply_reports_hits(self):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
-        cfg={'wiki_dir': str(root), 'knowledge_bases': {'scene.a': {'type':'local','path':'scenes/a'}}, 'reply_engine': {'use_subagent': False}}
+        cfg={'wiki_dir': str(root), 'knowledge_bases': {'scene.a': {'type':'local','path':'scenes/a'}}, 'reply_engine': {}}
         d=generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
         self.assertTrue(d.should_reply)
         self.assertTrue(any('scene.a' in x for x in d.wiki_hits))

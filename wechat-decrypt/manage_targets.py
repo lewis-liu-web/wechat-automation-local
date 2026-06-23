@@ -227,59 +227,11 @@ def _is_monitor_running():
     return bool(_monitor_pids())
 
 
-def _ensure_genericagent_bridge(cfg: dict | None = None) -> bool:
-    """Start GenericAgent desktop bridge when the reply engine depends on it.
-
-    The monitor can be started from the control UI via ``manage_targets start``;
-    that path used to skip ``start_wechat_auto.ps1`` and therefore left the
-    bridge down.  If raw GenericAgent mode is configured, no bridge means every
-    matched message turns into an empty reply.
-    """
-    loaded_cfg = cfg or reg.load_config()
-    if not isinstance(loaded_cfg, dict):
-        return True
-    raw_engine = loaded_cfg.get("reply_engine")
-    engine = raw_engine if isinstance(raw_engine, dict) else {}
-    if str(engine.get("provider") or "").lower() != "genericagent_bridge":
-        return True
-    bridge_url = str(engine.get("bridge_url") or "http://127.0.0.1:14168").rstrip("/")
-    try:
-        import urllib.request
-        import urllib.error
-        with urllib.request.urlopen(f"{bridge_url}/status", timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-        if data.get("ready"):
-            return True
-    except Exception:
-        pass
-
-    ga_root = Path(engine.get("bridge_cwd") or GA_ROOT).resolve()
-    bridge_script = ga_root / "frontends" / "desktop_bridge.py"
-    if not bridge_script.exists():
-        return False
-    python = Path(sys.executable)
-    subprocess.Popen(
-        [str(python), str(bridge_script)],
-        cwd=str(ga_root),
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(3.0)
-    try:
-        import urllib.request
-        with urllib.request.urlopen(f"{bridge_url}/status", timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-        return bool(data.get("ready"))
-    except Exception:
-        return False
 
 
 def cmd_start(json_mode=False):
-    cfg = reg.load_config()
-    bridge_ready = _ensure_genericagent_bridge(cfg)
     if _is_monitor_running():
-        msg = {"ok": True, "running": True, "bridge_ready": bridge_ready, "message": "微信自动监听已在运行。"}
+        msg = {"ok": True, "running": True, "message": "微信自动监听已在运行。"}
         if json_mode:
             safe_print(json.dumps(msg, ensure_ascii=False))
         else:
@@ -299,7 +251,7 @@ def cmd_start(json_mode=False):
     )
     time.sleep(1.0)
     running = _is_monitor_running()
-    msg = {"ok": running, "running": running, "bridge_ready": bridge_ready, "message": "已启动微信自动监听。" if running else "启动中，请稍候再查看状态。"}
+    msg = {"ok": running, "running": running, "message": "已启动微信自动监听。" if running else "启动中，请稍候再查看状态。"}
     if json_mode:
         safe_print(json.dumps(msg, ensure_ascii=False))
     else:

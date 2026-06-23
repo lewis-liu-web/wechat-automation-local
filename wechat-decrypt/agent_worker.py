@@ -293,7 +293,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Run one or more dry-run deep-agent jobs.")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="wechat_bot_targets.json path")
     ap.add_argument("--db", default=str(jobs.DEFAULT_DB_PATH), help="agent_jobs sqlite path")
-    ap.add_argument("--provider", choices=["genericagent", "echo", "hermes"], default="genericagent")
+    ap.add_argument("--provider", choices=["echo", "hermes"], default="hermes")
     ap.add_argument("--worker-id", default="agent-worker-1")
     ap.add_argument("--timeout", type=float, default=240.0)
     ap.add_argument("--hermes-cli", default=os.environ.get("HERMES_CLI", "hermes"),

@@ -354,7 +354,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             job = agent_jobs.get_job(job_id)
             if not job:
                 return _err("job not found: %d" % job_id)
-            provider = _build_agent_provider("genericagent")
+            provider = _build_agent_provider("hermes")
             recover = getattr(provider, "recover", None)
             if not callable(recover):
                 return _err("provider does not support result recovery")
@@ -396,7 +396,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             inst = instances.get(instance_id)
             if not inst:
                 return _err("unknown agent_provider instance: %s" % instance_id)
-            kind = str(inst.get("provider") or inst.get("type") or "genericagent").lower()
+            kind = str(inst.get("provider") or inst.get("type") or "hermes").lower()
             return _ok(**_agent_worker_start(
                 provider=kind,
                 worker_id=str(inst.get("worker_id") or instance_id),
@@ -418,7 +418,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/agent/worker/stop":
             return _ok(**_agent_worker_stop())
         if method == "GET" and path == "/agent/provider/health":
-            provider_name = str((params.get("provider") or ["genericagent"])[0]).lower()
+            provider_name = str((params.get("provider") or ["hermes"])[0]).lower()
             instance_id = (params.get("instance_id") or [None])[0]
             provider = _build_agent_provider(provider_name, instance_id=instance_id)
             return _ok(health=provider.health().to_dict())
@@ -656,7 +656,7 @@ def _register_agent_instance(instance: Any) -> Dict[str, Any]:
     provider = str(instance.get("provider") or instance.get("type") or "").strip().lower()
     if not instance_id:
         raise ValueError("instance.id is required")
-    if provider not in ("hermes", "genericagent", "echo"):
+    if provider not in ("hermes", "echo"):
         raise ValueError("unsupported instance provider: %s" % (provider or "(empty)"))
     normalized = dict(instance)
     normalized["id"] = instance_id
@@ -712,11 +712,11 @@ def _cached_provider_health(cache_key: str, provider: Any, *, ttl: float = 20.0)
 
 def _agent_instance_kind(instance_id: str | None) -> str:
     if not instance_id:
-        return "genericagent"
+        return "hermes"
     cfg = reg.load_config()
     for inst in list_agent_instances(cfg):
         if str(inst.get("id") or "") == str(instance_id):
-            return str(inst.get("provider") or inst.get("type") or "genericagent").lower()
+            return str(inst.get("provider") or inst.get("type") or "hermes").lower()
     return ""
 
 
@@ -737,7 +737,7 @@ def _agent_pool_status() -> Dict[str, Any]:
     rows = []
     for inst in list_agent_instances(cfg):
         iid = str(inst.get("id") or "")
-        kind = str(inst.get("provider") or inst.get("type") or "genericagent").lower()
+        kind = str(inst.get("provider") or inst.get("type") or "hermes").lower()
         health = None
         try:
             provider = provider_from_config(cfg, instance_id=iid)
@@ -906,7 +906,7 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         # Build provider from job's external_provider
-        ext_provider = str(job.get("external_provider") or "genericagent")
+        ext_provider = str(job.get("external_provider") or "hermes")
         payload = job.get("payload") or {}
         instance_id = payload.get("agent_instance_id") if isinstance(payload, dict) else None
         provider = _build_agent_provider(ext_provider, instance_id=str(instance_id) if instance_id else None)
