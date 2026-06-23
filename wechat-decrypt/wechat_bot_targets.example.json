@@ -85,7 +85,10 @@
     "max_tokens": 800,
     "chat_llm_timeout": 20,
     "disable_local_kb": false,
-    "_disable_local_kb_comment": "Set to true to skip all local KBs and rely on online providers or wiki/core only."
+    "_disable_local_kb_comment": "Set to true to skip all local KBs and rely on online providers or wiki/core only.",
+    "core_limit": 3,
+    "scene_limit": 3,
+    "_kb_limit_comment": "Independent caps for core rules and scene knowledge hits. Raise scene_limit to feed more KB context to the agent."
   },
   "context_policy": {
     "time_window_seconds": 90,

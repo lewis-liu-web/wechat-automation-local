@@ -271,6 +271,35 @@ class KnowledgeHit:
     def label(self) -> str:
         return f"{self.source}:{self.kb_id}:{self.rel_path}"
 
+def _knowledge_hits_to_payload(hits: List[KnowledgeHit]) -> List[Dict[str, Any]]:
+    """Convert KnowledgeHit objects to the dicts expected by the agent payload."""
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        if isinstance(h, KnowledgeHit):
+            out.append({
+                "label": h.label,
+                "source": h.source,
+                "kb_id": h.kb_id,
+                "scope": h.scope,
+                "rel_path": h.rel_path,
+                "score": h.score,
+                "content": h.content,
+            })
+        elif isinstance(h, (list, tuple)) and len(h) >= 2:
+            out.append({"label": str(h[0]), "content": str(h[1])})
+        else:
+            out.append({"label": str(h), "content": str(h)})
+    return out
+
+def _json_safe(value: Any) -> Any:
+    """Recursively make a value JSON-serializable (no bytes)."""
+    if isinstance(value, (bytes, bytearray)):
+        return "<bytes %d>" % len(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 def strip_group_sender_prefix(text: str) -> str:
     """Remove the decrypted group sender prefix: "username:\ncontent"."""
@@ -1138,21 +1167,27 @@ def _retrieve_hook_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Know
             break
     return out
 
-def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> Dict[str, List[KnowledgeHit]]:
+def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any],
+                               limit: int = 6, core_limit: int | None = None,
+                               scene_limit: int | None = None) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
     core_hits: List[KnowledgeHit] = []
     scene_hits: List[KnowledgeHit] = []
 
+    cfg_re = config.get("reply_engine") or {}
+    core_limit = int(core_limit if core_limit is not None else cfg_re.get("core_limit", 3))
+    scene_limit = int(scene_limit if scene_limit is not None else cfg_re.get("scene_limit", max(0, limit - core_limit)))
+
     # First principle: core rules/boundaries always apply for every target.
     core_docs = load_wiki(root / "core")
-    core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=3)
+    core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=core_limit)
     for rel, body in core_ranked:
         core_hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
 
     selected = target.get("knowledge_bases")
     if selected is None:
         selected = resolve_target_kb_ids(config, target)
-    disable_local = bool((config.get("reply_engine") or {}).get("disable_local_kb"))
+    disable_local = bool(cfg_re.get("disable_local_kb"))
     for kb in selected or []:
         spec = _resolve_kb_spec(config, target, kb)
         if not spec or spec.get("enabled", True) is False:
@@ -1176,7 +1211,17 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
             else:
                 scene_hits.append(h)
 
-    return {"core": core_hits[:3], "scene": scene_hits[:max(0, limit - min(len(core_hits), 3))]}
+    # Cross-provider dedup: the same note/document may surface from getnote + ima.
+    seen: set = set()
+    deduped_scene: List[KnowledgeHit] = []
+    for h in scene_hits:
+        key = (h.source, h.kb_id, h.rel_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_scene.append(h)
+
+    return {"core": core_hits[:core_limit], "scene": deduped_scene[:scene_limit]}
 
 
 def retrieve_knowledge(query: str, config: Dict[str, Any], target: Dict[str, Any], limit: int = 6) -> List[KnowledgeHit]:
@@ -1762,7 +1807,11 @@ def generate_reply(message: Dict[str, Any] | str,
             target.get("username"),
         )
         raw_kb_hits = (kb_layers.get("core") or []) + (kb_layers.get("scene") or [])
-        payload_knowledge_hits = _knowledge_hits_to_payload(raw_kb_hits)
+        try:
+            payload_knowledge_hits = _knowledge_hits_to_payload(raw_kb_hits)
+        except Exception as exc:
+            logging.getLogger("reply_engine").exception("[KB_DEBUG_RAW] payload formatter crashed: %r", exc)
+            payload_knowledge_hits = []
         scene_hits = kb_layers.get("scene") or []
         core_hits = kb_layers.get("core") or []
         retrieval_debug = {

@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from reply_engine import retrieve_knowledge, generate_reply
+from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply
 
 class KnowledgeArchitectureTests(unittest.TestCase):
     def make_wiki(self):
@@ -45,6 +45,45 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.assertNotIn('scene.b', labels)
         hits2=retrieve_knowledge('香蕉', cfg, {'knowledge_bases':['scene.a','scene.b']})
         self.assertIn('scene.b', '\n'.join(h.label for h in hits2))
+
+    def test_scene_limit_is_independent_from_core_limit(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {
+                'scene.a': {'type': 'local', 'path': 'scenes/a'},
+                'scene.b': {'type': 'local', 'path': 'scenes/b'},
+            },
+            'reply_engine': {'core_limit': 1, 'scene_limit': 2},
+        }
+        layers = retrieve_knowledge_layers('苹果 香蕉', cfg, {'knowledge_bases': ['scene.a', 'scene.b']})
+        self.assertLessEqual(len(layers['core']), 1, 'core_limit should cap core hits')
+        self.assertLessEqual(len(layers['scene']), 2, 'scene_limit should cap scene hits')
+        self.assertEqual(len(layers['scene']), 2, 'both scene KBs should appear')
+
+    def test_scene_hits_dedup_by_source_kb_rel_path(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {
+                'scene.a': {'type': 'local', 'path': 'scenes/a'},
+            },
+            'reply_engine': {'scene_limit': 5},
+        }
+        # Mock _retrieve_local_kb to return two hits for the same rel_path.
+        from reply_engine import _retrieve_local_kb as real_local
+        def fake_local(query, root, spec, limit):
+            from reply_engine import KnowledgeHit
+            kb_id = str(spec.get('id') or spec.get('path') or 'local')
+            return [
+                KnowledgeHit('local', kb_id, 'scene', 'scenes/a/faq.md', '片段1', 3),
+                KnowledgeHit('local', kb_id, 'scene', 'scenes/a/faq.md', '片段2', 2),
+            ]
+        with mock.patch('reply_engine._retrieve_local_kb', fake_local):
+            layers = retrieve_knowledge_layers('苹果', cfg, {'knowledge_bases': ['scene.a']})
+        self.assertEqual(len(layers['scene']), 1, 'duplicate rel_path should be deduped')
 
 
     def test_local_kb_matches_body_content(self):
