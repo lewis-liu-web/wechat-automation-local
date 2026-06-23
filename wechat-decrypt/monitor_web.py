@@ -16,6 +16,7 @@ from Crypto.Cipher import AES
 import urllib.parse
 import glob as glob_mod
 import zstandard as zstd
+import webbrowser
 from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_format
 from key_utils import get_key_info, strip_key_metadata
 
@@ -2096,10 +2097,11 @@ def main():
     print("Ctrl+C 停止\n", flush=True)
 
     try:
-        os.system(f'cmd.exe /c start http://localhost:{PORT}')
+        parent_pid = os.getppid()
+        print(f"[browser-launch] pid={os.getpid()} ppid={parent_pid} url=http://localhost:{PORT}", flush=True)
+        webbrowser.open(f'http://localhost:{PORT}')
     except Exception:
         pass
-
     try:
         server.serve_forever()
     except KeyboardInterrupt:
