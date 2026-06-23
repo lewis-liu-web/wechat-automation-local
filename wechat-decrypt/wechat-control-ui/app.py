@@ -923,7 +923,7 @@ def _page_knowledge():
             ).lower()
             kb_type_by_id[kb_id] = str(kb.get("type") or "local").lower()
         current = [x for x in (target.get("knowledge_bases") or []) if x in kb_ids]
-        selected = st.multiselect("绑定知识库", options=kb_ids, default=current, key="kb_bind_select", format_func=_kb_option_label)
+        selected = st.multiselect("绑定知识库", options=kb_ids, default=current, key="kb_bind_select_%s" % target_key, format_func=_kb_option_label)
         selected_sources = {kb_source_by_id.get(x, "local_folder") for x in selected}
         if len(selected_sources) > 1:
             st.warning("一个监听目标只能绑定同源知识库。请只选同一个来源，例如只选 Obsidian、只选普通本地文件夹，或只选 Get笔记。")

@@ -1255,16 +1255,29 @@ def _clean_agent_output(text: str) -> str:
 def _extract_command_reply(out: str) -> str | None:
     """Extract reply from command stdout.
 
-    Preferred stdout is a single JSON object, but some agent apps print logs
-    before the final JSON. Be forgiving: scan from the last non-empty line
-    backwards and accept JSON dict/string; otherwise return the last line.
+    Supports:
+    - JSON object with reply/text/content/output
+    - Hermes quiet-mode output (filter metadata/session lines, keep final response)
+    - Plain text: last non-empty line
     """
     out = (out or "").strip()
     if not out:
         return None
+
     lines = [line.strip() for line in out.splitlines() if line.strip()]
-    candidates = list(reversed(lines)) + [out]
-    for cand in candidates:
+
+    # Metadata/session lines emitted by Hermes even in quiet mode.
+    _META_RE = re.compile(
+        r"^(Warning:|session_id:|Session:|Duration:|Messages?|Tokens?|Resume this|Model:|\x1b\[|\s*$)",
+        re.IGNORECASE,
+    )
+    content_lines = [line for line in lines if not _META_RE.match(line)]
+    if content_lines:
+        # The actual response is usually the last non-metadata line.
+        return content_lines[-1].strip()
+
+    # JSON fallback: scan from the last non-empty line backwards.
+    for cand in reversed(lines):
         try:
             obj = json.loads(cand)
             if isinstance(obj, dict):
@@ -1288,6 +1301,8 @@ def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[st
     Supported config:
       provider: "command"
       cmd: ["agent", "--single-turn"] or "agent --single-turn"
+      cmd may include the literal placeholder "{prompt}" which is replaced
+      with the built prompt (wiki hits + user message) before execution.
       input_format: "plain" | "json"   (default: plain)
       timeout / llm_timeout: seconds
 
@@ -1305,6 +1320,10 @@ def _call_command_provider(prompt: str, config: Dict[str, Any], payload: Dict[st
         cmd = shlex.split(cmd)
     if not isinstance(cmd, list) or not cmd:
         return None
+
+    # Substitute the literal {prompt} placeholder in the command argv.
+    # The caller's prompt (built from wiki hits + user message) is passed here.
+    cmd = [str(p).replace("{prompt}", prompt) if isinstance(p, str) else p for p in cmd]
 
     fmt = str(config.get("input_format") or "plain").lower()
     if fmt == "json":
