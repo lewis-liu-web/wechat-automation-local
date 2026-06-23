@@ -2285,65 +2285,89 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
     element_count = state.get('element_count', 0)
     tree_markdown = state.get('tree_markdown') or ''
 
-    # Prefer raw UIA ValuePattern: cua-driver set_value CLI loses element
-    # cache across invocations, so uiautomation is more reliable here.
-    # If the separate window is minimised, briefly restore it without
-    # activation so the UIA tree is reachable, then re-minimise afterwards
-    # to keep the send visually silent.
+    # Prefer raw UIA ValuePattern.  Qt WeChat accepts SetValue on a
+    # minimised window in most cases, so avoid restoring it to prevent
+    # a visible pop-up.  If SetValue fails while minimised, fall back to
+    # a silent no-activate restore and retry, then re-minimise only if
+    # we actually restored.
     was_minimised = False
     try:
         import ctypes
         if ctypes.windll.user32.IsIconic(window_id):
             was_minimised = True
-            SW_SHOWNOACTIVATE = 4
-            ctypes.windll.user32.ShowWindow(window_id, SW_SHOWNOACTIVATE)
-            _log(log, 'cua separate window: restored minimised window hwnd=%s without activation' % window_id)
-            time.sleep(0.05)
+            _log(log, 'cua separate window: target window is minimised hwnd=%s' % window_id)
     except Exception as e:
-        _log(log, 'cua separate window: check/restore minimised failed: %r' % e)
+        _log(log, 'cua separate window: check minimised failed: %r' % e)
 
-    value_set = False
-    if _cua_set_input_value_uiautomation(window_id, text, log=log):
-        attempted.append('cua_set_input_value_uiautomation')
-        value_set = True
-    else:
-        input_idx = _find_chat_input_edit(tree_markdown)
-        if input_idx is None:
-            _restore()
-            return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
-                             reason='cua_input_not_found')
-        if not _cua_set_value(pid, window_id, input_idx, text, log=log):
-            _restore()
-            return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
-                             reason='cua_set_input_value_failed')
-        attempted.append('cua_set_input_value')
-        value_set = True
+    restored_for_input = False
+    input_not_found = False
 
-    if was_minimised and value_set:
-        try:
-            time.sleep(0.1)
-            if not _cua_press_key(pid, window_id, 'return', log=log):
-                _restore()
-                return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
-                                 reason='cua_press_enter_failed')
-            attempted.append('cua_press_enter')
-            # Re-minimise to honour the silent-send contract.
+    def _try_set_input(restore_if_minimised: bool = False) -> bool:
+        nonlocal restored_for_input, input_not_found
+        if was_minimised and restore_if_minimised and not restored_for_input:
             try:
                 import ctypes
-                SW_MINIMIZE = 6
-                ctypes.windll.user32.ShowWindow(window_id, SW_MINIMIZE)
-                _log(log, 'cua separate window: re-minimised window hwnd=%s' % window_id)
+                SW_SHOWNOACTIVATE = 4
+                ctypes.windll.user32.ShowWindow(window_id, SW_SHOWNOACTIVATE)
+                restored_for_input = True
+                _log(log, 'cua separate window: restored minimised window hwnd=%s without activation for retry' % window_id)
+                time.sleep(0.05)
             except Exception as e:
-                _log(log, 'cua separate window: re-minimise failed: %r' % e)
+                _log(log, 'cua separate window: no-activate restore failed: %r' % e)
+        if _cua_set_input_value_uiautomation(window_id, text, log=log):
+            attempted.append('cua_set_input_value_uiautomation')
+            return True
+        input_idx = _find_chat_input_edit(tree_markdown)
+        if input_idx is None:
+            input_not_found = True
+            return False
+        if _cua_set_value(pid, window_id, input_idx, text, log=log):
+            attempted.append('cua_set_input_value')
+            return True
+        return False
+
+    value_set = False
+    if _try_set_input():
+        value_set = True
+    elif was_minimised and _try_set_input(restore_if_minimised=True):
+        value_set = True
+    if not value_set:
+        _restore()
+        reason = 'cua_input_not_found' if input_not_found else 'cua_set_input_value_failed'
+        return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
+                         reason=reason)
+
+    # Qt WeChat may accept SetValue on a minimised window, but the Enter key
+    # (PostMessage WM_KEYDOWN) will likely be ignored while minimised.  Briefly
+    # restore without activation so the keystroke lands, then re-minimise.
+    if was_minimised and not restored_for_input:
+        try:
+            import ctypes
+            SW_SHOWNOACTIVATE = 4
+            ctypes.windll.user32.ShowWindow(window_id, SW_SHOWNOACTIVATE)
+            restored_for_input = True
+            _log(log, 'cua separate window: restored minimised window hwnd=%s without activation before enter' % window_id)
+            time.sleep(0.1)
         except Exception as e:
-            _log(log, 'cua separate window: send after restore failed: %r' % e)
-    else:
-        time.sleep(0.1)
-        if not _cua_press_key(pid, window_id, 'return', log=log):
-            _restore()
-            return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
-                             reason='cua_press_enter_failed')
-        attempted.append('cua_press_enter')
+            _log(log, 'cua separate window: no-activate restore before enter failed: %r' % e)
+
+    time.sleep(0.1)
+    if not _cua_press_key(pid, window_id, 'return', log=log):
+        _restore()
+        return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
+                         reason='cua_press_enter_failed')
+
+    attempted.append('cua_press_enter')
+
+    if restored_for_input:
+        try:
+            import ctypes
+            SW_MINIMIZE = 6
+            ctypes.windll.user32.ShowWindow(window_id, SW_MINIMIZE)
+            _log(log, 'cua separate window: re-minimised window hwnd=%s after silent restore' % window_id)
+        except Exception as e:
+            _log(log, 'cua separate window: re-minimise failed: %r' % e)
+
     _restore()
     dt = time.time() - t0
     _log(log, 'cua separate send completed attempted=%s dt=%.3fs' % (attempted, dt))
@@ -2355,8 +2379,6 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
         detail={'pid': pid, 'window_id': window_id, 'element_count': element_count, 'dt': dt,
                 'fg_restored': fg_before != window_id}
     )
-
-
 def open_chat_from_visible_list(target: Optional[dict] = None, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
     aliases = target_aliases(target)
     target_name = aliases[0] if aliases else ''

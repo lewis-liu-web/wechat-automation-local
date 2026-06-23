@@ -142,7 +142,8 @@ def _extract_hermes_reply(stdout: str) -> str:
 
     Strips the Hermes box frame, ANSI codes, tool hints. Uses the last
     non-empty Hermes box because Hermes may emit intermediate reasoning
-    boxes before the final reply box.
+    boxes before the final reply box.  In quiet mode Hermes prints no
+    frame, so we also drop stderr-style warnings and session metadata.
     """
     text = str(stdout or "").strip()
     hermes_reply = ""
@@ -152,6 +153,21 @@ def _extract_hermes_reply(stdout: str) -> str:
         box_content = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", last_box.group(1))
         lines = [line.strip().strip("│").strip() for line in box_content.split("\n") if line.strip()]
         hermes_reply = "\n".join(line for line in lines if line)
+    if not hermes_reply:
+        # Quiet mode: Hermes emits the reply followed by session metadata.
+        # Drop known metadata/warning lines, and strip an inline warning
+        # prefix that may have been merged with the reply line.
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        cleaned_lines: List[str] = []
+        for line in lines:
+            # If a warning was concatenated with the reply, remove the warning part first.
+            line = re.sub(r"^Warning:[^@]*?(?=\@)", "", line, flags=re.IGNORECASE).strip()
+            if not line:
+                continue
+            if re.match(r"^(Warning:|session_id:|Session:|Duration:|Messages?|Tokens?|Resume this|Model:)", line, re.IGNORECASE):
+                continue
+            cleaned_lines.append(line)
+        hermes_reply = "\n".join(cleaned_lines)
     if not hermes_reply:
         hermes_reply = _clean_agent_output(text)
     return postcheck(hermes_reply)
@@ -484,6 +500,7 @@ class HermesProvider:
         self.model = (str(model) if model else None) or os.environ.get("HERMES_MODEL")
         self.toolsets = (str(toolsets) if toolsets else None) or os.environ.get("HERMES_TOOLSETS")
         self.worker_id = worker_id
+        self.name = "hermes"
         self.extra_args = list(extra_args or [])
 
     def _build_env(self) -> Dict[str, str]:
