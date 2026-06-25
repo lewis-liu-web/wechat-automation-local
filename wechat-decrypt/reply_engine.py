@@ -43,6 +43,11 @@ except Exception:
     _HAS_TASK_ROUTER = False
 
 try:
+    import target_registry as _target_registry
+except Exception:
+    _target_registry = None  # type: ignore
+
+try:
     from message_aggregator import get_capabilities, CapabilityRegistry
 except Exception:
     get_capabilities = None  # type: ignore
@@ -1945,19 +1950,25 @@ def generate_reply(message: Dict[str, Any] | str,
                 job_key = "%s:%s" % (target.get("username", "unknown"), message.get("local_id", 0) if isinstance(message, dict) else 0)
                 group_key = target.get("username") or target.get("name") or "unknown"
                 payload_context_messages = context_messages[-10:] if isinstance(context_messages, list) else context_messages
+                dedicated_instance_id = (_target_registry.get_target_dedicated_instance_id(target, config)
+                                         if _target_registry else None)
+                deep_agent_provider = target.get("agent_provider") or target.get("provider") or None
+                if dedicated_instance_id and _target_registry:
+                    inst = _target_registry.get_registered_agent_instance(config, dedicated_instance_id)
+                    if inst:
+                        deep_agent_provider = inst.get("provider") or deep_agent_provider
                 job = _agent_jobs.enqueue_job(  # type: ignore
                     job_key=job_key,
                     group_key=group_key,
                     target_name=target.get("name"),
                     sender=mention_name,
                     message_local_id=message.get("local_id") if isinstance(message, dict) else None,
-                    is_aggregated=message.get("is_aggregated") if isinstance(message, dict) else None,
-                    aggregated_local_ids=message.get("aggregated_local_ids") if isinstance(message, dict) else None,
+                    task_type=str(route_name or "agent_provider"),
+                    provider=deep_agent_provider,
+                    dedicated_agent_instance_id=dedicated_instance_id,
                     session_image_paths=message.get("session_image_paths") if isinstance(message, dict) else None,
                     text_parts_count=message.get("text_parts_count") if isinstance(message, dict) else None,
                     agent_timeout=240.0 if image_paths else 90.0,
-                    task_type=str(route_name or "agent_provider"),
-                    provider=(target.get("agent_provider") or target.get("provider") or None),
                     payload=_json_safe({
                         "prompt": clean or raw_text,
                         "clean_text": clean,

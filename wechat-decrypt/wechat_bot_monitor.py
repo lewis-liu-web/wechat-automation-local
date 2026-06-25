@@ -31,6 +31,7 @@ from message_aggregator import (
     has_open_window,
     AggregatedTurn,
 )
+import admin_commands as _admin_commands
 try:
     import event_log as _event_log
 except Exception:  # pragma: no cover
@@ -883,6 +884,50 @@ def group_targets_by_db(targets):
     return grouped
 
 
+def _clean_command_text(msg):
+    text = str((msg or {}).get('message_content') or '')
+    prefix = extract_group_sender_username(text)
+    if prefix and text.startswith(prefix + ':\n'):
+        text = text[len(prefix) + 2:]
+    return text.strip()
+
+
+def _try_handle_admin_command(m, t, cfg, config_path, dry_run=False, contact_names=None):
+    sender = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
+    sender_display_name = m.get('sender_display_name') or (contact_names or {}).get(sender) or ''
+    clean_text = _clean_command_text(m)
+    try:
+        result = _admin_commands.handle_admin_command(clean_text, t, cfg, sender, sender_display_name)
+    except Exception as e:
+        log('admin_command handler exception target=%s local_id=%s error=%r' % (t.get('name'), m.get('local_id'), e))
+        return False
+    if not result.handled:
+        return False
+    lid = int(m.get('local_id') or 0)
+    if result.target_updates:
+        t.update(result.target_updates)
+    if result.reply_text and not dry_run:
+        send_reply(
+            result.reply_text,
+            cfg.get('send_mode'),
+            target=t,
+            before_local_id=lid,
+            cfg=cfg,
+            config_path=config_path,
+            mention_name=None,
+        )
+    _record_event(
+        'admin_command',
+        target=t.get('name'),
+        sender=sender,
+        payload={'local_id': lid, 'action': result.action, 'log_reason': result.log_reason},
+    )
+    if result.save_config:
+        save_config(cfg, config_path)
+    t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default=str(CONFIG_PATH))
@@ -1008,6 +1053,14 @@ def main():
                     except Exception as e:
                         log('image decrypt exception target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
                 log('new msg target=%s local_id=%s content=%r image=%s' % (t.get('name'), lid, m.get('message_content'), m.get('image_path', '')))
+                if _try_handle_admin_command(m, t, cfg, config_path, dry_run=args.dry_run, contact_names=contact_names):
+                    continue
+                sender = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
+                if t.get('admin_muted'):
+                    log('target_muted target=%s local_id=%s' % (t.get('name'), lid))
+                    _record_event('target_muted_skip', target=t.get('name'), sender=sender, payload={'local_id': lid})
+                    t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
                 # --- session-based trigger handling ---
                 _clear_expired_sessions(cfg)
                 triggered = bool(is_trigger(cfg, t, m))
@@ -1239,9 +1292,6 @@ def main():
                         )
                     except Exception:
                         pass
-                    advance_state = True
-                if advance_state:
-                    t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
         # Close conversation windows whose debounce timer elapsed even when no
         # new message arrives.  Without this, a single image + wake word can sit
         # in memory forever waiting for another message to trigger the flush.
@@ -1249,6 +1299,12 @@ def main():
         for turn in flushed_turns:
             turn_cfg = turn.config or cfg
             turn_target = turn.target or {}
+            if turn.target.get('admin_muted'):
+                for tt in targets:
+                    if tt.get('username') == turn.chat_id:
+                        tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
+                        break
+                continue
             if turn.image_paths and not turn.has_image_task_description():
                 _send_image_task_missing_guide(turn, turn_cfg, config_path=config_path, dry_run=args.dry_run)
                 for tt in targets:

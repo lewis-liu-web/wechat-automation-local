@@ -216,16 +216,17 @@ def enqueue_job(*,
                 priority: int = 0,
                 provider: str | None = None,
                 is_aggregated: bool | None = None,
-                aggregated_local_ids: List[Any] | None = None,
-                session_image_paths: List[str] | None = None,
-                text_parts_count: int | None = None,
-                agent_timeout: float | None = None,
-                knowledge_hits: List[Dict[str, Any]] | None = None,
-                knowledge_bases: List[str] | None = None,
-                reply_mode: str | None = None,
-                retrieval_debug: Dict[str, Any] | None = None,
-                skill_name: str | None = None,
-                db_path: Optional[Path] = None) -> Dict[str, Any]:
+               aggregated_local_ids: List[Any] | None = None,
+               session_image_paths: List[str] | None = None,
+               text_parts_count: int | None = None,
+               agent_timeout: float | None = None,
+               knowledge_hits: List[Dict[str, Any]] | None = None,
+               knowledge_bases: List[str] | None = None,
+               reply_mode: str | None = None,
+               retrieval_debug: Dict[str, Any] | None = None,
+               skill_name: str | None = None,
+               dedicated_agent_instance_id: str | None = None,
+               db_path: Optional[Path] = None) -> Dict[str, Any]:
     """Create a queued job, or return the existing job with the same key.
 
     `job_key` is the duplicate-reply guard.  For WeChat messages it should be
@@ -254,11 +255,11 @@ def enqueue_job(*,
         "reply_mode": reply_mode,
         "retrieval_debug": retrieval_debug,
         "skill_name": skill_name,
+        "dedicated_agent_instance_id": dedicated_agent_instance_id,
     }
     for key, value in _optional_payload_fields.items():
         if value is not None and key not in merged_payload:
             merged_payload[key] = value
-
     ts = _now()
     with _WRITE_LOCK, _connect(db_path) as con:
         con.execute(
@@ -328,6 +329,7 @@ def count_jobs(*, statuses: Iterable[str] | None = None,
 
 
 def claim_next_job(*, worker_id: str, provider: str | None = None,
+                   instance_id: str | None = None,
                    max_global_running: int = 1,
                    per_group_concurrency: int = 1,
                    active_workers: int = 1,
@@ -360,6 +362,10 @@ def claim_next_job(*, worker_id: str, provider: str | None = None,
         ).fetchall()
         selected = None
         for row in rows:
+            payload = _json_loads(row["payload_json"])
+            bound_instance = payload.get("dedicated_agent_instance_id")
+            if bound_instance and str(bound_instance) != str(instance_id or ""):
+                continue
             if per_group_concurrency > 0:
                 same_group_running = con.execute(
                     "SELECT COUNT(*) AS c FROM agent_jobs WHERE group_key=? AND status=?",
@@ -553,6 +559,7 @@ def release_stale_dispatching(*, lock_timeout_seconds: float = 60.0,
 # ---------------------------------------------------------------------------
 
 def claim_dispatchable(*, worker_id: str, provider: str | None = None,
+                       instance_id: str | None = None,
                        max_global_dispatching: int = 1,
                        per_group_concurrency: int = 1,
                        db_path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
@@ -594,6 +601,10 @@ def claim_dispatchable(*, worker_id: str, provider: str | None = None,
             ).fetchall()
         selected = None
         for row in rows:
+            payload = _json_loads(row["payload_json"])
+            bound_instance = payload.get("dedicated_agent_instance_id")
+            if bound_instance and str(bound_instance) != str(instance_id or ""):
+                continue
             if per_group_concurrency > 0:
                 same_group_active = con.execute(
                     "SELECT COUNT(*) AS c FROM agent_jobs WHERE group_key=? AND status IN (?, ?, ?, ?)",

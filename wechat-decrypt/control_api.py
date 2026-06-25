@@ -227,6 +227,16 @@ class ControlHandler(BaseHTTPRequestHandler):
             mode = str(body.get("mode") or "").strip().lower()
             mode = "customer_service" if mode == "customer_service" else "group_assistant"
             return _ok(action="mode_updated", target=reg.set_target_mode_bundle(m[0], mode, config_path=reg.CONFIG_PATH))
+        if method == "POST" and (m := _match(path, "/targets/{key}/dedicated-agent")):
+            instance_id_raw = str(body.get("instance_id") or "").strip()
+            instance_id: Optional[str] = instance_id_raw or None
+            try:
+                target = reg.set_target_dedicated_agent_instance_id(
+                    m[0], instance_id, config_path=reg.CONFIG_PATH
+                )
+            except ValueError as exc:
+                return _err(str(exc) or "invalid instance_id", status=400)
+            return _ok(action="set_dedicated_agent", target=target)
         if method == "DELETE" and (m := _match(path, "/targets/{key}")):
             return _ok(action="deleted", target=_delete_target(m[0]))
 
@@ -808,6 +818,7 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         provider=instance_provider or None,
         max_global_dispatching=max_global,
         per_group_concurrency=per_group,
+        instance_id=str(instance_id) if instance_id else None,
     )
     if not job:
         return {"ok": True, "action": "idle", "duration": round(time.time() - t0, 3)}

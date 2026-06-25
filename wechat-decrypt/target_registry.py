@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 # Windows: suppress console window for subprocess calls
 _NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -518,6 +519,110 @@ def set_category(key, category, config_path=CONFIG_PATH):
     save_json_atomic(config_path, cfg)
     return t
 
+def normalize_admin_senders(value) -> List[str]:
+    """Coerce admin_senders field to a clean list of trimmed strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[\n,]", value)
+    elif isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if item is None:
+                continue
+            parts.extend(re.split(r"[\n,]", str(item)))
+    else:
+        parts = [str(value)]
+    cleaned: List[str] = []
+    for part in parts:
+        if part is None:
+            continue
+        text = str(part).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def get_target_admin_senders(target) -> List[str]:
+    """Return the effective admin_senders list for a target dict."""
+    return normalize_admin_senders((target or {}).get("admin_senders"))
+
+
+def is_admin_sender(target, sender_username, sender_display_name=None) -> bool:
+    """Return True if sender_username (or sender_display_name) is allowed to issue admin commands for target.
+
+    Matching is case-insensitive and whitespace-trimmed. Entries in admin_senders may be wxids or nicknames/remarks.
+    """
+    if get_target_category(target) != "admin":
+        return False
+    whitelist = get_target_admin_senders(target)
+    if not whitelist:
+        return True
+    candidates = {str(sender_username or "").strip().lower()}
+    if sender_display_name:
+        candidates.add(str(sender_display_name).strip().lower())
+    normalized = {entry.strip().lower() for entry in whitelist if entry.strip()}
+    return bool(candidates & normalized)
+
+
+def mode_bundle(mode: str) -> Dict[str, Any]:
+    """Return the full reply/session/context policy bundle for a response mode."""
+    mode = str(mode or "").strip().lower()
+    if mode == "customer_service":
+        return {
+            "mode": "customer_service",
+            "reply_policy": "knowledge_grounded",
+            "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
+            "context_policy": {"time_window_seconds": 120, "max_messages": 40, "sender_recent_limit": 6, "include_bot_recent": True},
+        }
+    return {
+        "mode": "group_assistant",
+        "reply_policy": "balanced",
+        "session_policy": {"timeout_seconds": 60, "max_turns": 3, "require_followup_intent": True},
+        "context_policy": {"time_window_seconds": 90, "max_messages": 30, "sender_recent_limit": 5, "include_bot_recent": True},
+    }
+
+
+def get_registered_agent_instance(cfg, instance_id):
+    """Return the registered agent_provider instance dict matching instance_id, or None."""
+    if not instance_id:
+        return None
+    instances = ((cfg or {}).get("agent_provider") or {}).get("instances") or []
+    for inst in instances:
+        if isinstance(inst, dict) and inst.get("id") == instance_id:
+            return inst
+    return None
+
+
+def get_target_dedicated_instance_id(target, cfg) -> Optional[str]:
+    """Return the target's dedicated_agent_instance_id if it resolves to a registered instance, else None."""
+    if not target:
+        return None
+    candidate = target.get("dedicated_agent_instance_id")
+    if not candidate:
+        return None
+    candidate = str(candidate).strip()
+    if not candidate:
+        return None
+    if get_registered_agent_instance(cfg, candidate) is None:
+        return None
+    return candidate
+
+
+def set_target_dedicated_agent_instance_id(key, instance_id, config_path=CONFIG_PATH):
+    """Bind a target to a dedicated agent_provider instance (empty clears the binding)."""
+    cfg = load_config(config_path)
+    t = find_target(cfg, key)
+    if not t:
+        raise ValueError("target not found: %s" % key)
+    cleaned = str(instance_id or "").strip()
+    if cleaned and get_registered_agent_instance(cfg, cleaned) is None:
+        raise ValueError("agent_provider instance not registered: %s" % cleaned)
+    t["dedicated_agent_instance_id"] = cleaned or None
+    save_json_atomic(config_path, cfg)
+    return t
+
+
 def set_target_field(key, field, value, config_path=CONFIG_PATH):
     """Update an arbitrary scalar field on an existing target."""
     cfg = load_config(config_path)
@@ -531,21 +636,7 @@ def set_target_field(key, field, value, config_path=CONFIG_PATH):
 
 def set_target_mode_bundle(key, mode, config_path=CONFIG_PATH):
     """Update target response mode and derived policy fields atomically."""
-    mode = str(mode or "").strip().lower()
-    if mode == "customer_service":
-        bundle = {
-            "mode": "customer_service",
-            "reply_policy": "knowledge_grounded",
-            "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
-            "context_policy": {"time_window_seconds": 120, "max_messages": 40, "sender_recent_limit": 6, "include_bot_recent": True},
-        }
-    else:
-        bundle = {
-            "mode": "group_assistant",
-            "reply_policy": "balanced",
-            "session_policy": {"timeout_seconds": 60, "max_turns": 3, "require_followup_intent": True},
-            "context_policy": {"time_window_seconds": 90, "max_messages": 30, "sender_recent_limit": 5, "include_bot_recent": True},
-        }
+    bundle = mode_bundle(mode)
     cfg = load_config(config_path)
     t = find_target(cfg, key)
     if not t:

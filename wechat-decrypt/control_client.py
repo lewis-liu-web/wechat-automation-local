@@ -400,6 +400,16 @@ def set_target_mode(key: str, mode: str, base_url: str = DEFAULT_BASE_URL) -> Di
                     base_url=base_url, body={"mode": mode})
 
 
+def set_target_dedicated_agent(key: str, instance_id: Optional[str],
+                                base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """Bind a target to a specific registered agent instance.
+
+    ``instance_id`` of empty string or ``None`` clears the binding.
+    """
+    return _request("POST", "/targets/%s/dedicated-agent" % urllib.parse.quote(key, safe=""),
+                    base_url=base_url, body={"instance_id": (instance_id or "")})
+
+
 def list_agent_instances(base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]]:
     res = _request("GET", "/agent/instances", base_url=base_url, timeout=10)
     return res.get("instances") or []
@@ -487,6 +497,8 @@ __all__ = [
     "replace_target_kbs",
     "set_target_field",
     "set_target_mode",
+
+    "set_target_dedicated_agent",
     "set_target_category",
     "get_triggers",
     "add_triggers",
