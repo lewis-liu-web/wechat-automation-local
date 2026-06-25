@@ -72,6 +72,7 @@ from api import (  # noqa: E402
     search_kb,
     set_target_category,
     set_target_field,
+    set_target_dedicated_agent,
     start_agent_worker,
     start_async_loop,
     start_monitor,
@@ -684,6 +685,50 @@ def _page_targets():
                             try:
                                 set_target_category(action_key, new_cat, base_url=base)
                                 st.success("已设为 %s" % _label(CATEGORY_LABELS, new_cat))
+                                _clear_data_cache()
+                                st.rerun()
+                            except ControlAPIError as e:
+                                st.error("保存失败：%s" % (e,))
+                        st.caption("管理员白名单：留空表示该目标下所有发送者都被视为管理员。可填写 wxid 或昵称/备注，每行一个。")
+                        admin_senders_text = st.text_area(
+                            "管理员发送者白名单（每行一个 wxid 或昵称，留空=该目标下所有发送者均为管理员）",
+                            value='\n'.join(t.get('admin_senders') or []),
+                            key="admin_senders_%s" % widget_key,
+                            height=100,
+                        )
+                        if st.button("保存管理员白名单", key="save_admin_senders_%s" % widget_key, use_container_width=False):
+                            try:
+                                cleaned = [s.strip() for s in admin_senders_text.splitlines() if s.strip()]
+                                set_target_field(action_key, "admin_senders", cleaned, base_url=base)
+                                st.success("已保存")
+                                _clear_data_cache()
+                                st.rerun()
+                            except ControlAPIError as e:
+                                st.error("保存失败：%s" % (e,))
+                    with st.expander("Agent 绑定", expanded=False):
+                        try:
+                            _instance_list = list_agent_instances(base_url=base)
+                        except ControlAPIError as _e:
+                            _instance_list = []
+                            st.error("读取 agent 实例失败：%s" % (_e,))
+                        instance_ids = [str(i.get('id')) for i in _instance_list if i.get('id')]
+                        current_dedicated = str(t.get('dedicated_agent_instance_id') or '')
+                        options = [""] + instance_ids
+                        try:
+                            current_index = options.index(current_dedicated) if current_dedicated in options else 0
+                        except ValueError:
+                            current_index = 0
+                        selected_id = st.selectbox(
+                            "专用 Agent 实例",
+                            options=options,
+                            index=current_index,
+                            key="dedicated_agent_%s" % widget_key,
+                            help="留空=不绑定（任务进入通用池）；选择具体实例后只由该实例处理该目标的任务。",
+                        )
+                        if st.button("保存 Agent 绑定", key="save_dedicated_agent_%s" % widget_key, use_container_width=False):
+                            try:
+                                set_target_dedicated_agent(action_key, selected_id or "", base_url=base)
+                                st.success("已保存")
                                 _clear_data_cache()
                                 st.rerun()
                             except ControlAPIError as e:

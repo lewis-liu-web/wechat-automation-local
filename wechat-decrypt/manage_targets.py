@@ -913,6 +913,8 @@ def main(argv=None):
                     safe_print("category: %s" % t.get("category", "user"))
                     safe_print("mode: %s" % t.get("mode", "group_assistant"))
                     safe_print("knowledge_bases: %s" % ", ".join(str(k) for k in (t.get("knowledge_bases") or [])))
+                    safe_print("admin_senders: %s" % ", ".join(str(s) for s in (t.get("admin_senders") or [])))
+                    safe_print("dedicated_agent_instance_id: %s" % (t.get("dedicated_agent_instance_id") or ""))
                     safe_print("effective_triggers: %s" % ", ".join(info.get("effective_triggers") or []))
                 elif info.get("kind") == "candidate":
                     c = info.get("candidate") or {}
