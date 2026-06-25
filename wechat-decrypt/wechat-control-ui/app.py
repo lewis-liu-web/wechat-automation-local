@@ -650,6 +650,27 @@ def _page_targets():
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
+                        st.divider()
+                        response_mode_options = [("触发词回复", "trigger"), ("自由回复（所有消息都回）", "free")]
+                        valid_response_modes = {v for _, v in response_mode_options}
+                        current_response_mode = t.get("response_mode") or "trigger"
+                        if current_response_mode not in valid_response_modes:
+                            current_response_mode = "trigger"
+                        selected_response_label = st.selectbox(
+                            "回复策略",
+                            options=[label for label, _ in response_mode_options],
+                            index=[v for _, v in response_mode_options].index(current_response_mode),
+                            key=f"target_response_mode_{widget_key}",
+                        )
+                        selected_response_mode = dict(response_mode_options)[selected_response_label]
+                        if st.button("保存回复策略", key="save_response_mode_%s" % widget_key, use_container_width=False):
+                            try:
+                                set_target_field(action_key, "response_mode", selected_response_mode, base_url=base)
+                                st.success("已切换回复策略为：%s" % selected_response_label)
+                                _clear_data_cache()
+                                st.rerun()
+                            except ControlAPIError as e:
+                                st.error("保存失败：%s" % (e,))
                     with st.expander("类别 / 管理员设置", expanded=False):
                         new_cat = st.radio(
                             "类别",

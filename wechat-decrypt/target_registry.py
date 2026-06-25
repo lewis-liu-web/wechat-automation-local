@@ -118,6 +118,11 @@ def get_target_category(target):
     return _normalize_category((target or {}).get("category"))
 
 
+
+def _is_private_chat(username):
+    """Return True for 1-on-1 contacts (anything not a WeChat chatroom)."""
+    return not str(username or "").endswith("@chatroom")
+
 def msg_table(username):
     return "Msg_" + hashlib.md5(str(username).encode("utf-8")).hexdigest()
 
@@ -481,6 +486,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         "knowledge_bases": selected_kbs,
         "category": _normalize_category(category),
     }
+    if _is_private_chat(username):
+        target["response_mode"] = "free"
     cfg.setdefault("targets", []).append(target)
     cand["status"] = "enabled"
     cand["enabled_at"] = now_text()
