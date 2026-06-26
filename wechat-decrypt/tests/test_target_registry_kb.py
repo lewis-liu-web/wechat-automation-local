@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """Tests for knowledge-base validation and single-source binding."""
 
+import json
 import os
 import sys
 import tempfile
@@ -209,5 +210,40 @@ class TestDisableLocalKb(unittest.TestCase):
         self.assertFalse(db_path.exists())
 
 
+
+class TestWikiKbScan(unittest.TestCase):
+    def test_list_knowledge_bases_includes_wiki_dirs(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        cfg_path = Path(td.name) / "targets.json"
+        cand_path = Path(td.name) / "candidates.json"
+        cfg_path.write_text(
+            json.dumps({
+                "knowledge_bases": {
+                    "scene.existing": {"type": "local", "path": "scenes/existing"}
+                }
+            }),
+            encoding="utf-8",
+        )
+        cand_path.write_text('{"version": 1, "candidates": []}', encoding="utf-8")
+        wiki = Path(td.name) / "wiki"
+        (wiki / "desktop_pdf").mkdir(parents=True)
+        (wiki / "scenes" / "workdocs").mkdir(parents=True)
+        # create a file so the folder is non-empty (not required by impl, but clearer)
+        (wiki / "desktop_pdf" / "a.md").write_text("x", encoding="utf-8")
+        (wiki / "scenes" / "workdocs" / "b.md").write_text("y", encoding="utf-8")
+
+        rows = reg.list_knowledge_bases(config_path=cfg_path)
+        ids = {r["id"] for r in rows}
+        self.assertIn("desktop_pdf", ids)
+        self.assertIn("scene.workdocs", ids)
+        self.assertIn("scene.existing", ids)
+
+        desktop = next(r for r in rows if r["id"] == "desktop_pdf")
+        self.assertEqual(desktop["path"], "desktop_pdf")
+        self.assertEqual(desktop["source"], "local_folder")
+
+        workdocs = next(r for r in rows if r["id"] == "scene.workdocs")
+        self.assertEqual(workdocs["path"], "scenes/workdocs")
 if __name__ == "__main__":
     unittest.main()

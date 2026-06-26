@@ -712,12 +712,81 @@ def remove_triggers(key, triggers, clear=False, config_path=CONFIG_PATH):
     return get_triggers(key, config_path=config_path)
 
 
+def _resolve_wiki_root(config_path=CONFIG_PATH):
+    cfg = load_config(config_path)
+    base = Path(config_path).resolve().parent
+    wiki_dir = cfg.get("wiki_dir")
+    if wiki_dir:
+        wiki_root = Path(wiki_dir)
+        if not wiki_root.is_absolute():
+            wiki_root = base / wiki_root
+    else:
+        wiki_root = base / "wiki"
+    return wiki_root
+
+
+def _scan_wiki_kbs(config_path=CONFIG_PATH):
+    """Return auto-discovered local KB rows for folders under wiki_dir.
+
+    Direct subdirectories of wiki_dir become KBs named after the folder.
+    Subdirectories of wiki_dir/scenes/ become scene KBs with id 'scene.<name>'.
+    System directories (core, scenes, providers, __pycache__, etc.) are skipped.
+    """
+    wiki_root = _resolve_wiki_root(config_path)
+    if not wiki_root.exists():
+        return []
+    excluded = {"core", "scenes", "providers", "__pycache__", ".git", "temp", "tmp"}
+    rows = []
+    seen_paths = set()
+    # Direct children of wiki_dir
+    for p in sorted(wiki_root.iterdir()):
+        if p.is_dir() and p.name not in excluded:
+            rel = p.name
+            rows.append({
+                "id": p.name,
+                "type": "local",
+                "enabled": True,
+                "knowledge_base_id": "",
+                "path": rel,
+                "source": "local_folder",
+                "scope": "scene",
+                "limit": None,
+                "timeout": None,
+                "description": "自动识别：%s" % p.name,
+            })
+            seen_paths.add(rel)
+    # Scene KBs under wiki_dir/scenes/
+    scenes_root = wiki_root / "scenes"
+    if scenes_root.exists() and scenes_root.is_dir():
+        for p in sorted(scenes_root.iterdir()):
+            if p.is_dir() and p.name not in excluded:
+                rel = "scenes/%s" % p.name
+                kb_id = "scene.%s" % p.name
+                if rel not in seen_paths:
+                    rows.append({
+                        "id": kb_id,
+                        "type": "local",
+                        "enabled": True,
+                        "knowledge_base_id": "",
+                        "path": rel,
+                        "source": "local_folder",
+                        "scope": "scene",
+                        "limit": None,
+                        "timeout": None,
+                        "description": "自动识别：%s" % kb_id,
+                    })
+                    seen_paths.add(rel)
+    return rows
+
+
 def list_knowledge_bases(config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     rows = []
+    existing_ids = set()
+    existing_paths = set()
     for kb_id, spec in sorted((cfg.get("knowledge_bases") or {}).items()):
         spec = spec or {}
-        rows.append({
+        row = {
             "id": kb_id,
             "type": spec.get("type") or "local",
             "enabled": spec.get("enabled", True),
@@ -728,7 +797,13 @@ def list_knowledge_bases(config_path=CONFIG_PATH):
             "limit": spec.get("limit"),
             "timeout": spec.get("timeout"),
             "description": spec.get("description") or "",
-        })
+        }
+        rows.append(row)
+        existing_ids.add(kb_id)
+        existing_paths.add(row["path"])
+    for row in _scan_wiki_kbs(config_path):
+        if row["id"] not in existing_ids and row["path"] not in existing_paths:
+            rows.append(row)
     return rows
 
 
