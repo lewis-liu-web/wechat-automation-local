@@ -351,24 +351,16 @@ def find_candidate(data, key):
     return None
 
 
-def _kb_source(spec):
-    spec = spec or {}
-    explicit = str(spec.get("source") or "").strip().lower()
-    if explicit:
-        return explicit
-    kb_type = str(spec.get("type") or "local").lower()
-    return "local_folder" if kb_type == "local" else kb_type
 
 
 def inspect_target(key, config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH):
     """Return target or pending candidate detail by name/username without mutating files."""
     cfg = load_config(config_path)
     data = load_candidates(candidates_path)
-    kbs = cfg.get("knowledge_bases") or {}
     default_triggers = list(cfg.get("default_triggers") or [])
 
     def _resolve_kb(kb_id):
-        spec = kbs.get(kb_id)
+        spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
         if not spec:
             return {"id": kb_id, "exists": False, "type": None, "source": None,
                     "enabled": False, "description": ""}
@@ -777,6 +769,48 @@ def _scan_wiki_kbs(config_path=CONFIG_PATH):
                     })
                     seen_paths.add(rel)
     return rows
+def _get_kb_spec(kb_id, cfg=None, config_path=CONFIG_PATH):
+    """Return a knowledge-base spec for kb_id, checking the configured KB map first.
+
+    Order of lookup:
+      1. ``cfg["knowledge_bases"][kb_id]`` when present — the returned dict is
+         a copy of the configured spec with ``_from_scan=False``.
+      2. Otherwise, scan wiki subdirectories via :func:`_scan_wiki_kbs` and
+         synthesize a local-only spec (``type="local"``, ``source="local_folder"``,
+         ``scope="scene"``) with ``_from_scan=True`` when a folder matches the
+         requested ``kb_id``.
+      3. Returns ``None`` if neither lookup yields a match.
+    """
+    if not kb_id:
+        return None
+    cfg = cfg if cfg is not None else load_config(config_path)
+    configured = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    if configured:
+        out = dict(configured or {})
+        out["_from_scan"] = False
+        return out
+    for row in _scan_wiki_kbs(config_path):
+        if row.get("id") == kb_id:
+            out = {
+                "type": "local",
+                "path": row.get("path") or "",
+                "enabled": True,
+                "source": "local_folder",
+                "scope": "scene",
+                "_from_scan": True,
+            }
+            # Preserve any extra metadata the scanner exposed (description, etc.).
+            for key in ("description", "knowledge_base_id", "limit", "timeout"):
+                if row.get(key) is not None and key not in out:
+                    out[key] = row.get(key)
+            return out
+    return None
+
+
+def _is_scanned_kb(kb_id, cfg=None, config_path=CONFIG_PATH):
+    """Return True when kb_id resolves via the wiki scanner rather than config."""
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
+    return bool(spec and spec.get("_from_scan"))
 
 
 def list_knowledge_bases(config_path=CONFIG_PATH):
@@ -797,12 +831,14 @@ def list_knowledge_bases(config_path=CONFIG_PATH):
             "limit": spec.get("limit"),
             "timeout": spec.get("timeout"),
             "description": spec.get("description") or "",
+            "managed": True,
         }
         rows.append(row)
         existing_ids.add(kb_id)
         existing_paths.add(row["path"])
     for row in _scan_wiki_kbs(config_path):
         if row["id"] not in existing_ids and row["path"] not in existing_paths:
+            row["managed"] = False
             rows.append(row)
     return rows
 
@@ -917,21 +953,28 @@ def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=No
 
 def set_knowledge_base_enabled(kb_id, enabled=True, config_path=CONFIG_PATH):
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
-    spec["enabled"] = bool(enabled)
+    if spec.get("_from_scan"):
+        raise ValueError("该知识库 '%s' 来自 wiki 扫描，未在配置中注册，请先在配置中显式注册后再管理" % kb_id)
+    configured = (cfg.get("knowledge_bases") or {}).get(kb_id) or {}
+    configured["enabled"] = bool(enabled)
     save_json_atomic(config_path, cfg)
-    out = dict(spec)
+    out = dict(configured)
     out["id"] = kb_id
     return out
-
 
 def delete_knowledge_base(kb_id, remove_files=False, config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     kbs = cfg.setdefault("knowledge_bases", {})
-    spec = kbs.get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    if spec.get("_from_scan"):
+        raise ValueError("该知识库 '%s' 来自 wiki 扫描，未在配置中注册，请先在配置中显式注册后再管理" % kb_id)
+    configured = kbs.get(kb_id)
+    if not configured:
         raise ValueError("知识库不存在: %s" % kb_id)
     for t in cfg.get("targets") or []:
         t["knowledge_bases"] = [x for x in (t.get("knowledge_bases") or []) if x != kb_id]
@@ -966,20 +1009,20 @@ def _kb_source(spec):
 
 def validate_knowledge_bases(knowledge_bases, config_path=CONFIG_PATH, cfg=None):
     cfg = cfg or load_config(config_path)
-    known = cfg.get("knowledge_bases") or {}
     sources = set()
     for kb in knowledge_bases or []:
         if str(kb).startswith("legacy:"):
             continue
-        if kb not in known:
+        spec = _get_kb_spec(kb, cfg=cfg, config_path=config_path)
+        if not spec:
             raise ValueError(_unknown_kb_message(kb, cfg))
-        spec = known.get(kb) or {}
         if spec.get("enabled", True) is False:
             raise ValueError("知识库 '%s' 已被禁用，无法绑定。请先启用或选择其他知识库。" % kb)
         sources.add(_kb_source(spec))
     if len(sources) > 1:
         raise ValueError("一个监听目标只能绑定同源知识库，当前混用了: %s。请只选择 obsidian/local_folder/getnote/ima/hook 中的一种。" % ", ".join(sorted(sources)))
     return True
+
 
 
 def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
@@ -1061,7 +1104,7 @@ def rebuild_kb_index(kb_id, config_path=CONFIG_PATH):
     The index will be rebuilt lazily on the next query via reply_engine.
     """
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
     if spec.get("type") != "local":
@@ -1086,13 +1129,17 @@ def rebuild_kb_index(kb_id, config_path=CONFIG_PATH):
 def diagnose_local_kb(kb_id, query='', config_path=CONFIG_PATH):
     """Diagnose a local KB index and run a sample query."""
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
     if spec.get("type") != "local":
         raise ValueError("仅支持诊断本地知识库: %s" % kb_id)
     import reply_engine
     root = reply_engine._kb_root(cfg)
+    resolved = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+    if resolved is not None:
+        spec = dict(spec)
+        spec["path"] = str(resolved)
     # Ensure the index exists so diagnosis reflects current KB contents.
     con = reply_engine._ensure_local_kb_fts(root, spec)
     if con:
@@ -1189,12 +1236,13 @@ def import_kb_file(kb_id, source_path, config_path=CONFIG_PATH, allow_empty=Fals
     (write a stub markdown) and the result is still non-fatal either way.
     """
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
     if spec.get("type") != "local":
         raise ValueError("仅支持导入本地知识库: %s" % kb_id)
-    dst = Path(spec.get("path") or "")
+    resolved_dst = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+    dst = Path(str(resolved_dst)) if resolved_dst else Path(spec.get("path") or "")
     if not dst.exists():
         dst.mkdir(parents=True, exist_ok=True)
     src = Path(source_path)
@@ -1265,12 +1313,13 @@ def search_local_kb(kb_id, query, limit=5, config_path=CONFIG_PATH):
     monitor setup.
     """
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
     if spec.get("type") != "local":
         raise ValueError("仅支持检索本地知识库: %s" % kb_id)
-    base = Path(spec.get("path") or "")
+    resolved_base = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+    base = Path(str(resolved_base)) if resolved_base else Path(spec.get("path") or "")
     if not base.exists() or not base.is_dir():
         return {"hits": [], "matched_files": 0, "total_files": 0, "query": query}
     toks = re.findall(r"[\u4e00-\u9fff]{2,}|\w+", query or "")
@@ -1364,12 +1413,13 @@ def _find_markitdown_exe():
 def open_kb_dir(kb_id, config_path=CONFIG_PATH):
     """Open local knowledge base directory in file manager."""
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
     if spec.get("type") != "local":
         raise ValueError("仅支持打开本地知识库目录: %s" % kb_id)
-    p = Path(spec.get("path") or "")
+    resolved = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+    p = Path(str(resolved)) if resolved else Path(spec.get("path") or "")
     if not p.exists():
         p.mkdir(parents=True, exist_ok=True)
     import platform
@@ -1383,16 +1433,16 @@ def open_kb_dir(kb_id, config_path=CONFIG_PATH):
         subprocess.Popen(["xdg-open", str(p)])
     return str(p)
 
-
 def open_kb_obsidian(kb_id, config_path=CONFIG_PATH):
     """Open a local knowledge base directory as an Obsidian vault."""
     cfg = load_config(config_path)
-    spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
     if not spec:
         raise ValueError("知识库不存在: %s" % kb_id)
     if spec.get("type") != "local":
         raise ValueError("仅支持用 Obsidian 打开本地知识库: %s" % kb_id)
-    p = Path(spec.get("path") or "")
+    resolved = _resolve_kb_path(spec.get("path"), config_path=config_path, cfg=cfg)
+    p = Path(str(resolved)) if resolved else Path(spec.get("path") or "")
     if not p.exists():
         p.mkdir(parents=True, exist_ok=True)
     exe = _find_obsidian_exe()

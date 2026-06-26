@@ -245,5 +245,211 @@ class TestWikiKbScan(unittest.TestCase):
 
         workdocs = next(r for r in rows if r["id"] == "scene.workdocs")
         self.assertEqual(workdocs["path"], "scenes/workdocs")
+
+
+class TestWikiKbScanActions(unittest.TestCase):
+    """Regression tests for read-only actions on auto-discovered wiki KBs.
+
+    The wiki scanner exposes ``desktop_pdf`` and ``scene.workdocs`` even when
+    they are NOT registered in ``cfg["knowledge_bases"]``.  These actions must
+    succeed for scanned ids:
+      * open_kb_dir / open_kb_obsidian (resolve path)
+      * rebuild_kb_index (delete stale .kb_index.sqlite)
+      * diagnose_local_kb / search_local_kb / import_kb_file (read & write)
+    while ``set_knowledge_base_enabled`` and ``delete_knowledge_base`` must
+    refuse to mutate a KB that has no configured alias.
+    """
+
+    def _setup_wiki(self):
+        """Build a temp dir containing a wiki/ subtree with two scanned KBs.
+
+        Returns (td, cfg_path, wiki_root, desktop_dir, workdocs_dir).  No
+        entries are written to ``cfg["knowledge_bases"]`` so every id below
+        resolves only through the wiki scanner.
+        """
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        cfg_path = Path(td.name) / "targets.json"
+        cfg_path.write_text(json.dumps({}), encoding="utf-8")
+
+        wiki = Path(td.name) / "wiki"
+        desktop_dir = wiki / "desktop_pdf"
+        desktop_dir.mkdir(parents=True)
+        (desktop_dir / "intro.md").write_text(
+            "欢迎语 工作号 用于号码认证场景\n", encoding="utf-8",
+        )
+
+        scenes = wiki / "scenes"
+        workdocs_dir = scenes / "workdocs"
+        workdocs_dir.mkdir(parents=True)
+        (workdocs_dir / "guide.md").write_text(
+            "工作号真实号用于号码认证场景的常见问题\n", encoding="utf-8",
+        )
+        return td, cfg_path, wiki, desktop_dir, workdocs_dir
+
+    def test_scanned_rows_mark_managed_false(self):
+        _, cfg_path, _, _, _ = self._setup_wiki()
+        rows = reg.list_knowledge_bases(config_path=cfg_path)
+        by_id = {r["id"]: r for r in rows}
+        self.assertIn("desktop_pdf", by_id)
+        self.assertIn("scene.workdocs", by_id)
+        self.assertFalse(by_id["desktop_pdf"]["managed"])
+        self.assertFalse(by_id["scene.workdocs"]["managed"])
+        # Configured KBs (none here) would still be marked managed=True.
+        for r in rows:
+            if r["id"] in ("desktop_pdf", "scene.workdocs"):
+                self.assertFalse(r["managed"])
+
+    def test_open_kb_dir_resolves_scanned_id(self):
+        _, cfg_path, _, desktop_dir, _ = self._setup_wiki()
+        called = {}
+        real_popen = reg.subprocess.Popen
+
+        def fake_popen(args, *a, **kw):
+            called.setdefault("args", []).append(list(args))
+            class _Dummy:
+                pass
+            return _Dummy()
+
+        reg.subprocess.Popen = fake_popen
+        try:
+            result = reg.open_kb_dir("desktop_pdf", config_path=cfg_path)
+        finally:
+            reg.subprocess.Popen = real_popen
+
+        self.assertEqual(Path(result).resolve(), desktop_dir.resolve())
+        self.assertEqual(len(called.get("args", [])), 1)
+        cmd = called["args"][0]
+        self.assertEqual(Path(cmd[-1]).resolve(), desktop_dir.resolve())
+
+    def test_open_kb_obsidian_resolves_scanned_id(self):
+        _, cfg_path, _, _, workdocs_dir = self._setup_wiki()
+        called = {}
+        real_popen = reg.subprocess.Popen
+
+        def fake_popen(args, *a, **kw):
+            called.setdefault("args", []).append(list(args))
+            class _Dummy:
+                pass
+            return _Dummy()
+
+        reg.subprocess.Popen = fake_popen
+        try:
+            out = reg.open_kb_obsidian("scene.workdocs", config_path=cfg_path)
+        finally:
+            reg.subprocess.Popen = real_popen
+
+        self.assertEqual(Path(out["path"]).resolve(), workdocs_dir.resolve())
+        self.assertTrue(out.get("executable"))
+        self.assertEqual(len(called.get("args", [])), 1)
+        cmd = called["args"][0]
+        self.assertEqual(Path(cmd[-1]).resolve(), workdocs_dir.resolve())
+
+    def test_rebuild_kb_index_removes_stale_index_on_scanned_id(self):
+        _, cfg_path, _, _, workdocs_dir = self._setup_wiki()
+        db_path = workdocs_dir / ".kb_index.sqlite"
+        db_path.write_text("old index blob", encoding="utf-8")
+        self.assertTrue(db_path.exists())
+        out = reg.rebuild_kb_index("scene.workdocs", config_path=cfg_path)
+        self.assertTrue(out["index_removed"])
+        self.assertFalse(db_path.exists())
+        self.assertEqual(out["id"], "scene.workdocs")
+        self.assertGreaterEqual(out["doc_count"], 1)
+
+    def test_diagnose_local_kb_works_on_scanned_id(self):
+        _, cfg_path, _, _, workdocs_dir = self._setup_wiki()
+        info = reg.diagnose_local_kb(
+            "scene.workdocs", query="工作号", config_path=cfg_path,
+        )
+        # The implementation may or may not have produced a fresh FTS index,
+        # but the keys MUST be present and the path must point at the scanned
+        # directory.  Doc count is non-negative.
+        self.assertIn("index_path", info)
+        self.assertEqual(Path(info["index_path"]).parent.resolve(), workdocs_dir.resolve())
+        self.assertIn("doc_count", info)
+        self.assertIsInstance(info["doc_count"], int)
+        self.assertGreaterEqual(info["doc_count"], 0)
+
+    def test_search_local_kb_works_on_scanned_id(self):
+        _, cfg_path, _, _, _ = self._setup_wiki()
+        result = reg.search_local_kb(
+            "scene.workdocs", "工作号", limit=5, config_path=cfg_path,
+        )
+        self.assertGreaterEqual(result.get("total_files", 0), 1)
+        hits = result.get("hits") or []
+        self.assertTrue(hits, "expected at least one hit for '工作号'")
+        # Token must appear in the hit snippet of the matching file.
+        self.assertTrue(
+            any("工作号" in (h.get("snippet") or "") for h in hits),
+            "expected query token to appear in at least one hit snippet",
+        )
+
+    def test_import_kb_file_works_on_scanned_id(self):
+        _, cfg_path, _, desktop_dir, _ = self._setup_wiki()
+        # Prepare a source markdown outside the KB dir to import.
+        src_dir = desktop_dir.parent.parent / "import_src"
+        src_dir.mkdir(exist_ok=True)
+        src_file = src_dir / "imported.md"
+        src_file.write_text("# imported\n\n用于号码认证的导入条目\n", encoding="utf-8")
+        try:
+            out = reg.import_kb_file(
+                "desktop_pdf", str(src_file), config_path=cfg_path,
+            )
+            copied = out.get("copied") or []
+            self.assertTrue(copied, "expected at least one copied entry, got %r" % (out,))
+            # The copied path must live inside the scanned KB dir.
+            copied_path = Path(copied[0]).resolve()
+            self.assertTrue(
+                str(copied_path).startswith(str(desktop_dir.resolve())),
+                "expected copy under %s, got %s" % (desktop_dir.resolve(), copied_path),
+            )
+            self.assertTrue(copied_path.exists())
+        finally:
+            try:
+                src_file.unlink()
+            except OSError:
+                pass
+
+    def test_set_knowledge_base_enabled_rejects_scanned_id(self):
+        _, cfg_path, _, _, _ = self._setup_wiki()
+        with self.assertRaises(ValueError) as ctx:
+            reg.set_knowledge_base_enabled("scene.workdocs", True, config_path=cfg_path)
+        # The KB map MUST remain untouched for a scanned id.
+        cfg_after = reg.load_config(cfg_path)
+        self.assertNotIn("scene.workdocs", cfg_after.get("knowledge_bases") or {})
+        self.assertIn("未在配置中注册", str(ctx.exception))
+
+    def test_delete_knowledge_base_rejects_scanned_id(self):
+        _, cfg_path, _, _, workdocs_dir = self._setup_wiki()
+        # Capture mtime so we can prove the directory is not deleted either.
+        mtime_before = workdocs_dir.stat().st_mtime
+        with self.assertRaises(ValueError) as ctx:
+            reg.delete_knowledge_base(
+                "scene.workdocs", remove_files=True, config_path=cfg_path,
+            )
+        cfg_after = reg.load_config(cfg_path)
+        self.assertNotIn("scene.workdocs", cfg_after.get("knowledge_bases") or {})
+        self.assertTrue(workdocs_dir.exists(), "scanned dir must not be removed")
+        self.assertEqual(workdocs_dir.stat().st_mtime, mtime_before)
+        self.assertIn("未在配置中注册", str(ctx.exception))
+
+    def test_configured_kb_still_managed_after_scan(self):
+        """Adding an explicit alias for a scanned folder must keep managed=True."""
+        td, cfg_path, _, desktop_dir, _ = self._setup_wiki()
+        cfg = reg.load_config(cfg_path)
+        cfg["knowledge_bases"] = {
+            "scene.desktop": {"type": "local", "path": str(desktop_dir), "enabled": True},
+        }
+        reg.save_json_atomic(cfg_path, cfg)
+        rows = reg.list_knowledge_bases(config_path=cfg_path)
+        by_id = {r["id"]: r for r in rows}
+        # Configured alias stays managed.
+        self.assertIn("scene.desktop", by_id)
+        self.assertTrue(by_id["scene.desktop"]["managed"])
+        # Unregistered scanned id remains unmanaged.
+        self.assertIn("scene.workdocs", by_id)
+        self.assertFalse(by_id["scene.workdocs"]["managed"])
+
+
 if __name__ == "__main__":
     unittest.main()
