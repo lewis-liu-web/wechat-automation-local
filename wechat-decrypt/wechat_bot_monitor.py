@@ -1055,6 +1055,12 @@ def main():
                 log('new msg target=%s local_id=%s content=%r image=%s' % (t.get('name'), lid, m.get('message_content'), m.get('image_path', '')))
                 if _try_handle_admin_command(m, t, cfg, config_path, dry_run=args.dry_run, contact_names=contact_names):
                     continue
+                # Skip messages sent by the bot itself to prevent self-reply loops.
+                if int(m.get('status') or 0) == 2:
+                    log('self_sent_skip target=%s local_id=%s' % (t.get('name'), lid))
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
                 sender = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
                 if t.get('admin_muted'):
                     log('target_muted target=%s local_id=%s' % (t.get('name'), lid))
