@@ -115,6 +115,7 @@ def _row_to_dict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
         return None
     out = dict(row)
     out["payload"] = _json_loads(out.pop("payload_json", "{}"))
+    out["aggregator_summary"] = _json_loads(out.get("aggregator_summary") or "{}")
     if out.get("result_text"):
         out["result_text"] = sanitize_agent_result_text(str(out["result_text"]))
     return out
@@ -181,6 +182,7 @@ def open_db(path: Optional[Path] = None) -> sqlite3.Connection:
         ("result_message_id", "TEXT"),
         ("dispatch_owner", "TEXT"),
         ("dispatch_locked_until", "REAL"),
+        ("aggregator_summary", "TEXT"),
     ]
     for col_name, col_type in migrations:
         if col_name not in cols:
@@ -216,19 +218,19 @@ def enqueue_job(*,
                 priority: int = 0,
                 provider: str | None = None,
                 is_aggregated: bool | None = None,
-               aggregated_local_ids: List[Any] | None = None,
-               session_image_paths: List[str] | None = None,
-               text_parts_count: int | None = None,
-               agent_timeout: float | None = None,
-               knowledge_hits: List[Dict[str, Any]] | None = None,
-               knowledge_bases: List[str] | None = None,
-               reply_mode: str | None = None,
-               retrieval_debug: Dict[str, Any] | None = None,
-               skill_name: str | None = None,
-               dedicated_agent_instance_id: str | None = None,
-               db_path: Optional[Path] = None) -> Dict[str, Any]:
+                aggregated_local_ids: List[Any] | None = None,
+                session_image_paths: List[str] | None = None,
+                text_parts_count: int | None = None,
+                aggregator_summary: Dict[str, Any] | None = None,
+                agent_timeout: float | None = None,
+                knowledge_hits: List[Dict[str, Any]] | None = None,
+                knowledge_bases: List[str] | None = None,
+                reply_mode: str | None = None,
+                retrieval_debug: Dict[str, Any] | None = None,
+                skill_name: str | None = None,
+                dedicated_agent_instance_id: str | None = None,
+                db_path: Optional[Path] = None) -> Dict[str, Any]:
     """Create a queued job, or return the existing job with the same key.
-
     `job_key` is the duplicate-reply guard.  For WeChat messages it should be
     derived from target/table/local_id rather than random UUIDs.
 
@@ -256,6 +258,7 @@ def enqueue_job(*,
         "retrieval_debug": retrieval_debug,
         "skill_name": skill_name,
         "dedicated_agent_instance_id": dedicated_agent_instance_id,
+        "aggregator_summary": aggregator_summary,
     }
     for key, value in _optional_payload_fields.items():
         if value is not None and key not in merged_payload:
@@ -266,13 +269,15 @@ def enqueue_job(*,
             """
             INSERT OR IGNORE INTO agent_jobs (
                 job_key, group_key, target_name, sender, message_local_id,
-                task_type, priority, status, payload_json, provider, created_at, send_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                task_type, priority, status, payload_json, provider, aggregator_summary, created_at, send_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(job_key), str(group_key), target_name, sender, message_local_id,
                 str(task_type), int(priority), STATUS_QUEUED, _json_dumps(merged_payload),
-                provider, ts, SEND_PENDING,
+                provider,
+                _json_dumps(aggregator_summary) if aggregator_summary is not None else None,
+                ts, SEND_PENDING,
             ),
         )
         row = con.execute("SELECT * FROM agent_jobs WHERE job_key=?", (str(job_key),)).fetchone()

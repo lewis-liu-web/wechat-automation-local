@@ -45,8 +45,44 @@ This workspace is a local WeChat automation/research project. The current produc
 ## Development vs runtime directories
 
 - `wechat-automation-local/` is the git repository and development workspace.
-- `CD-only/wechat-decrypt/` is the current runtime/test deployment copy.
+- `E:\projects\GA-projects\CD-only\wechat-decrypt` is the current runtime/test deployment copy.
 - Source of truth is the git repo; deploy by syncing `wechat-decrypt/` to `CD-only/wechat-decrypt/`.
 - Always start `control_api` and `wechat_bot_monitor` from the **runtime directory** (`CD-only/wechat-decrypt/`).
 - Do not manually start the monitor from the git repo directory; otherwise `STOP_FILE`, config paths, and log files drift between the two copies and stop/restart commands fail silently.
 - After code changes: sync to `CD-only`, restart `control_api`, and verify `/status` before asking the user to test the UI.
+
+
+## Sync to runtime rules
+
+To prevent cursor resets, config loss, and accidental message replay:
+
+1. **Stop runtime services before syncing.**
+   - Place `STOP_FILE` (or `wechat_bot_monitor.stop`, per config) and wait for `wechat_bot_monitor.py` to exit.
+   - Stop `control_api.py` if its code changed.
+
+2. **Use a robocopy command that never overwrites runtime state / config.**
+   Example (PowerShell):
+   ```powershell
+   robocopy "E:\projects\GA-projects\wechat-automation-local\wechat-decrypt" "E:\projects\GA-projects\CD-only\wechat-decrypt" /E /R:0 /W:0 `
+     /XD __pycache__ .pytest_cache logs temp data decrypted decoded_images wechat_auto `
+     /XF *.sqlite *.db *.log STOP_FILE wechat_bot_monitor.stop wechat_bot.stop `
+          wechat_bot_targets.json wechat_bot_targets.example.json `
+          config.json config.example.json `
+          wechat_bot_candidates.json wechat_decrypted_targets.json `
+          fast_refresh_state.json all_keys.json agent_jobs.db
+   ```
+   Never use `/MIR` on the runtime directory.
+
+3. **Preserve the knowledge-base layout.**
+   - The canonical root is `wiki/`.
+   - Scene KBs live under `wiki/scenes/<kb>/`.
+   - Do not keep a top-level `scenes/` directory in runtime.
+
+4. **After syncing, verify message cursors before starting the monitor.**
+   - For each target in `wechat_bot_targets.json` / `wechat_decrypted_targets.json`, ensure `last_local_id` is >= the current `MAX(local_id)` in the corresponding decrypted message table.
+   - If a config file was accidentally overwritten and the cursor is stale, set it to the DB max before starting the monitor to avoid replaying history.
+
+5. **Restart in the right order.**
+   - Start `control_api` from `CD-only/wechat-decrypt/` and verify `/status`.
+   - Remove any stale `STOP_FILE`.
+   - Start `wechat_bot_monitor.py` from `CD-only/wechat-decrypt/`.

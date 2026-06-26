@@ -67,6 +67,73 @@ def test_raw_agent_enqueue_carries_skill_and_knowledge_fields():
             assert len(payload.get("knowledge_hits")) >= 1
         finally:
             jobs.DEFAULT_DB_PATH = orig_default
+
+def test_aggregated_prompt_prefix_and_summary():
+    """聚合消息在 raw_agent 模式下必须在 prompt 中携带连续对话前缀和 aggregator_summary。"""
+    import agent_jobs as jobs
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wiki_root = Path(tmpdir) / "wiki"
+        kb_path = wiki_root / "desktop_pdf"
+        kb_path.mkdir(parents=True)
+        (kb_path / "product.md").write_text(
+            "移动云盘是中国移动推出的云存储产品，支持文件备份、多端同步和在线预览。",
+            encoding="utf-8",
+        )
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        target = {
+            "name": "bot群聊测试",
+            "username": "47965620946@chatroom",
+            "table": "Msg_abc",
+            "triggers": ["@小助理"],
+            "knowledge_bases": ["desktop_pdf"],
+            "mode": "group_assistant",
+        }
+        config = {
+            "reply_engine": {"raw_mode": True},
+            "knowledge_bases": {
+                "desktop_pdf": {"type": "local", "path": "desktop_pdf"},
+            },
+            "wiki_dir": str(wiki_root),
+        }
+        message = {
+            "content": "@小助理 看看",
+            "message_content": "@小助理 看看",
+            "local_id": 2,
+            "local_type": 1,
+            "sender_display_name": "测试用户",
+            "context_messages": [
+                {
+                    "local_id": 1,
+                    "sender_id": "u1",
+                    "message_content": "帮我查一下这个订单",
+                    "create_time": 1700000000.0,
+                    "image_path": None,
+                },
+                {
+                    "local_id": 2,
+                    "sender_id": "u1",
+                    "message_content": "@小助理 看看",
+                    "create_time": 1700000001.0,
+                    "image_path": None,
+                },
+            ],
+            "is_aggregated": True,
+            "text_parts_count": 2,
+        }
+        orig_default = jobs.DEFAULT_DB_PATH
+        try:
+            jobs.DEFAULT_DB_PATH = db
+            decision = re.generate_reply(message, target, config)
+            assert decision.should_reply is False
+            assert decision.intent in ("deep_agent_queued", "agent_job_queued"), decision.intent
+            all_jobs = jobs.list_jobs(db_path=db)
+            assert len(all_jobs) >= 1
+            job = all_jobs[-1]
+            payload = job.get("payload") or {}
+            assert payload.get("aggregator_summary") is not None
+            assert "以下是你需要回复的连续对话" in payload.get("prompt", "")
+        finally:
+            jobs.DEFAULT_DB_PATH = orig_default
 def test_legacy_personal_mode_normalizes_to_balanced_agent_payload():
     """legacy personal_assistant target mode must be normalized to group_assistant in agent payload."""
     target = {

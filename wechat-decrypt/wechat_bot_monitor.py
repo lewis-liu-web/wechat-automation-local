@@ -1114,34 +1114,6 @@ def main():
                         log('pending_images fresh_paths=%d total=%d window=%.0fs' % (len(fresh_paths), len(pending), window))
                         if fresh_paths:
                             m['session_image_paths'] = fresh_paths
-                if not should_process:
-                    if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
-                    continue
-
-                # High-risk requests should get an immediate safety boundary reply.
-                # This avoids losing the response if a debounce window is interrupted.
-                boundary = precheck(str(m.get('message_content') or ''))
-                if boundary and boundary.risk_level == 'high':
-                    text = _ensure_sender_mention(postcheck(boundary.reply_text), m, contact_names)
-                    if text and not args.dry_run:
-                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
-                        log('pre_boundary_immediate target=%s local_id=%s ok=%s reason=%s' % (
-                            t.get('name'), lid, ok, boundary.reason))
-                        _record_event(
-                            'send_ok' if ok else 'send_failed',
-                            target=t.get('name'),
-                            sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-                            payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True},
-                        )
-                    if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
-                    continue
-
-                # ---- Message Aggregator (M5) ----
-                # Instead of immediately generating a reply for this single message,
-                # we feed it into a short conversation window.  When the window
-                # closes we get an AggregatedTurn containing all text + images.
                 event = event_from_monitor_message(m, t)
                 # Build minimal event_context for the aggregated turn
                 policy = resolve_target_policy(cfg, t)
@@ -1170,8 +1142,42 @@ def main():
                 )
 
                 if turn is None:
-                    # Window still open – do not reply yet, but advance cursor
-                    # so we don't re-process this message next cycle.
+                    _record_event(
+                        'aggregator_buffered',
+                        target=t.get('name'),
+                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                        payload={'local_id': lid},
+                    )
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
+
+                if not should_process:
+                    _record_event(
+                        'aggregator_dropped',
+                        target=t.get('name'),
+                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                        payload={'local_id': lid},
+                    )
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                    continue
+
+                # High-risk requests should get an immediate safety boundary reply.
+                # This avoids losing the response if a debounce window is interrupted.
+                boundary = precheck(str(m.get('message_content') or ''))
+                if boundary and boundary.risk_level == 'high':
+                    text = _ensure_sender_mention(postcheck(boundary.reply_text), m, contact_names)
+                    if text and not args.dry_run:
+                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
+                        log('pre_boundary_immediate target=%s local_id=%s ok=%s reason=%s' % (
+                            t.get('name'), lid, ok, boundary.reason))
+                        _record_event(
+                            'send_ok' if ok else 'send_failed',
+                            target=t.get('name'),
+                            sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                            payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True},
+                        )
                     if advance_state:
                         t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
                     continue

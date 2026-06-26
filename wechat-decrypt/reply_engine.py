@@ -1796,6 +1796,28 @@ def generate_reply(message: Dict[str, Any] | str,
 
     if raw_agent_mode:
         context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
+        # ---- Aggregator summary for deep-agent context (M5) ----
+        ctx = message.get("context_messages") or []
+        parts = []
+        for idx, cm in enumerate(ctx, start=1):
+            text = str(cm.get("message_content") or cm.get("content") or "").strip()
+            image_path = cm.get("image_path") or None
+            parts.append({
+                "index": idx,
+                "local_id": int(cm.get("local_id") or 0),
+                "sender": str(cm.get("sender_id") or ""),
+                "sender_display_name": str(message.get("sender_display_name") or ""),
+                "text": text,
+                "image_path": image_path,
+                "timestamp": str(cm.get("create_time") or ""),
+            })
+        aggregator_summary = {
+            "is_aggregated": bool(message.get("is_aggregated")),
+            "text_parts_count": int(message.get("text_parts_count") or len(parts)),
+            "parts": parts,
+            "conversation_id": f"{message.get('chat_id') or message.get('talker_id') or ''}::{message.get('sender_id') or message.get('username') or ''}",
+        }
+        # -------------------------------------------------------
         selected_kbs = resolve_target_kb_ids(config, target)
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
         response_mode = _normalize_response_mode((target_policy or {}).get("mode") or target.get("mode") or "group_assistant")
@@ -1851,6 +1873,18 @@ def generate_reply(message: Dict[str, Any] | str,
                 # No vision capability – mark as missing so agent_provider can degrade gracefully
                 image_descriptions = [{"path": p, "description": "[当前环境未配置视觉识别能力]"} for p in image_paths]
         prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode)
+        # Inject readable aggregator context before the [用户消息] block
+        if aggregator_summary["is_aggregated"] and aggregator_summary["text_parts_count"] >= 2:
+            prefix_lines = [f"以下是你需要回复的连续对话（共 {aggregator_summary['text_parts_count']} 条消息）："]
+            sender = message.get("sender_display_name") or message.get("mention_name") or "用户"
+            for i, p in enumerate(aggregator_summary["parts"], start=1):
+                text = p["text"]
+                if p.get("image_path") and text:
+                    text = f"[图片] {text}"
+                elif p.get("image_path"):
+                    text = "[图片]"
+                prefix_lines.append(f"[{i}] {sender}: {text}")
+            prompt = "\n".join(prefix_lines) + "\n\n" + prompt
         boundary = precheck(clean or raw_text)
         if boundary:
             boundary.reply_text = postcheck(boundary.reply_text)
@@ -1863,17 +1897,26 @@ def generate_reply(message: Dict[str, Any] | str,
         route_decision = None
         if _HAS_TASK_ROUTER:
             local_type = message.get("local_type") if isinstance(message, dict) else None
-            msg_type = "text"
-            if local_type == 3:
-                msg_type = "image"
-            elif local_type == 34:
-                msg_type = "voice"
-            elif local_type == 49:
-                msg_type = "file"
+            if aggregator_summary["is_aggregated"]:
+                has_image = any(bool(p.get("image_path")) for p in aggregator_summary["parts"])
+                last_part = aggregator_summary["parts"][-1]
+                if has_image and str(last_part.get("text") or "").strip():
+                    msg_type = "image"
+                else:
+                    msg_type = "text"
+            else:
+                msg_type = "text"
+                if local_type == 3:
+                    msg_type = "image"
+                elif local_type == 34:
+                    msg_type = "voice"
+                elif local_type == 49:
+                    msg_type = "file"
+                has_image = bool(image_paths)
             route_decision = _task_router.route_message(  # type: ignore
                 clean,
                 message_type=msg_type,
-                has_image=bool(image_paths),
+                has_image=has_image,
                 has_file=(local_type == 49),
             )
             if route_decision.route == _task_router.ROUTE_DEEP:  # type: ignore
@@ -1891,10 +1934,11 @@ def generate_reply(message: Dict[str, Any] | str,
                         aggregated_local_ids=message.get("aggregated_local_ids") if isinstance(message, dict) else None,
                         session_image_paths=message.get("session_image_paths") if isinstance(message, dict) else None,
                         text_parts_count=message.get("text_parts_count") if isinstance(message, dict) else None,
+                        aggregator_summary=aggregator_summary,
                         agent_timeout=240.0 if image_paths else 90.0,
                         task_type="deep_agent",
                         payload=_json_safe({
-                            "prompt": clean or raw_text,
+                            "prompt": prompt,
                             "clean_text": clean,
                             "raw_text": raw_text,
                             "skill_name": "wechat_task",
@@ -1968,9 +2012,10 @@ def generate_reply(message: Dict[str, Any] | str,
                     dedicated_agent_instance_id=dedicated_instance_id,
                     session_image_paths=message.get("session_image_paths") if isinstance(message, dict) else None,
                     text_parts_count=message.get("text_parts_count") if isinstance(message, dict) else None,
+                    aggregator_summary=aggregator_summary,
                     agent_timeout=240.0 if image_paths else 90.0,
                     payload=_json_safe({
-                        "prompt": clean or raw_text,
+                        "prompt": prompt,
                         "clean_text": clean,
                         "raw_text": raw_text,
                         "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),

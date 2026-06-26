@@ -139,3 +139,47 @@ def test_enqueue_backward_compatibility_with_skill_prompt():
         p = fetched.get("payload") or {}
         assert p.get("skill_prompt") == "You are the legacy WeChat assistant."
         assert "skill_name" not in p
+
+
+def test_aggregator_summary_round_trip():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        summary = {
+            "is_aggregated": True,
+            "text_parts_count": 2,
+            "parts": [
+                {
+                    "index": 1,
+                    "local_id": 1,
+                    "sender": "u1",
+                    "sender_display_name": "测试用户",
+                    "text": "帮我查一下这个订单",
+                    "image_path": None,
+                    "timestamp": "1700000000.0",
+                },
+                {
+                    "index": 2,
+                    "local_id": 2,
+                    "sender": "u1",
+                    "sender_display_name": "测试用户",
+                    "text": "@小助理 看看",
+                    "image_path": None,
+                    "timestamp": "1700000001.0",
+                },
+            ],
+            "conversation_id": "chat::sender",
+        }
+        job = jobs.enqueue_job(
+            job_key="test_agg_summary_001",
+            group_key="test_group",
+            task_type="deep_agent",
+            payload={"prompt": "prompt text"},
+            target_name="bot群聊测试",
+            sender="alice",
+            message_local_id=42,
+            aggregator_summary=summary,
+            db_path=db,
+        )
+        fetched = jobs.get_job(job_id=job["id"], db_path=db)
+        assert fetched["aggregator_summary"] == summary
+        assert fetched["payload"].get("aggregator_summary") == summary

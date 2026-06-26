@@ -118,6 +118,17 @@ class AggregationPipelineTests(unittest.TestCase):
         self.assertTrue(turn.trigger_matched)
         self.assertEqual(turn.image_paths, ['/tmp/meter.jpg'])
         self.assertIn('这个怎么处理', turn.combined_text())
+    def test_non_trigger_messages_are_buffered_and_flushed(self):
+        config = {'max_aggregated_messages': 2}
+        e1 = self._event(1, content='帮我查一下这个订单')
+        e2 = self._event(2, content='小助手')
+        self.assertIsNone(agg.ingest_event(e1, config=config))
+        turn = agg.ingest_event(e2, config=config)
+        self.assertIsNotNone(turn)
+        self.assertEqual(len(turn.text_parts), 2)
+        combined = turn.combined_text()
+        self.assertIn('帮我查一下这个订单', combined)
+        self.assertIn('小助手', combined)
 
     def test_trigger_inheritance_on_time_flush(self):
         agg.ingest_event(self._event(1, content='对了'))
