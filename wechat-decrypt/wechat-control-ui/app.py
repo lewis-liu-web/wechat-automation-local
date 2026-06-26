@@ -1075,6 +1075,7 @@ def _page_knowledge():
         kb_id = kb.get("id") or ""
         enabled = bool(kb.get("enabled"))
         kb_type = (kb.get("type") or "local").lower()
+        managed = bool(kb.get("managed", True))
         upload_nonce_key = "kb_upload_nonce_%s" % kb_id
         if upload_nonce_key not in st.session_state:
             st.session_state[upload_nonce_key] = 0
@@ -1105,17 +1106,22 @@ def _page_knowledge():
                     suffix = ""
                 st.markdown("**%s**  %s%s" % (kb_id, "已启用" if enabled else "已停用", suffix))
                 # 来源行：去掉“类型”重复，只保留来源 + 说明
-                st.caption("来源：%s · 说明：%s" % (
+                # 未注册（wiki 扫描得到）的 KB 仅展示，不可启用/停用/删除
+                managed_caption = " · 未注册" if not managed else ""
+                st.caption("来源：%s · 说明：%s%s" % (
                     _label(KB_SOURCE_LABELS, kb.get("source") or "local_folder"),
                     kb.get("description") or "",
+                    managed_caption,
                 ))
                 if kb.get("path"):
                     st.caption("路径：%s" % kb.get("path"))
                 if kb.get("knowledge_base_id"):
                     st.caption("外部ID：%s" % kb.get("knowledge_base_id"))
             with cols[1]:
+                # 未注册（wiki 扫描得到）的 KB：禁用启用/停用/删除，仅允许打开与查询
+                mutation_disabled = not managed
                 if enabled:
-                    if st.button("停用", key="kb_off_%s" % kb_id, use_container_width=True):
+                    if st.button("停用", key="kb_off_%s" % kb_id, use_container_width=True, disabled=mutation_disabled, help="未注册的 KB 无法停用" if mutation_disabled else None):
                         try:
                             disable_kb(kb_id, base_url=base)
                             if "data_loaded" in st.session_state:
@@ -1124,7 +1130,7 @@ def _page_knowledge():
                         except ControlAPIError as e:
                             st.error("停用失败：%s" % (e,))
                 else:
-                    if st.button("启用", key="kb_on_%s" % kb_id, use_container_width=True):
+                    if st.button("启用", key="kb_on_%s" % kb_id, use_container_width=True, disabled=mutation_disabled, help="未注册的 KB 无法启用" if mutation_disabled else None):
                         try:
                             enable_kb(kb_id, base_url=base)
                             if "data_loaded" in st.session_state:
@@ -1132,7 +1138,7 @@ def _page_knowledge():
                             st.rerun()
                         except ControlAPIError as e:
                             st.error("启用失败：%s" % (e,))
-                if st.button("删除", key="kb_del_%s" % kb_id, use_container_width=True):
+                if st.button("删除", key="kb_del_%s" % kb_id, use_container_width=True, disabled=mutation_disabled, help="未注册的 KB 无法删除" if mutation_disabled else None):
                     try:
                         delete_kb(kb_id, remove_files=False, base_url=base)
                         if "data_loaded" in st.session_state:
