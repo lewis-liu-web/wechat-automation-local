@@ -505,6 +505,19 @@ class TestBindWikiAutoRegister(unittest.TestCase):
         cfg = reg.load_config(cfg_path)
         self.assertNotIn("scene.nonexistent", cfg.get("knowledge_bases", {}))
 
+    def test_bind_wiki_partial_failure_does_not_persist_registration(self):
+        """If one KB is valid scanned but another is unknown, no KB is persisted."""
+        _, cfg_path, _, _ = self._setup_wiki_with_target()
+        with self.assertRaises(ValueError):
+            reg.bind_wiki(
+                "wxid_a",
+                ["scene.workdocs", "scene.nonexistent"],
+                replace=True,
+                config_path=cfg_path,
+            )
+        cfg = reg.load_config(cfg_path)
+        self.assertEqual(cfg.get("knowledge_bases", {}), {})
+
     def test_enable_candidate_auto_registers_scanned_kb(self):
         td, cfg_path, cand_path, workdocs_dir = self._setup_wiki_with_target()
         reg.save_json_atomic(cand_path, {
