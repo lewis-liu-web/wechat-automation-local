@@ -830,8 +830,8 @@ def _ensure_kb_registered(kb_id, cfg=None, config_path=CONFIG_PATH):
       * If the KB is already configured, return the existing spec untouched.
       * Otherwise consult :func:`_get_kb_spec`. When that yields a spec with
         ``_from_scan=True``, copy the relevant fields into
-        ``cfg["knowledge_bases"][kb_id]``, persist the config, and return the
-        freshly registered spec.
+        ``cfg["knowledge_bases"][kb_id]`` and return the freshly registered
+        spec. The caller must save ``cfg`` after the overall operation validates.
       * Returns None for KB ids that neither match a configured entry nor a
         scanned wiki folder — the caller is expected to raise the standard
         "unknown knowledge base" error.
@@ -850,7 +850,7 @@ def _ensure_kb_registered(kb_id, cfg=None, config_path=CONFIG_PATH):
                   if spec.get(k) is not None}
     registered.setdefault("id", kb_id)
     cfg["knowledge_bases"][kb_id] = registered
-    save_json_atomic(config_path, cfg)
+    # Caller is responsible for saving config after validating the full operation.
     return registered
 
 
