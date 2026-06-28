@@ -33,6 +33,7 @@
       "session_policy": {
         "timeout_seconds": 60,
         "max_turns": 3,
+        "_require_followup_intent_comment": "true/unset = session messages go to reply_decision; false = session follow-ups stay silent",
         "require_followup_intent": true
       },
       "knowledge_bases": [
@@ -67,6 +68,7 @@
       "session_policy": {
         "timeout_seconds": 120,
         "max_turns": 5,
+        "_require_followup_intent_comment": "true/unset = session messages go to reply_decision; false = session follow-ups stay silent",
         "require_followup_intent": true
       },
       "knowledge_bases": [

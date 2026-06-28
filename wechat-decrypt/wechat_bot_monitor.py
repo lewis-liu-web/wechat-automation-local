@@ -115,11 +115,6 @@ MODE_DEFAULTS = {
     },
 }
 
-FOLLOWUP_PATTERNS = [
-    '继续', '那这个', '这个呢', '为什么', '怎么', '如何', '咋', '然后呢', '还有呢',
-    '什么意思', '啥意思', '看下', '帮我看', '分析', '对吗', '可以吗', '要怎么',
-    '图片', '图里', '截图', '上面', '刚才', '前面', '它', '这个', '?', '？'
-]
 
 CLOSE_SESSION_PATTERNS = ['谢谢', '谢了', '好了', '好啦', '明白', '懂了', '不用了', '没事了', '解决了']
 
@@ -184,9 +179,6 @@ def _message_text(msg):
     return str((msg or {}).get('message_content') or '').strip()
 
 
-def _looks_like_followup(text):
-    low = str(text or '').lower()
-    return any(p.lower() in low for p in FOLLOWUP_PATTERNS)
 
 
 def _looks_like_session_close(text):
@@ -259,16 +251,19 @@ def _is_in_session(t, msg, cfg):
             log('session_miss key=%s reason=max_turns turns=%s max=%s' % (key, turns, max_turns))
             return False
         require_followup = bool(session_policy.get('require_followup_intent', True))
+        if not require_followup:
+            log('session_miss key=%s reason=session_followup_disabled' % key)
+            return False
         has_images = bool(msg.get('image_path') or msg.get('session_image_paths'))
-        if require_followup and not has_images and not _looks_like_followup(text):
-            log('session_miss key=%s reason=no_followup_intent text=%r' % (key, text[:80]))
+        if not text and not has_images:
+            log('session_miss key=%s reason=empty_text' % key)
             return False
         timeout = float(session_policy.get('timeout_seconds') or cfg.get('session_window') or SESSION_WINDOW_DEFAULT)
         sess['turns'] = turns + 1
         sess['last_message_at'] = time.time()
         sess['expires_at'] = time.time() + timeout
-        log('session_hit key=%s turns=%s expires_in=%.0fs followup=%s image=%s' % (
-            key, sess['turns'], sess['expires_at'] - time.time(), _looks_like_followup(text), has_images))
+        log('session_hit key=%s turns=%s expires_in=%.0fs image=%s' % (
+            key, sess['turns'], sess['expires_at'] - time.time(), has_images))
         return True
     log('session_miss key=%s active_keys=%s' % (key, list(_active_sessions.keys())))
     return False

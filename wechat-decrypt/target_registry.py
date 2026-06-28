@@ -427,6 +427,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         for kb in new_kbs or []:
             if kb not in merged:
                 merged.append(kb)
+        for kb in merged:
+            _ensure_kb_registered(kb, cfg=cfg, config_path=config_path)
         validate_knowledge_bases(merged, cfg=cfg)
         return merged
 
@@ -466,6 +468,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
         save_json_atomic(candidates_path, data)
         return existing
     selected_kbs = knowledge_bases or cand.get("suggested_knowledge_bases") or []
+    for kb in selected_kbs:
+        _ensure_kb_registered(kb, cfg=cfg, config_path=config_path)
     validate_knowledge_bases(selected_kbs, cfg=cfg)
     target = {
         "name": cand.get("name") or username,
@@ -564,12 +568,16 @@ def mode_bundle(mode: str) -> Dict[str, Any]:
         return {
             "mode": "customer_service",
             "reply_policy": "knowledge_grounded",
+            # require_followup_intent: True/unset = session messages go to reply_decision.decide();
+            # False = session follow-ups are silent without calling decide().
             "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
             "context_policy": {"time_window_seconds": 120, "max_messages": 40, "sender_recent_limit": 6, "include_bot_recent": True},
         }
     return {
         "mode": "group_assistant",
         "reply_policy": "balanced",
+            # require_followup_intent: True/unset = session messages go to reply_decision.decide();
+            # False = session follow-ups are silent without calling decide().
         "session_policy": {"timeout_seconds": 60, "max_turns": 3, "require_followup_intent": True},
         "context_policy": {"time_window_seconds": 90, "max_messages": 30, "sender_recent_limit": 5, "include_bot_recent": True},
     }
@@ -813,6 +821,39 @@ def _is_scanned_kb(kb_id, cfg=None, config_path=CONFIG_PATH):
     return bool(spec and spec.get("_from_scan"))
 
 
+
+def _ensure_kb_registered(kb_id, cfg=None, config_path=CONFIG_PATH):
+    """Auto-register a scanned wiki KB into cfg["knowledge_bases"] when needed.
+
+    Behavior:
+      * ``legacy:<id>`` aliases pass through and return None (validation skips them).
+      * If the KB is already configured, return the existing spec untouched.
+      * Otherwise consult :func:`_get_kb_spec`. When that yields a spec with
+        ``_from_scan=True``, copy the relevant fields into
+        ``cfg["knowledge_bases"][kb_id]``, persist the config, and return the
+        freshly registered spec.
+      * Returns None for KB ids that neither match a configured entry nor a
+        scanned wiki folder — the caller is expected to raise the standard
+        "unknown knowledge base" error.
+    """
+    if not kb_id or str(kb_id).startswith("legacy:"):
+        return None
+    cfg = cfg if cfg is not None else load_config(config_path)
+    cfg.setdefault("knowledge_bases", {})
+    if kb_id in cfg["knowledge_bases"]:
+        return cfg["knowledge_bases"][kb_id]
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
+    if not spec or not spec.get("_from_scan"):
+        return None
+    registered = {k: spec.get(k) for k in
+                  ("id", "type", "path", "source", "scope", "description", "enabled")
+                  if spec.get(k) is not None}
+    registered.setdefault("id", kb_id)
+    cfg["knowledge_bases"][kb_id] = registered
+    save_json_atomic(config_path, cfg)
+    return registered
+
+
 def list_knowledge_bases(config_path=CONFIG_PATH):
     cfg = load_config(config_path)
     rows = []
@@ -1038,6 +1079,8 @@ def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
             if kb not in cur:
                 cur.append(kb)
         final_kbs = cur
+    for kb in final_kbs:
+        _ensure_kb_registered(kb, cfg=cfg, config_path=config_path)
     validate_knowledge_bases(final_kbs, cfg=cfg)
     t["knowledge_bases"] = final_kbs
     save_json_atomic(config_path, cfg)

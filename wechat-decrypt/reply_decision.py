@@ -40,7 +40,7 @@ _FOLLOWUP_HINT = re.compile(
     r"这图|截图|图片|上面|刚才|前面|这个怎么|这个为啥|"
     r"再.{0,4}下|再.{0,4}一遍|再讲|再说|还有吗|是吗|对吗)"
 )
-_ACK_ONLY = re.compile(r"^[\s\u2005]*((谢谢|谢啦|好的?|好哒|收到|嗯|ok|OK|👌|👍|🙏|😂|😄|🎉|🤣|🤝|🙃|哈哈|嘿嘿|笑死|好)+[\s\u2005,，。!！?？]*)+$")
+_ACK_ONLY = re.compile(r"^[\s\u2005]*((谢谢|谢啦|好的?|好哒|收到|嗯|ok|OK|👌|👍|🙏|😂|😄|🎉|🤣|🤝|🙃|哈哈|嘿嘿|笑死|好)+[\s\u2005,，。!！?？]*)+$", re.IGNORECASE)
 _CLOSE_HINT = re.compile(r"(谢谢|谢了|好了|好啦|明白|懂了|不用了|没事了|解决了|不需要|算了)")
 _RISK_HINT = re.compile(
     r"(密钥|keys\.json|api[_ -]?key|token|password|pwd|密码|验证码|"
@@ -140,11 +140,22 @@ def _detect_risk(text: str) -> Optional[str]:
 
 
 def _is_active_session_followup(msg: Dict[str, Any], text: str, has_images: bool) -> bool:
+    """Open-session follow-up detection.
+
+    Once a sender is in an active session, their next non-empty message
+    counts as a follow-up unless it is a pure acknowledgement or a close
+    hint. The downstream agent decides whether the message actually needs
+    a reply.
+    """
     if has_images:
         return True
-    if _looks_like_followup(text):
-        return True
-    return False
+    if not text:
+        return False
+    if _is_ack_only(text):
+        return False
+    if _looks_like_close(text):
+        return False
+    return True
 
 
 def decide(target: Dict[str, Any], msg: Dict[str, Any],
@@ -187,6 +198,12 @@ def decide(target: Dict[str, Any], msg: Dict[str, Any],
     # 2. Pure acknowledgement in a non-active session: stay silent.
     if not session_active and _is_ack_only(text) and not has_images:
         plan.reason = "ack_only_no_session"
+        plan.reply_mode = "silent"
+        plan.confidence = 0.9
+        return plan
+    # 2b. Pure acknowledgement inside an active session: stay silent.
+    if session_active and _is_ack_only(text) and not has_images:
+        plan.reason = "ack_only_in_session"
         plan.reply_mode = "silent"
         plan.confidence = 0.9
         return plan

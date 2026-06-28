@@ -451,5 +451,79 @@ class TestWikiKbScanActions(unittest.TestCase):
         self.assertFalse(by_id["scene.workdocs"]["managed"])
 
 
+class TestBindWikiAutoRegister(unittest.TestCase):
+    """Auto-register scanned wiki KBs when binding them to a target."""
+
+    def _setup_wiki_with_target(self):
+        """Build a temp dir with a wiki/scenes/workdocs folder and a target."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        cfg_path = Path(td.name) / "targets.json"
+        cfg = {
+            "knowledge_bases": {},
+            "targets": [{
+                "name": "群A",
+                "username": "wxid_a",
+                "knowledge_bases": [],
+            }],
+        }
+        reg.save_json_atomic(cfg_path, cfg)
+        cand_path = Path(td.name) / "candidates.json"
+        reg.save_json_atomic(cand_path, {"version": 1, "candidates": []})
+
+        wiki = Path(td.name) / "wiki"
+        scenes = wiki / "scenes"
+        workdocs_dir = scenes / "workdocs"
+        workdocs_dir.mkdir(parents=True)
+        (workdocs_dir / "guide.md").write_text(
+            "工作号真实号用于号码认证场景的常见问题\n", encoding="utf-8",
+        )
+        return td, cfg_path, cand_path, workdocs_dir
+
+    def test_bind_wiki_auto_registers_scanned_kb(self):
+        _, cfg_path, _, workdocs_dir = self._setup_wiki_with_target()
+        t = reg.bind_wiki(
+            "wxid_a", ["scene.workdocs"], replace=True, config_path=cfg_path,
+        )
+        self.assertEqual(t["knowledge_bases"], ["scene.workdocs"])
+        cfg = reg.load_config(cfg_path)
+        self.assertIn("scene.workdocs", cfg["knowledge_bases"])
+        spec = cfg["knowledge_bases"]["scene.workdocs"]
+        self.assertEqual(spec.get("path"), "scenes/workdocs")
+        self.assertEqual(spec.get("type"), "local")
+        self.assertEqual(spec.get("source"), "local_folder")
+        self.assertEqual(spec.get("scope"), "scene")
+        self.assertTrue(spec.get("enabled", False))
+
+    def test_bind_wiki_still_rejects_truly_unknown_kb(self):
+        _, cfg_path, _, _ = self._setup_wiki_with_target()
+        with self.assertRaises(ValueError) as ctx:
+            reg.bind_wiki(
+                "wxid_a", ["scene.nonexistent"], replace=True, config_path=cfg_path,
+            )
+        self.assertIn("unknown knowledge base", str(ctx.exception).lower())
+        cfg = reg.load_config(cfg_path)
+        self.assertNotIn("scene.nonexistent", cfg.get("knowledge_bases", {}))
+
+    def test_enable_candidate_auto_registers_scanned_kb(self):
+        td, cfg_path, cand_path, workdocs_dir = self._setup_wiki_with_target()
+        reg.save_json_atomic(cand_path, {
+            "version": 1,
+            "candidates": [{"username": "wxid_b", "name": "群B", "status": "pending"}],
+        })
+        t = reg.enable_candidate(
+            "wxid_b",
+            knowledge_bases=["scene.workdocs"],
+            config_path=cfg_path,
+            candidates_path=cand_path,
+        )
+        self.assertEqual(t["knowledge_bases"], ["scene.workdocs"])
+        cfg = reg.load_config(cfg_path)
+        self.assertIn("scene.workdocs", cfg["knowledge_bases"])
+        spec = cfg["knowledge_bases"]["scene.workdocs"]
+        self.assertEqual(spec.get("path"), "scenes/workdocs")
+        self.assertEqual(spec.get("type"), "local")
+
+
 if __name__ == "__main__":
     unittest.main()
