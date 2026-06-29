@@ -66,6 +66,7 @@ wechat-decrypt/temp/
 update_backup_*/
 remote_update/
 pywechat_probe/
+source_read/
 
 # Private bot knowledge and chat-derived samples
 wechat-decrypt/wiki/groups/
