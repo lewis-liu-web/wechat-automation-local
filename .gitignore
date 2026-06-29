@@ -1,4 +1,5 @@
 # Secrets, keys, configs, decrypted/private data
+AGENTS.md
 *.key
 *key*.txt
 *keys*.json
