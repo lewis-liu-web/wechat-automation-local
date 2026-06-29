@@ -1653,7 +1653,7 @@ def _normalize_response_mode(mode: str | None) -> str:
 def _mode_instruction(mode: str) -> str:
     normalized = _normalize_response_mode(mode)
     if normalized == "customer_service":
-        return "当前响应模式：客服。用客服口吻，先确认诉求；信息不足时只问一个必要澄清问题；不要承诺、报价、授权或替负责人做决定。"
+        return "当前响应模式：客服。用客服口吻，先确认诉求；如果知识库里有相关资料，请基于资料给出处理建议或排查步骤；只有资料无法覆盖时才追问一个必要澄清问题。不要替负责人承诺、报价、授权或做高风险决定。"
     return "当前响应模式：平衡。简短克制，只回答用户明确表达的问题；不主动扩展，不替负责人承诺。"
 
 
