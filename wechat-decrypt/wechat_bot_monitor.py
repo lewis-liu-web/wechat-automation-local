@@ -20,6 +20,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
+try:
+    import zstandard as _zstd
+    _ZSTD_DCTX = _zstd.ZstdDecompressor()
+except Exception:  # pragma: no cover
+    _zstd = None
+    _ZSTD_DCTX = None
+
 from reply_engine import DEFAULT_TRIGGERS, generate_reply, precheck, postcheck
 from reply_decision import decide as reply_decision_decide
 from wechat_sender import send_reply_detailed
@@ -411,8 +418,46 @@ def clean_value(v):
     return v
 
 
+def _decode_message_content(content, ct):
+    """Return plaintext for message_content. ct is WCDB_CT_message_content.
+
+    - 4: zstd-compressed BLOB -> decompress -> utf-8 string
+    - 0 / None: pass through (may be str or bytes)
+    - bytes (any other ct) -> utf-8 with errors='replace'
+    - str -> return as-is
+
+    On zstd failure: warn and return '' (do not raise; one bad message must
+    not kill the monitor loop).
+    """
+    if ct == 4 and isinstance(content, (bytes, bytearray)):
+        if _ZSTD_DCTX is None:
+            log('warn zstd content present but zstandard not installed')
+            return ''
+        try:
+            return _ZSTD_DCTX.decompress(content).decode('utf-8', errors='replace')
+        except Exception as e:
+            log('warn zstd decompress failed: %r' % (e,))
+            return ''
+    if isinstance(content, (bytes, bytearray)):
+        return content.decode('utf-8', errors='replace')
+    return content
+
+
 def row_to_dict(row):
-    d = {k: clean_value(row[k]) for k in row.keys()}
+    ct = None
+    if 'WCDB_CT_message_content' in row.keys():
+        try:
+            ct = int(row['WCDB_CT_message_content'] or 0)
+        except Exception:
+            ct = 0
+    d = {}
+    for k in row.keys():
+        v = row[k]
+        if k == 'message_content' and ct is not None:
+            v = _decode_message_content(v, ct)
+        elif isinstance(v, (bytes, bytearray)):
+            v = '<bytes %d>' % len(v)
+        d[k] = v
     ts = d.get('create_time') or 0
     try:
         d['create_time_local'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ts))) if int(ts) else ''
@@ -519,7 +564,8 @@ def fetch_new_for_db(db_name, targets):
                 continue
             last_id = int(t.get('last_local_id') or 0)
             sql = f'''select local_id, server_id, local_type, sort_seq, real_sender_id,
-                             create_time, status, message_content, source, packed_info_data
+                             create_time, status, message_content, source, packed_info_data,
+                             WCDB_CT_message_content
                       from "{table}"
                       where local_id > ?
                       order by local_id asc
@@ -546,7 +592,7 @@ def fetch_latest_for_target(t):
     try:
         if not table_exists(con, table):
             return None
-        row = con.execute(f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data from "{table}" order by local_id desc limit 1').fetchone()
+        row = con.execute(f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data, WCDB_CT_message_content from "{table}" order by local_id desc limit 1').fetchone()
         return row_to_dict(row) if row else None
     finally:
         con.close()
@@ -572,7 +618,7 @@ def has_self_sent_after(t, after_local_id, text_hint=None):
         if not table_exists(con, table):
             return None
         rows = con.execute(
-            f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data from "{table}" where local_id > ? and status = 2 order by local_id asc limit 8',
+            f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data, WCDB_CT_message_content from "{table}" where local_id > ? and status = 2 order by local_id asc limit 8',
             (int(after_local_id or 0),)
         ).fetchall()
         hint = (text_hint or '').strip()
@@ -706,7 +752,7 @@ def fetch_context_for_target(t, upto_local_id=None, limit=12):
         if upto_local_id is not None:
             where = 'where local_id <= ?'
             params.append(int(upto_local_id))
-        sql = 'select local_id, real_sender_id, create_time, status, message_content, packed_info_data from "%s" %s order by local_id desc limit ?' % (table, where)
+        sql = 'select local_id, real_sender_id, create_time, status, message_content, packed_info_data, WCDB_CT_message_content from "%s" %s order by local_id desc limit ?' % (table, where)
         params.append(max(1, int(limit)))
         rows = [row_to_dict(r) for r in con.execute(sql, params)]
         out = []
