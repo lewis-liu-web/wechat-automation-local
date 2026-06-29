@@ -138,6 +138,17 @@ wechat-auto kb-delete <kb-id> --yes
 
 Run `wechat-auto <command> --help` for full options.
 
+## Response modes: customer_service vs group_assistant
+
+Each target can run in one of two response modes, selected with `wechat-auto target-mode <chat-name> customer_service|group_assistant`. The two modes diverge in four layers:
+
+- **Mode normalization** — Only `customer_service` is treated as a special case internally. Any other mode value (including the default) is normalized to `group_assistant`.
+- **Mode instruction text** — `customer_service` tells the agent to first confirm what the user is asking, then answer from the bound knowledge base whenever it covers the question, and only fall back to a clarifying question when the KB cannot help. `group_assistant` is short and restrained: respond only to what is explicitly asked, without proactive clarification or KB-driven expansion.
+- **Routing and policy** — `reply_decision.decide` returns `ask_clarification` for `customer_service` targets when no trigger matches and there is no clear follow-up, while `group_assistant` stays silent in the same situation. The `mode_bundle` also gives `customer_service` longer session and context windows: `timeout` 120s vs 60s, `max_turns` 5 vs 3, context `time_window` 120s vs 90s, `max_messages` 40 vs 30, and `sender_recent_limit` 6 vs 5.
+- **Immediate feedback and KB fallback** — `_agent_ack` sends the "正在处理中，请稍等。" acknowledgment only for `customer_service`; `group_assistant` does not preemptively reply. `generate_reply` early-exits to a `kb_clarification` template when `customer_service` has no `scene_hits`, while `group_assistant` proceeds straight to the agent.
+
+> Note: a comment near `_agent_ack` mentions a "free mode", but no such mode exists in code — only `customer_service` and `group_assistant` are recognized.
+
 ## Project layout
 
 ```text

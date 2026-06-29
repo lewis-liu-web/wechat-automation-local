@@ -158,6 +158,21 @@ python wiki_dry_run.py --target "群组名称" --query "如何申请权限？"
 }
 ```
 
+### 响应模式：客服 vs 平衡
+
+回复引擎支持两种响应模式，由 `target-mode` 设置：`customer_service`（客服）和 `group_assistant`（群助手 / 平衡）。代码层面对 `customer_service` 做了特化处理，其它取值一律归一化为 `group_assistant`；配置中并不存在第三种"free mode"。
+
+| 维度 | `customer_service`（客服） | `group_assistant`（群助手 / 平衡） |
+| --- | --- | --- |
+| 模式归一化 | 唯一特殊分支，按客服逻辑处理 | 其余任意值都归一化为此模式 |
+| 模式指令文本 | 强调先确认需求；知识库能覆盖就直接答，知识库没覆盖时再追问 | 短而克制，只回答用户明确问到的那部分 |
+| 路由与策略 | `reply_decision.decide` 在没有触发词或明确追问时返回 `ask_clarification` | 同样条件下保持沉默，不主动开口 |
+| 会话 / 上下文窗口 | `timeout=120s`，`max_turns=5`，上下文 `time_window=120s`，`max_messages=40`，`sender_recent_limit=6` | `timeout=60s`，`max_turns=3`，上下文 `time_window=90s`，`max_messages=30`，`sender_recent_limit=5` |
+| 立即反馈 | `_agent_ack` 会发送"正在处理中，请稍等。" | 不发送立即反馈消息 |
+| 知识库兜底 | `generate_reply` 在客服模式无 `scene_hits` 时提前返回 `kb_clarification` 模板 | 没有命中时继续走 agent，由 agent 自己决定是否回复 |
+
+> `_agent_ack` 的注释里曾提到"free mode"，但代码中并不存在该模式，实际行为以 `customer_service` 为准。
+
 ### `manage_targets.py`
 
 | 命令 | 别名 | 说明 |
