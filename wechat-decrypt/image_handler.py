@@ -14,14 +14,54 @@ from __future__ import annotations
 import glob
 import hashlib
 import os
+import shutil
 import sqlite3
+import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 try:
-    from decode_image import v2_decrypt_file
+    from decode_image import v2_decrypt_file, detect_image_format
 except ImportError:
     v2_decrypt_file = None
+    detect_image_format = None
+
+
+# Formats accepted by the MiniMax `mmx vision describe` CLI.
+_MMX_SUPPORTED_EXTS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _ensure_image_extension(path: str, fmt: Optional[str]) -> str:
+    """Rename *path* so it carries a VLM-compatible extension if it lacks one.
+
+    mmx CLI determines format from the file extension and rejects files
+    without one, even when the bytes are a valid image. We keep unknown
+    formats untouched; callers can decide whether to convert them.
+    """
+    if not path or not os.path.isfile(path):
+        return path
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if ext in _MMX_SUPPORTED_EXTS:
+        return path
+    effective_fmt = fmt
+    if not effective_fmt or effective_fmt == "bin":
+        if detect_image_format is None:
+            return path
+        try:
+            with open(path, "rb") as f:
+                effective_fmt = detect_image_format(f.read(16)) or "bin"
+        except Exception:
+            return path
+    if effective_fmt not in _MMX_SUPPORTED_EXTS:
+        return path
+    new_path = f"{path}.{effective_fmt}"
+    try:
+        os.replace(path, new_path)
+        return new_path
+    except Exception:
+        return path
 
 
 def extract_md5_from_packed_info(blob: Optional[bytes]) -> Optional[str]:
@@ -258,10 +298,16 @@ def process_image_message(
         return None
     _log.info('process_image_msg: decrypted result=%s fmt=%s', result_path, fmt)
 
+    # Give the decoded file a proper extension. The downstream VLM CLI
+    # (mmx vision describe) determines image format from the extension and
+    # rejects extensionless files even if the bytes are valid JPEG/PNG.
+    result_path = _ensure_image_extension(result_path, fmt)
+
     # Convert wxgf/hevc to JPEG for VLM compatibility
     if fmt in ('hevc', 'bin') or (os.path.exists(result_path) and open(result_path, 'rb').read(4) == b'wxgf'):
         try:
-            jpg_path = f"{result_path}.jpg"
+            base_no_ext = os.path.splitext(result_path)[0]
+            jpg_path = f"{base_no_ext}.jpg"
             converted = _convert_wxgf_to_jpeg(result_path, jpg_path)
             if converted and os.path.exists(jpg_path):
                 _log.info('process_image_msg: converted to jpeg=%s', jpg_path)
@@ -488,45 +534,84 @@ def mmx_recognize_image(image_path: str, prompt: str = "简要的描述一下图
             "Or set env: MMX_CLI_PATH=C:\\path\\to\\mmx.cmd"
         )
 
+    # mmx CLI requires a supported extension to infer image format.
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext not in ('.jpg', '.jpeg', '.png', '.webp'):
+        try:
+            with open(image_path, 'rb') as f:
+                header = f.read(4)
+            if header[:2] == b'\xff\xd8':
+                ext = '.jpg'
+            elif header[:4] == b'\x89PNG':
+                ext = '.png'
+            elif header[:4] == b'RIFF':
+                ext = '.webp'
+            else:
+                ext = '.jpg'
+            fd, tmp_path = tempfile.mkstemp(suffix=ext)
+            os.close(fd)
+            shutil.copy2(image_path, tmp_path)
+            image_path = tmp_path
+        except Exception as e:
+            return f"[VLM Error] failed to prepare image with extension: {e}"
+
     cmd = [mmx_cli, 'vision', 'describe', '--image', image_path, '--prompt', prompt]
-    try:
-        startupinfo = None
-        creationflags = 0
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            creationflags = subprocess.CREATE_NO_WINDOW
-        r = subprocess.run(
-            cmd, capture_output=True, timeout=120, shell=False,
-            startupinfo=startupinfo, creationflags=creationflags,
-        )
-        stdout = _decode_cli_output(r.stdout) if r.stdout else ''
-        stderr = _decode_cli_output(r.stderr) if r.stderr else ''
-        if r.returncode == 0:
-            # mmx vision describe returns JSON with {"content": "...", "base_resp": {...}}
-            # Try to parse JSON first
-            try:
-                data = json.loads(stdout.strip())
-                content = data.get('content', '')
-                if content:
-                    return content.strip()
-            except (json.JSONDecodeError, ValueError):
-                pass
-            # Fallback: extract text from raw output (filter ASCII art/logo lines)
-            lines = [l.strip() for l in stdout.split('\n') if l.strip()]
-            result_lines = [l for l in lines if not any(c in l for c in '██╗╚═╝╔╝')]
-            if not result_lines:
-                result_lines = [l for l in lines if l]
-            vlm_text = '\n'.join(result_lines)
-            return vlm_text if vlm_text else stdout.strip()
-        else:
-            err = stderr.strip() or stdout.strip()[:200]
-            return f"[VLM Error] mmx cli exit={r.returncode}: {err}"
-    except subprocess.TimeoutExpired:
-        return "[VLM Error] mmx cli timed out after 120s"
-    except Exception as e:
-        return f"[VLM Error] {e}"
+    last_err = ""
+    for attempt in range(3):
+        try:
+            startupinfo = None
+            creationflags = 0
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                creationflags = subprocess.CREATE_NO_WINDOW
+            r = subprocess.run(
+                cmd, capture_output=True, timeout=120, shell=False,
+                startupinfo=startupinfo, creationflags=creationflags,
+            )
+            stdout = _decode_cli_output(r.stdout) if r.stdout else ''
+            stderr = _decode_cli_output(r.stderr) if r.stderr else ''
+            if r.returncode == 0:
+                # mmx vision describe returns JSON with {"content": "...", "base_resp": {...}}
+                # Try to parse JSON first
+                try:
+                    data = json.loads(stdout.strip())
+                    content = data.get('content', '')
+                    if content:
+                        return content.strip()
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                # Fallback: extract text from raw output (filter ASCII art/logo lines)
+                lines = [l.strip() for l in stdout.split('\n') if l.strip()]
+                result_lines = [l for l in lines if not any(c in l for c in '██╗╚═╝╔╝')]
+                if not result_lines:
+                    result_lines = [l for l in lines if l]
+                vlm_text = '\n'.join(result_lines)
+                return vlm_text if vlm_text else stdout.strip()
+            err = stderr.strip() or stdout.strip()[:500]
+            last_err = f"mmx cli exit={r.returncode}: {err}"
+            # Retry on transient MiniMax network errors.
+            if "Network request failed" in err or "network" in err.lower():
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+            return f"[VLM Error] {last_err}"
+        except subprocess.TimeoutExpired:
+            last_err = "mmx cli timed out after 120s"
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return f"[VLM Error] {last_err}"
+        except Exception as e:
+            return f"[VLM Error] {e}"
+        finally:
+            if 'tmp_path' in locals():
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+    return f"[VLM Error] {last_err}"
 
 
 def run_vision_hook(image_path: str, hook_cmd: list[str] | str, timeout: int = 120) -> str:

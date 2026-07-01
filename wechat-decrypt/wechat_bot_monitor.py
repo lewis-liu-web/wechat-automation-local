@@ -1234,7 +1234,10 @@ def main():
 
                 # Image-only without task description: guide the user instead of
                 # dispatching an agent job that has nothing to analyze.
-                if turn.image_paths and not turn.has_image_task_description():
+                # Exception: if the user explicitly triggered the bot or is in an
+                # active session, let the image through so reply_engine can run VLM
+                # and KB retrieval on it.
+                if turn.image_paths and not turn.has_image_task_description() and not (turn.trigger_matched or turn.in_session):
                     _send_image_task_missing_guide(turn, cfg, config_path=config_path, dry_run=args.dry_run)
                     if advance_state:
                         t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
@@ -1358,11 +1361,11 @@ def main():
                         tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
                         break
                 continue
-            if turn.image_paths and not turn.has_image_task_description():
+            if turn.image_paths and not turn.has_image_task_description() and not (turn.trigger_matched or turn.in_session):
                 _send_image_task_missing_guide(turn, turn_cfg, config_path=config_path, dry_run=args.dry_run)
                 for tt in targets:
                     if tt.get('username') == turn.chat_id:
-                        tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
+                        tt['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
                         break
                 continue
             try:

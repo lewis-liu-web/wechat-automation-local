@@ -895,20 +895,28 @@ def send_reply_backend(text: str, log: Optional[LogFn] = None) -> bool:
     return preserved
 
 
-def _cua_list_windows_json(timeout: float = 10) -> Optional[dict]:
+def _cua_list_windows_json(timeout: float = 30) -> Optional[dict]:
     """Run `cua-driver list_windows --json` without popping a console window.
 
     Returns the parsed JSON dict or ``None`` on failure.
     """
     import json
-    try:
-        proc = _cua_run(['cua-driver', 'list_windows', '--json'], timeout=timeout)
-        return json.loads(proc.stdout or '{}')
-    except Exception:
-        return None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            proc = _cua_run(['cua-driver', 'list_windows', '--json'], timeout=timeout)
+            if proc.returncode == 0:
+                return json.loads(proc.stdout or '{}')
+        except subprocess.TimeoutExpired as e:
+            last_exc = e
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        except Exception as e:
+            return None
+    return None
 
 
-def _cua_run(cmd: list, timeout: float = 10, log: Optional[LogFn] = None) -> 'subprocess.CompletedProcess[str]':
+def _cua_run(cmd: list, timeout: float = 30, log: Optional[LogFn] = None) -> 'subprocess.CompletedProcess[str]':
     """Run cua-driver CLI without popping a console window on Windows."""
     import subprocess
     kwargs: dict = dict(capture_output=True, text=True, timeout=timeout)
@@ -1025,7 +1033,7 @@ def _cua_find_wechat_window(log=None) -> Optional[Tuple[int, int]]:
     def _main_candidates(windows):
         return [c for c in _cua_filter_usable_candidates(windows) if c[5] in main_titles]
 
-    result = _cua_run(['cua-driver', 'list_windows'], timeout=10, log=log)
+    result = _cua_run(['cua-driver', 'list_windows'], log=log)
     windows = _parse(result)
     pids = _cua_weixin_pids_from_windows(windows)
 
@@ -1054,7 +1062,7 @@ def _cua_find_wechat_window(log=None) -> Optional[Tuple[int, int]]:
                 time.sleep(0.6)
         except Exception as e:
             _log(log, 'cua restore main window failed: %r' % e)
-        retry = _cua_run(['cua-driver', 'list_windows'], timeout=10, log=log)
+        retry = _cua_run(['cua-driver', 'list_windows'], log=log)
         windows = _parse(retry)
         mains = _main_candidates(windows)
         if mains:
@@ -1071,7 +1079,7 @@ def _cua_find_wechat_window(log=None) -> Optional[Tuple[int, int]]:
         for pid in sorted(pids):
             _cua_call_bring_to_front(pid, log=log)
         time.sleep(0.5)
-        retry = _cua_run(['cua-driver', 'list_windows'], timeout=10, log=log)
+        retry = _cua_run(['cua-driver', 'list_windows'], log=log)
         windows = _parse(retry)
         mains = _main_candidates(windows)
         if mains:
@@ -1116,7 +1124,7 @@ def _cua_find_separate_chat_window(target: Optional[dict], cfg: Optional[dict] =
         _log(log, 'cua separate window: no target aliases')
         return None
 
-    result = _cua_run(['cua-driver', 'list_windows'], timeout=10, log=log)
+    result = _cua_run(['cua-driver', 'list_windows'], log=log)
     if result.returncode != 0:
         _log(log, 'cua separate window list_windows failed rc=%s stderr=%s' % (result.returncode, result.stderr[:200]))
         return None
@@ -1750,7 +1758,7 @@ def _cua_find_any_separate_window(main_hwnd: int, log: Optional[LogFn] = None) -
     Used after a pop-out when the title does not match any known alias.
     """
     import json
-    result = _cua_run(['cua-driver', 'list_windows'], timeout=10, log=log)
+    result = _cua_run(['cua-driver', 'list_windows'], log=log)
     if result.returncode != 0:
         return None
     try:
@@ -2244,7 +2252,14 @@ def _cua_window_title_from_handle(pid: int, window_id: int) -> Optional[str]:
 def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
                                    cfg: Optional[dict] = None,
                                    log: Optional[LogFn] = None) -> SendResult:
-    """Send through an already-open independent chat window using CUA background input."""
+    """Send through an already-open independent chat window using CUA background input.
+
+    This path is intentionally background-only: it does not save or restore
+    the foreground window.  If the target has no separate window, it falls back
+    to popping one out from the main window (which does foreground itself and
+    restores it afterwards).  Once the separate window is available, SetValue
+    and Enter are sent through UIA/PostMessage without activation.
+    """
     import time
     t0 = time.time()
     cfg = cfg or {}
@@ -2270,15 +2285,8 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
 
     pid, window_id = window_info
 
-    fg_before = _cua_save_foreground_window()
-
-    def _restore():
-        if fg_before and fg_before != window_id:
-            _cua_restore_foreground_window(fg_before, log=log)
-
     state = _cua_get_window_state(pid, window_id, log=log)
     if not state:
-        _restore()
         return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
                          reason='cua_get_window_state_failed')
     attempted.append('cua_get_window_state')
@@ -2332,15 +2340,17 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
     elif was_minimised and _try_set_input(restore_if_minimised=True):
         value_set = True
     if not value_set:
-        _restore()
         reason = 'cua_input_not_found' if input_not_found else 'cua_set_input_value_failed'
         return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
                          reason=reason)
 
-    # Qt WeChat may accept SetValue on a minimised window, but the Enter key
-    # (PostMessage WM_KEYDOWN) will likely be ignored while minimised.  Briefly
-    # restore without activation so the keystroke lands, then re-minimise.
-    if was_minimised and not restored_for_input:
+    # Try a background Enter first.  Qt sometimes drops PostMessage WM_KEYDOWN
+    # while minimised; in that case, silently restore without activation,
+    # send the key, and re-minimise.  This never touches the foreground window.
+    time.sleep(0.1)
+    if _cua_press_key(pid, window_id, 'return', log=log):
+        attempted.append('cua_press_enter')
+    elif was_minimised and not restored_for_input:
         try:
             import ctypes
             SW_SHOWNOACTIVATE = 4
@@ -2350,14 +2360,14 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
             time.sleep(0.1)
         except Exception as e:
             _log(log, 'cua separate window: no-activate restore before enter failed: %r' % e)
-
-    time.sleep(0.1)
-    if not _cua_press_key(pid, window_id, 'return', log=log):
-        _restore()
+        time.sleep(0.1)
+        if not _cua_press_key(pid, window_id, 'return', log=log):
+            return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
+                             reason='cua_press_enter_failed')
+        attempted.append('cua_press_enter')
+    else:
         return SendResult(ok=False, mode='cua_separate_window', attempted=attempted,
                          reason='cua_press_enter_failed')
-
-    attempted.append('cua_press_enter')
 
     if restored_for_input:
         try:
@@ -2368,7 +2378,6 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
         except Exception as e:
             _log(log, 'cua separate window: re-minimise failed: %r' % e)
 
-    _restore()
     dt = time.time() - t0
     _log(log, 'cua separate send completed attempted=%s dt=%.3fs' % (attempted, dt))
     return SendResult(
@@ -2377,8 +2386,9 @@ def send_reply_cua_separate_window(text: str, target: Optional[dict] = None,
         attempted=attempted,
         reason='cua_separate_send_completed',
         detail={'pid': pid, 'window_id': window_id, 'element_count': element_count, 'dt': dt,
-                'fg_restored': fg_before != window_id}
+                'fg_restored': False}
     )
+
 def open_chat_from_visible_list(target: Optional[dict] = None, cfg: Optional[dict] = None, log: Optional[LogFn] = None) -> bool:
     aliases = target_aliases(target)
     target_name = aliases[0] if aliases else ''

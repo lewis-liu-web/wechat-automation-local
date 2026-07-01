@@ -13,7 +13,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 ROOT = Path(__file__).resolve().parents[1]
 SENDER_PATH = ROOT / 'wechat_sender.py'
@@ -313,12 +313,12 @@ class SeparateWindowTests(unittest.TestCase):
             'bounds': {'width': 900, 'height': 700, 'x': 0, 'y': 0},
             'tree_markdown': '- [44] Edit "输入" [id=chat_input_field actions=[invoke,set_value,text]]',
         }
-        with patch.object(sender, '_cua_find_separate_chat_window', side_effect=[None, (9616, 222)]) \
+        with patch.object(sender, '_cua_find_separate_chat_window', return_value=None) \
              as find_mock, \
              patch.object(sender, '_cua_pop_out_chat', return_value=(9616, 222)) as pop_mock, \
              patch.object(sender, '_cua_get_window_state', return_value=state), \
-             patch.object(sender, '_cua_save_foreground_window', return_value=11111), \
-             patch.object(sender, '_cua_restore_foreground_window', return_value=True), \
+             patch.object(sender, '_cua_save_foreground_window', side_effect=AssertionError('separate_window must not save foreground itself')), \
+             patch.object(sender, '_cua_restore_foreground_window', side_effect=AssertionError('separate_window must not restore foreground itself')), \
              patch.object(sender, '_cua_set_input_value_uiautomation', return_value=True), \
              patch.object(sender, '_cua_press_key', return_value=True), \
              patch.object(sender.time, 'sleep', lambda *a, **k: None):
@@ -386,35 +386,34 @@ class SeparateWindowTests(unittest.TestCase):
         ])
         self.assertEqual([c[0] for c in calls], ['uia_set_value', 'press_key'])
 
-    def test_separate_window_keeps_minimised_and_restores_foreground(self):
-        calls = []
+    def test_separate_window_minimised_sends_in_background(self):
         state = {
             'element_count': 20,
             'screenshot_width': 900,
             'screenshot_height': 700,
             'bounds': {'width': 183, 'height': 26, 'x': -31992, 'y': -32000},
-            'tree_markdown': '- [44] Edit \"输入\" [id=chat_input_field actions=[invoke,set_value,text]]',
+            'tree_markdown': '- [44] Edit "输入" [id=chat_input_field actions=[invoke,set_value,text]]',
         }
-        def record(name, value=True):
-            def inner(*args, **kwargs):
-                calls.append(name)
-                return value
-            return inner
         with patch.object(sender, '_cua_find_separate_chat_window', return_value=(9616, 222)), \
              patch.object(sender, '_cua_get_window_state', return_value=state), \
-             patch.object(sender, '_cua_restore_window_no_activate', side_effect=AssertionError('must not restore minimised window')), \
-             patch.object(sender, '_cua_save_foreground_window', side_effect=record('save_fg', 12345)), \
-             patch.object(sender, '_cua_restore_foreground_window', side_effect=record('restore_fg')), \
+             patch.object(sender, '_cua_save_foreground_window', side_effect=AssertionError('separate_window must not save foreground itself')), \
+             patch.object(sender, '_cua_restore_foreground_window', side_effect=AssertionError('separate_window must not restore foreground itself')), \
              patch.object(sender, '_cua_set_input_value_uiautomation', return_value=True), \
              patch.object(sender, '_cua_press_key', return_value=True), \
+             patch('wechat_sender.ctypes.windll', MagicMock()) as mock_windll, \
              patch.object(sender.time, 'sleep', lambda *a, **k: None):
+            mock_windll.user32.IsIconic.return_value = 1
+            mock_windll.user32.ShowWindow.side_effect = AssertionError('must not restore minimised window in background path')
             result = sender.send_reply_cua_separate_window('hello', target={'name': 'bot群聊测试'})
         self.assertTrue(result.ok)
         self.assertEqual(result.mode, 'cua_separate_window')
-        self.assertIn('save_fg', calls)
-        self.assertIn('restore_fg', calls)
-        self.assertNotIn('restore_window', calls)
-        self.assertTrue(result.detail.get('fg_restored'))
+        self.assertFalse(result.detail.get('fg_restored', True))
+        self.assertEqual(result.attempted, [
+            'cua_find_separate_window',
+            'cua_get_window_state',
+            'cua_set_input_value_uiautomation',
+            'cua_press_enter',
+        ])
 
     def test_separate_window_falls_back_to_cua_set_value(self):
         calls = []

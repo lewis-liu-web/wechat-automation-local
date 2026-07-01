@@ -770,6 +770,15 @@ def _page_targets():
                             st.rerun()
                         except ControlAPIError as e:
                             st.error("启用失败：%s" % (e,))
+                if not t.get("enabled") and not t.get("is_candidate"):
+                    if st.button("恢复监听", key="resume_%s" % widget_key, use_container_width=True):
+                        try:
+                            enable_target(action_key, base_url=base)
+                            st.success("已恢复监听 %s" % action_key)
+                            _clear_data_cache()
+                            st.rerun()
+                        except ControlAPIError as e:
+                            st.error("恢复失败：%s" % (e,))
                 if t.get("enabled"):
                     if st.button("停用", key="off_%s" % widget_key, use_container_width=True):
                         try:

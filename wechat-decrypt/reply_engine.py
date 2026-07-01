@@ -92,9 +92,12 @@ def _call_minimax_vlm(image_path: str, user_prompt: str = "简要的描述一下
         from image_handler import mmx_recognize_image
         desc = mmx_recognize_image(image_path, prompt=user_prompt)
         if desc and not desc.startswith("[VLM Error]"):
+            logger.info("[VLM] success path=%s text=%s", image_path, desc[:120])
             return desc
+        logger.warning("[VLM] failed path=%s result=%s", image_path, desc)
         return None
-    except Exception:
+    except Exception as exc:
+        logger.warning("[VLM] exception path=%s err=%r", image_path, exc)
         return None
 
 
@@ -387,6 +390,27 @@ def _describe_images_for_agent(image_paths: List[str], prompt: str) -> List[Dict
         else:
             descriptions.append({"path": p, "description": ""})
     return descriptions
+
+
+def _local_image_descriptions(image_paths: List[str], prompt: str) -> Tuple[str, List[Dict[str, str]]]:
+    """返回 (query_text, descriptions)。query_text 用于 FTS，descriptions 用于 agent payload。"""
+    if not image_paths:
+        return "", []
+    descs = _describe_images_for_agent(image_paths, prompt)
+    if not descs:
+        logger.warning("[VLM] no descriptions returned for paths=%s", image_paths)
+        return "", []
+    lines = []
+    for d in descs:
+        text = d.get("description") or ""
+        if not text:
+            # Keep the failure marker for the agent payload, but don't pollute the FTS query.
+            logger.warning("[VLM] empty description for path=%s", d.get("path"))
+            d["description"] = "[图片识别失败]"
+            continue
+        lines.append("图片识别：%s" % text)
+    logger.info("[VLM] built query text from %d/%d images", len(lines), len(descs))
+    return "\n".join(lines), descs
 
 
 def load_wiki(base_dir: str | Path | None = None) -> List[Tuple[str, str]]:
@@ -1759,26 +1783,33 @@ def generate_reply(message: Dict[str, Any] | str,
     target = target or {}
     raw_text = message if isinstance(message, str) else (message.get("content") or message.get("str_content") or message.get("message") or message.get("message_content") or "")
     raw_agent_mode = _is_raw_agent_mode(config, target)
-    # Vision routing for image messages (local_type==3)
+    # Strip embedded image XML from WeChat mixed messages so it doesn't pollute the KB query.
+    if isinstance(raw_text, str):
+        raw_text = re.sub(r'<msg\b.*?</msg>', '', raw_text, flags=re.DOTALL).strip()
+    # Vision routing: collect any image paths attached to the message (local_type==3 or aggregator-provided).
     image_paths = []
-    if isinstance(message, dict) and message.get("local_type") == 3:
+    if isinstance(message, dict):
         image_path = message.get("image_path")
         if image_path and os.path.isfile(str(image_path)):
             image_paths.append(str(image_path))
         # Strip raw binary placeholder from image messages so the LLM never sees "<bytes 516>"
         if isinstance(raw_text, str) and raw_text.startswith("<bytes "):
             raw_text = ""
-    # Also pick up images from session context (e.g. user sent a photo then asked about it)
-    session_img_paths = message.get("session_image_paths") if isinstance(message, dict) else None
-    if session_img_paths:
-        import logging
-        logging.getLogger('reply_engine').info('session_image_paths received: %s', session_img_paths)
-        for p in session_img_paths:
-            if p and os.path.isfile(str(p)) and str(p) not in image_paths:
-                image_paths.append(str(p))
-                logging.getLogger('reply_engine').info('session_image_paths added: %s', str(p))
-            elif p:
-                logging.getLogger('reply_engine').warning('session_image_paths file not found: %s', str(p))
+        # Also pick up images from session context (e.g. user sent a photo then asked about it)
+        session_img_paths = message.get("session_image_paths")
+        if session_img_paths:
+            import logging
+            logging.getLogger('reply_engine').info('session_image_paths received: %s', session_img_paths)
+            for p in session_img_paths:
+                if not p:
+                    continue
+                sp = str(p)
+                if os.path.isfile(sp):
+                    if sp not in image_paths:
+                        image_paths.append(sp)
+                        logging.getLogger('reply_engine').info('session_image_paths added: %s', sp)
+                else:
+                    logging.getLogger('reply_engine').warning('session_image_paths file not found: %s', sp)
     # Route vision processing according to target config. In raw agent mode,
     # image recognition is delegated to the agent; WeChat side only passes paths.
     if image_paths and isinstance(message, dict) and not raw_agent_mode:
@@ -1822,12 +1853,18 @@ def generate_reply(message: Dict[str, Any] | str,
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
         response_mode = _normalize_response_mode((target_policy or {}).get("mode") or target.get("mode") or "group_assistant")
         # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
-        query = _clean_query_for_fts(clean or raw_text)
+        # ---- Pre-compute image descriptions and inject into KB query ----
+        # FTS query must see image content, otherwise image messages always miss the scene KB.
+        vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text)
+        kb_query_text = clean or raw_text
+        if vision_query_text:
+            kb_query_text = "%s\n\n[图片识别结果]\n%s" % (kb_query_text, vision_query_text)
+        query = _clean_query_for_fts(kb_query_text)
         kb_layers = retrieve_knowledge_layers(query, config, target)
         import logging
         logging.getLogger("reply_engine").warning(
-            "[KB_DEBUG_RAW] raw=%r clean=%r query=%r core=%d scene=%d kbs=%r target=%s",
-            raw_text, clean, query,
+            "[KB_DEBUG_RAW] raw=%r clean=%r kb_query=%r query=%r core=%d scene=%d kbs=%r target=%s",
+            raw_text, clean, kb_query_text, query,
             len(kb_layers.get("core") or []),
             len(kb_layers.get("scene") or []),
             selected_kbs,
@@ -1866,12 +1903,15 @@ def generate_reply(message: Dict[str, Any] | str,
         caps = get_capabilities() if get_capabilities else None
         has_local_vision = bool(caps.local_vision_mmx) if caps else False
         image_descriptions: List[Dict[str, str]] = []
-        if image_paths:
+        if image_paths and not vision_image_descriptions:
             if has_local_vision:
                 image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text)
             else:
                 # No vision capability – mark as missing so agent_provider can degrade gracefully
                 image_descriptions = [{"path": p, "description": "[当前环境未配置视觉识别能力]"} for p in image_paths]
+        else:
+            # Reuse descriptions already computed for KB query to avoid a second VLM call.
+            image_descriptions = vision_image_descriptions
         prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode)
         # Inject readable aggregator context before the [用户消息] block
         if aggregator_summary["is_aggregated"] and aggregator_summary["text_parts_count"] >= 2:
