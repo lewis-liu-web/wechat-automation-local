@@ -9,7 +9,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply
+from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools
+import agent_provider as ap
 
 class KnowledgeArchitectureTests(unittest.TestCase):
     def make_wiki(self):
@@ -277,6 +278,136 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         d=generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
         self.assertTrue(d.should_reply)
         self.assertTrue(any('scene.a' in x for x in d.wiki_hits))
+
+    def test_generate_reply_tool_agent_sync_uses_deep_agent_provider(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg={
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type':'local','path':'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = mock.Mock(ok=True, reply_text='工具查询结果回复')
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
+
+        self.assertTrue(d.should_reply)
+        self.assertIn('工具查询结果回复', d.reply_text)
+        self.assertEqual(d.retrieval_debug.get('agent_mode'), 'tool_agent')
+        self.assertEqual(d.retrieval_debug.get('route'), 'tool_agent_sync')
+        instance.run.assert_called_once()
+        job = instance.run.call_args.args[0]
+        payload = job.get('payload') or job
+        self.assertEqual(payload.get('agent_mode'), 'tool_agent')
+        self.assertTrue(any(t.get('name') == 'leann_search' for t in payload.get('available_tools', [])))
+
+    def test_generate_reply_tool_agent_sync_falls_back_when_provider_fails(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg={
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type':'local','path':'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = mock.Mock(ok=False, reply_text='', error='hermes not found')
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
+
+        self.assertTrue(d.should_reply)
+        # When the deep-agent provider fails, we should fall back to standard retrieval.
+        self.assertTrue(any('scene.a' in x for x in d.wiki_hits))
+        self.assertIn('tool_agent', d.retrieval_debug.get('agent_mode', ''))
+
+    def test_provider_from_config_reads_max_tool_rounds_and_leann_cli_path(self):
+        cfg = {
+            'agent_provider': {
+                'default': 'hermes',
+                'providers': {
+                    'hermes': {
+                        'cli_path': 'hermes',
+                        'max_tool_rounds': 5,
+                        'leann_cli_path': 'custom-leann',
+                    }
+                },
+                'instances': [
+                    {
+                        'id': 'deep-1',
+                        'provider': 'hermes',
+                        'cli_path': 'hermes',
+                        'max_tool_rounds': 7,
+                        'leann_cli_path': 'instance-leann',
+                    }
+                ],
+            }
+        }
+        legacy = ap.provider_from_config(cfg)
+        self.assertEqual(legacy.max_tool_rounds, 5)
+        self.assertEqual(legacy.leann_cli_path, 'custom-leann')
+
+        inst = ap.provider_from_config(cfg, instance_id='deep-1')
+        self.assertEqual(inst.max_tool_rounds, 7)
+        self.assertEqual(inst.leann_cli_path, 'instance-leann')
+
+    def test_tool_agent_available_tools_default_to_leann_only(self):
+        cfg = {'reply_engine': {'agent_mode': 'tool_agent'}}
+        tools = _tool_agent_available_tools(cfg)
+        self.assertEqual([t['name'] for t in tools], ['leann_search'])
+
+    def test_tool_agent_available_tools_is_leann_only_even_when_mcp_enabled(self):
+        cfg = {'reply_engine': {'agent_mode': 'tool_agent', 'enable_wechat_mcp_tool': True}}
+        tools = _tool_agent_available_tools(cfg)
+        self.assertEqual([t['name'] for t in tools], ['leann_search'])
+
+    def test_generate_reply_tool_agent_passes_mcp_hint_flag_when_enabled(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent', 'enable_wechat_mcp_tool': True},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = mock.Mock(ok=True, reply_text='工具查询结果回复')
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['scene.a']}, cfg)
+
+        self.assertTrue(d.should_reply)
+        self.assertIn('工具查询结果回复', d.reply_text)
+        instance.run.assert_called_once()
+        job = instance.run.call_args.args[0]
+        payload = job.get('payload') or job
+        tool_names = [t.get('name') for t in payload.get('available_tools', [])]
+        self.assertEqual(tool_names, ['leann_search'])
+        self.assertTrue(payload.get('enable_wechat_mcp_tool'))
+
+    def test_async_raw_agent_forces_standard_mode_when_config_is_tool_agent(self):
+        """Queued deep-agent jobs must not claim tool_agent; async path has no tool loop."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'mode': 'raw_agent', 'agent_mode': 'tool_agent'},
+        }
+        message = {
+            'content': '小助手 分析一下苹果',
+            'local_id': 1,
+            'local_type': 1,
+        }
+        with mock.patch('reply_engine._agent_jobs.enqueue_job') as mock_enqueue:
+            d = generate_reply(message, {'knowledge_bases': ['scene.a'], 'mode': 'customer_service'}, cfg)
+
+        self.assertTrue(d.should_reply)
+        self.assertIn('处理', d.reply_text)
+        mock_enqueue.assert_called_once()
+        payload = mock_enqueue.call_args.kwargs['payload']
+        self.assertEqual(payload['agent_mode'], 'standard')
+        self.assertEqual(payload['available_tools'], [])
+        self.assertEqual(payload['leann'], {})
+        self.assertTrue(len(payload.get('knowledge_hits', [])) > 0)
+        self.assertIn('scene.a', payload['retrieval_debug']['selected_kbs'])
 
 if __name__ == '__main__':
     unittest.main()

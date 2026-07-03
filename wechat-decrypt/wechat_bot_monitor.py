@@ -123,7 +123,7 @@ MODE_DEFAULTS = {
 }
 
 
-CLOSE_SESSION_PATTERNS = ['谢谢', '谢了', '好了', '好啦', '明白', '懂了', '不用了', '没事了', '解决了']
+CLOSE_SESSION_PATTERNS = ['谢谢', '谢了', '好了', '好啦', '明白', '懂了', '不用了', '没事了', '解决了', '不需要', '算了']
 
 # Recent image paths per sender per target, used when a text message triggers after an image.
 # Key: target+sender, Value: [{'path': str, 'time': float}, ...]
@@ -272,6 +272,27 @@ def _is_in_session(t, msg, cfg):
         log('session_hit key=%s turns=%s expires_in=%.0fs image=%s' % (
             key, sess['turns'], sess['expires_at'] - time.time(), has_images))
         return True
+
+
+def _maybe_expire_session_on_close_cue(t, msg, decision_plan, event_context):
+    """Expire the active session when a close cue is suppressed to silent.
+
+    The trigger branch in the main loop calls _activate_session and skips
+    _is_in_session(), so a message that both matches a trigger and looks like
+    a session-close cue would leave the session open. This helper closes it
+    after the decision layer has returned silent for a close cue.
+    """
+    if decision_plan.reply_mode != 'silent':
+        return
+    if not (event_context or {}).get('session_active'):
+        return
+    text = _message_text(msg)
+    if not _looks_like_session_close(text):
+        return
+    key = _session_key(t, msg)
+    if key in _active_sessions:
+        log('session_close key=%s reason=close_cue_after_decision text=%r' % (key, text[:80]))
+        del _active_sessions[key]
     log('session_miss key=%s active_keys=%s' % (key, list(_active_sessions.keys())))
     return False
 
@@ -1249,9 +1270,9 @@ def main():
                 agg_msg['target_policy'] = policy
                 agg_msg['event_context'] = event_context
 
-                # Product reply decision layer (on the *aggregated* message)
+                # Trigger-only reply decision layer (on the *aggregated* message)
                 decision_plan = reply_decision_decide(t, agg_msg, event_context)
-                log('decision target=%s local_id=%s should_reply=%s reason=%s mode=%s risk=%s confidence=%.2f' % (
+                log('decision target=%s local_id=%s should_trigger=%s reason=%s mode=%s risk=%s confidence=%.2f' % (
                     t.get('name'), turn.end_local_id, decision_plan.should_reply, decision_plan.reason,
                     decision_plan.reply_mode, decision_plan.risk_level, decision_plan.confidence))
                 _record_event(
@@ -1275,6 +1296,7 @@ def main():
                         payload={'local_id': turn.end_local_id, 'reason': decision_plan.reason},
                     )
                 if not decision_plan.should_reply:
+                    _maybe_expire_session_on_close_cue(t, agg_msg, decision_plan, event_context)
                     if advance_state:
                         t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
                     continue

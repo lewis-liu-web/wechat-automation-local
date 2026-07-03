@@ -1681,11 +1681,50 @@ def _extract_mention_name(message: Dict[str, Any] | str) -> str:
             value = str(message.get(key) or "").strip()
             if value:
                 return value.lstrip("@").strip()
-        raw = str(message.get("message_content") or message.get("content") or "")
-    else:
-        raw = str(message or "")
+    return ""
 
 
+
+def _reply_engine_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    raw = config.get("reply_engine")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _agent_mode(config: Dict[str, Any]) -> str:
+    """Return reply_engine.agent_mode, defaulting to 'standard'."""
+    return str(_reply_engine_config(config).get("agent_mode") or "standard").lower()
+
+
+def _leann_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return reply_engine.leann block with safe defaults."""
+    raw = _reply_engine_config(config).get("leann") or {}
+    return {
+        "cli_path": str(raw.get("cli_path") or "leann"),
+        "embedding_model": str(raw.get("embedding_model") or "sentence-transformers/all-MiniLM-L6-v2"),
+        "timeout": float(raw.get("timeout") or 120),
+    }
+
+
+def _enable_wechat_mcp_tool(config: Dict[str, Any]) -> bool:
+    """Return reply_engine.enable_wechat_mcp_tool, defaulting to False."""
+    return bool(_reply_engine_config(config).get("enable_wechat_mcp_tool", False))
+
+
+def _tool_agent_available_tools(config: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Build the available_tools list for tool_agent mode.
+
+    Only leann_search is exposed in the Python tool loop.  WeChat query tools
+    are executed by Hermes's native MCP layer; enable_wechat_mcp_tool only
+    adds a prompt hint telling the agent it may use a registered WeChat MCP
+    server.
+    """
+    tools: List[Dict[str, str]] = [
+        {
+            "name": "leann_search",
+            "description": "本地 LEANN 语义搜索工具，按需求检索知识库索引。",
+        }
+    ]
+    return tools
 
 
 def _is_raw_agent_mode(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
@@ -1750,6 +1789,89 @@ def _agent_ack(response_mode: str) -> Tuple[str, bool]:
     if str(response_mode or "").lower() == "customer_service":
         return "正在处理中，请稍等。", True
     return "", False
+
+
+def _run_tool_agent_sync(
+    raw_text: str,
+    clean: str,
+    mention_name: str,
+    config: Dict[str, Any],
+    target: Dict[str, Any],
+    image_paths: List[str],
+    context_messages: List[Dict[str, Any]] | None,
+) -> ReplyDecision | None:
+    """Route a tool_agent request through the deep-agent provider synchronously.
+
+    The synchronous build_prompt()/call_llm_provider() path does not inject tool
+    instructions or run the tool loop, so agent_mode='tool_agent' must be handled
+    by an AgentProvider (HermesProvider) that does both. If the provider is
+    unavailable or returns no reply, return None so the caller can fall back to
+    standard retrieval.
+    """
+    from agent_provider import provider_from_config
+
+    leann_cfg = _leann_config(config)
+    selected_kbs = resolve_target_kb_ids(config, target) or []
+    response_mode = _normalize_response_mode(target.get("mode") or "group_assistant")
+    payload: Dict[str, Any] = {
+        "clean_text": clean or raw_text,
+        "raw_text": raw_text,
+        "agent_mode": "tool_agent",
+        "available_tools": _tool_agent_available_tools(config),
+        "enable_wechat_mcp_tool": _enable_wechat_mcp_tool(config),
+        "leann": leann_cfg,
+        "knowledge_hits": [],
+        "knowledge_bases": selected_kbs,
+        "image_paths": image_paths,
+        "context_messages": context_messages or [],
+        "mention_name": mention_name,
+        "mode_instruction": _mode_instruction(response_mode),
+        "target": {
+            "id": target.get("id"),
+            "name": target.get("name"),
+            "username": target.get("username"),
+            "table": target.get("table"),
+        },
+    }
+    job: Dict[str, Any] = {
+        "sender": mention_name,
+        "payload": payload,
+        "timeout": 240.0 if image_paths else 90.0,
+    }
+    try:
+        instance_id = str(target.get("dedicated_agent_instance_id") or "").strip() or None
+        provider = provider_from_config(config, instance_id=instance_id)
+        result = provider.run(job, timeout=job["timeout"])
+    except Exception as exc:
+        logger.warning("tool_agent sync provider failed: %r; falling back to standard retrieval", exc)
+        return None
+
+    if not result.ok or not result.reply_text:
+        logger.warning("tool_agent sync provider returned no reply: %s", getattr(result, "error", "") or "")
+        return None
+
+    reply = postcheck(_clean_agent_output(result.reply_text))
+    if reply == "[SILENT]":
+        return ReplyDecision(
+            should_reply=False,
+            reply_text="",
+            intent="tool_agent_silent",
+            risk_level="low",
+            need_human=False,
+            reason="tool_agent_provider_silent",
+            wiki_hits=[],
+            retrieval_debug={"agent_mode": "tool_agent", "route": "tool_agent_sync"},
+        )
+    return ReplyDecision(
+        True,
+        reply,
+        intent="tool_agent_sync_reply",
+        risk_level="low",
+        need_human=False,
+        reason="tool_agent_provider_sync",
+        wiki_hits=[],
+        retrieval_debug={"agent_mode": "tool_agent", "route": "tool_agent_sync"},
+    )
 
 
 
@@ -1841,6 +1963,9 @@ def generate_reply(message: Dict[str, Any] | str,
                    config: Dict[str, Any] | None = None) -> ReplyDecision:
     config = config or {}
     target = target or {}
+    agent_mode = _agent_mode(config)
+    leann_cfg = _leann_config(config)
+    is_tool_agent = agent_mode == "tool_agent"
     raw_text = message if isinstance(message, str) else (message.get("content") or message.get("str_content") or message.get("message") or message.get("message_content") or "")
     raw_agent_mode = _is_raw_agent_mode(config, target)
     # Strip embedded image XML from WeChat mixed messages so it doesn't pollute the KB query.
@@ -1912,23 +2037,36 @@ def generate_reply(message: Dict[str, Any] | str,
         selected_kbs = resolve_target_kb_ids(config, target)
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
         response_mode = _normalize_response_mode((target_policy or {}).get("mode") or target.get("mode") or "group_assistant")
+        # The async deep-agent path does not implement the tool loop yet, so
+        # tool_agent config is forced back to standard mode for queued jobs.
+        # Synchronous _run_tool_agent_sync still handles tool_agent directly.
+        effective_agent_mode = "standard" if is_tool_agent else agent_mode
+        async_is_tool_agent = effective_agent_mode == "tool_agent"
         # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
         # ---- Pre-compute image descriptions and inject into KB query ----
         # FTS query must see image content, otherwise image messages always miss the scene KB.
         vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text, target=target, config=config)
-        kb_query_text = clean or raw_text
-        if vision_query_text:
-            kb_query_text = "%s\n\n[图片识别结果]\n%s" % (kb_query_text, vision_query_text)
-        query = _clean_query_for_fts(kb_query_text)
-        kb_layers = retrieve_knowledge_layers(query, config, target)
+        if async_is_tool_agent:
+            # thin-monitor mode: agent retrieves knowledge on demand via tools.
+            kb_layers = {"core": [], "scene": []}
+            payload_knowledge_hits = []
+            query = ""
+            kb_query_text = clean or raw_text
+        else:
+            kb_query_text = clean or raw_text
+            if vision_query_text:
+                kb_query_text = "%s\n\n[图片识别结果]\n%s" % (kb_query_text, vision_query_text)
+            query = _clean_query_for_fts(kb_query_text)
+            kb_layers = retrieve_knowledge_layers(query, config, target)
         import logging
         logging.getLogger("reply_engine").warning(
-            "[KB_DEBUG_RAW] raw=%r clean=%r kb_query=%r query=%r core=%d scene=%d kbs=%r target=%s",
+            "[KB_DEBUG_RAW] raw=%r clean=%r kb_query=%r query=%r core=%d scene=%d kbs=%r target=%s agent_mode=%s",
             raw_text, clean, kb_query_text, query,
             len(kb_layers.get("core") or []),
             len(kb_layers.get("scene") or []),
             selected_kbs,
             target.get("username"),
+            effective_agent_mode,
         )
         raw_kb_hits = (kb_layers.get("core") or []) + (kb_layers.get("scene") or [])
         try:
@@ -1940,25 +2078,17 @@ def generate_reply(message: Dict[str, Any] | str,
         core_hits = kb_layers.get("core") or []
         retrieval_debug = {
             "mode": "raw_agent",
+            "agent_mode": effective_agent_mode,
             "selected_kbs": selected_kbs,
             "core_hit_count": len(core_hits),
             "scene_hit_count": len(scene_hits),
         }
         logging.getLogger("reply_engine").warning(
-            "[KB_DEBUG_RAW] enqueue hits count=%d target=%s",
-            len(payload_knowledge_hits), target.get("username"),
+            "[KB_DEBUG_RAW] enqueue hits count=%d target=%s agent_mode=%s",
+            len(payload_knowledge_hits), target.get("username"), effective_agent_mode,
         )
-        if response_mode == "customer_service" and not scene_hits:
-            return ReplyDecision(
-                True,
-                postcheck("我需要先查到相关资料才能准确回复。请补充具体产品或业务名称，或稍等负责人确认。"),
-                intent="kb_clarification",
-                risk_level="low",
-                need_human=True,
-                reason="customer_service_no_kb_hit",
-                wiki_hits=[],
-                retrieval_debug=retrieval_debug,
-            )
+        # Thin-monitor: the agent decides whether to clarify; do not short-circuit
+        # here based on KB hit status.
         llm_config = dict(config.get("reply_engine", config) or {})
         image_descriptions: List[Dict[str, str]] = []
         if image_paths and not vision_image_descriptions:
@@ -2041,6 +2171,9 @@ def generate_reply(message: Dict[str, Any] | str,
                             "knowledge_hits": payload_knowledge_hits,
                             "knowledge_bases": selected_kbs,
                             "reply_mode": "raw_agent",
+                            "agent_mode": effective_agent_mode,
+                            "available_tools": _tool_agent_available_tools(config) if async_is_tool_agent else [],
+                            "leann": leann_cfg if async_is_tool_agent else {},
                             "response_mode": response_mode,
                             "target_policy": target_policy or {},
                             "mode_instruction": _mode_instruction(response_mode),
@@ -2116,13 +2249,19 @@ def generate_reply(message: Dict[str, Any] | str,
                         "raw_text": raw_text,
                         "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),
                         "skill_name": "wechat_task",
-                            "knowledge_hits": payload_knowledge_hits,
+                        "knowledge_hits": payload_knowledge_hits,
                         "knowledge_bases": selected_kbs,
                         "reply_mode": "raw_agent",
+                        "agent_mode": effective_agent_mode,
+                        "available_tools": _tool_agent_available_tools(config) if async_is_tool_agent else [],
+                        "leann": leann_cfg if async_is_tool_agent else {},
                         "response_mode": response_mode,
                         "target_policy": target_policy or {},
                         "mode_instruction": _mode_instruction(response_mode),
                         "retrieval_debug": {**retrieval_debug, "route": str(route_name or "agent_provider"), "route_reason": str(route_reason or "agent_provider")},
+                        "image_paths": image_paths,
+                        "image_descriptions": image_descriptions,
+                        "context_messages": payload_context_messages,
                         "mention_name": mention_name,
                         "route": str(route_name or "agent_provider"),
                         "route_reason": str(route_reason or "agent_provider"),
@@ -2175,6 +2314,16 @@ def generate_reply(message: Dict[str, Any] | str,
         return pre
 
     else:
+        if is_tool_agent:
+            context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
+            decision = _run_tool_agent_sync(
+                raw_text, clean, mention_name, config, target, image_paths, context_messages
+            )
+            if decision is not None:
+                return decision
+            logger.warning(
+                "tool_agent sync provider unavailable; falling back to standard retrieval"
+            )
         layers = retrieve_knowledge_layers(clean or raw_text, config, target)
     core_hits = layers.get("core") or []
     raw_scene_hits = layers.get("scene") or []
@@ -2195,6 +2344,7 @@ def generate_reply(message: Dict[str, Any] | str,
     retrieval_debug = {
         "query": clean or raw_text,
         "reply_mode": reply_mode,
+        "agent_mode": agent_mode,
         "selected_kbs": list(target.get("knowledge_bases") or resolve_target_kb_ids(config, target) or []),
         "core_count": len(core_hits),
         "raw_scene_count": len(raw_scene_hits),
@@ -2232,6 +2382,11 @@ def generate_reply(message: Dict[str, Any] | str,
         "context_messages": context_messages,
         "mention_name": mention_name,
         "mode": mode,
+        "agent_mode": agent_mode,
+        # tool_agent is handled earlier via _run_tool_agent_sync; this fallback path
+        # runs standard retrieval and should not expose tools to the local prompt.
+        "available_tools": [],
+        "leann": {},
         "target": {
             "id": target.get("id"),
             "name": target.get("name"),

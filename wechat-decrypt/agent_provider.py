@@ -218,6 +218,104 @@ def _trim_reply_json_block(text: str) -> str:
     return text
 
 
+def _extract_tool_call(text: str) -> Dict[str, Any] | None:
+    """Look for a single-line JSON tool call such as {"tool": "leann_search", ...}."""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict) and obj.get("tool") == "leann_search":
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _strip_leann_tool_calls(text: str) -> str:
+    """Remove lines that are JSON leann_search tool calls from stdout.
+
+    When the model hits the tool-round budget and still emits a tool call,
+    the JSON line must not leak into the final WeChat reply.
+    """
+    cleaned: List[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and obj.get("tool") == "leann_search":
+                    continue
+            except Exception:
+                pass
+        cleaned.append(raw_line)
+    return "\n".join(cleaned)
+
+
+def _run_leann_search(cli_path: str, index_name: str, query: str, top_k: int, timeout: float) -> str:
+    """Execute leann search CLI and return JSON text or a failure marker."""
+    env = dict(os.environ)
+    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    cmd = [
+        str(cli_path or "leann"),
+        "search",
+        str(index_name),
+        str(query),
+        "--top-k",
+        str(int(top_k or 3)),
+        "--json",
+        "--non-interactive",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(1.0, float(timeout or 120)),
+            env=env,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+        if proc.returncode != 0 or not (proc.stdout or "").strip():
+            logger.warning("leann search failed rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:200])
+            return "(LEANN search failed)"
+        return (proc.stdout or "").strip()
+    except Exception as exc:
+        logger.warning("leann search exception: %s", exc)
+        return "(LEANN search failed)"
+
+
+def _tool_result_to_text(raw: str) -> str:
+    """Best-effort summarize leann JSON output for the agent prompt."""
+    text = str(raw or "").strip()
+    if not text:
+        return "(LEANN search returned no results)"
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            results = payload.get("results") or payload.get("data") or payload.get("hits") or []
+        elif isinstance(payload, list):
+            results = payload
+        else:
+            results = []
+        if not results:
+            return "(LEANN search returned no results)"
+        lines: List[str] = []
+        for idx, item in enumerate(results[:5], start=1):
+            if isinstance(item, dict):
+                title = str(item.get("title") or item.get("id") or "").strip()
+                content = str(item.get("content") or item.get("text") or item.get("summary") or "").strip()
+                lines.append(f"[{idx}] {title}\n{content[:800]}")
+            else:
+                lines.append(f"[{idx}] {str(item)[:800]}")
+        return "\n\n".join(lines)
+    except Exception:
+        # Not JSON: return raw text truncated.
+        return text[:4000]
+
+
 
 
 
@@ -329,7 +427,13 @@ def _sendable_reply_from_assistant(content: str) -> str:
 def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
     raw_payload = job.get("payload")
     payload: Dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
-    prompt = str(payload.get("prompt") or job.get("prompt") or payload.get("clean_text") or payload.get("raw_text") or "").strip()
+    agent_mode = str(payload.get("agent_mode") or "").lower()
+    # Prefer clean_text only in tool_agent mode; for raw_agent/standard keep prompt
+    # first so aggregator context and monitor-side retrieval are preserved.
+    if agent_mode == "tool_agent":
+        prompt = str(payload.get("clean_text") or payload.get("prompt") or job.get("prompt") or payload.get("raw_text") or "").strip()
+    else:
+        prompt = str(payload.get("prompt") or payload.get("clean_text") or payload.get("raw_text") or job.get("prompt") or "").strip()
     sender = str(job.get("sender") or payload.get("mention_name") or "").strip().lstrip("@")
     mention_rule = f"最终回复建议以 @{sender} + 空格 开头。" if sender else "最终回复直接输出适合微信群发送的一段话。"
     image_paths = [str(p) for p in (payload.get("image_paths") or []) if p]
@@ -353,13 +457,50 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         )
         image_hint = f"{image_hint}{path_hint}"
 
-    # --- Knowledge hits injection ---
+    # --- Knowledge hits / tool injection ---
     _KB_MAX_HITS = 5
     _KB_DEFAULT_HIT_MAX_CHARS = 4000
     _KB_TOTAL_BUDGET_CHARS = 12000
+    available_tools = payload.get("available_tools") or []
+    is_tool_agent = agent_mode == "tool_agent"
     knowledge_hits = payload.get("knowledge_hits") or []
+    enable_wechat_mcp_tool = bool(payload.get("enable_wechat_mcp_tool") or False)
     knowledge_section = ""
-    if knowledge_hits:
+    if is_tool_agent:
+        max_tool_rounds = max(0, int(payload.get("max_tool_rounds") or 2))
+        tools_desc = []
+        for tool in available_tools or [{"name": "leann_search", "description": "本地 LEANN 语义搜索工具"}]:
+            name = str(tool.get("name") or "leann_search")
+            desc = str(tool.get("description") or "本地 LEANN 语义搜索工具")
+            tools_desc.append(f"- {name}: {desc}")
+        tool_schema_parts: List[str] = []
+        for tool in available_tools or [{"name": "leann_search", "description": "本地 LEANN 语义搜索工具"}]:
+            name = str(tool.get("name") or "")
+            if name == "leann_search":
+                tool_schema_parts.append(
+                    "leann_search(index_name, query, top_k)\n"
+                    "  参数:\n"
+                    "    index_name: 知识库索引名称（字符串）\n"
+                    "    query: 搜索查询（字符串）\n"
+                    "    top_k: 返回结果数量（整数，默认 3）\n"
+                    "  输出: JSON 数组，每个元素包含 title/content 等字段。\n"
+                    "  调用方式: 在任意一行单独输出 JSON 对象:\n"
+                    '    {"tool": "leann_search", "index_name": "your_index", "query": "your query", "top_k": 3}\n'
+                    "  系统会执行该工具并把结果追加到对话中，你可以继续推理。"
+                )
+        tool_schema = "\n\n".join(tool_schema_parts) + f"\n  最多允许 {max_tool_rounds} 轮工具调用。"
+        if enable_wechat_mcp_tool:
+            tool_schema += (
+                "\n\n提示：如果 Hermes 已配置 WeChat MCP server，"
+                "你还可以直接调用其中的消息/联系人查询工具。"
+            )
+        knowledge_section = (
+            "\n\n[可用工具]\n"
+            + ("\n".join(tools_desc) + "\n\n" if tools_desc else "")
+            + tool_schema
+            + "\n"
+        )
+    elif knowledge_hits:
         parts = []
         total_chars = 0
         for idx, hit in enumerate(knowledge_hits[:_KB_MAX_HITS], start=1):
@@ -415,6 +556,11 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         if skill_section:
             skill_section = f"{skill_section.strip()}\n\n"
 
+    tool_output_rule = (
+        "7. 如果你决定不回复，或用户消息只是闲聊/无意义内容，最终输出必须是字面量 [SILENT]，不要加任何解释。\n"
+        if is_tool_agent else ""
+    )
+
     return (
         f"{skill_section}"
         "你正在执行 wechat-deep-reply 任务。\n"
@@ -426,6 +572,7 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         "4. 不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序。\n"
         "5. 不确定就说不确定，不要编造事实。\n"
         "6. 最多 600 字。\n"
+        f"{tool_output_rule}"
         f"{mention_rule}\n\n"
         f"用户请求：{prompt}"
         f"{'' if skill_rendered else knowledge_section}"
@@ -495,7 +642,9 @@ class HermesProvider:
                  model: str | None = None,
                  toolsets: str | None = None,
                  worker_id: str = "hermes-1",
-                 extra_args: Optional[List[str]] = None) -> None:
+                 extra_args: Optional[List[str]] = None,
+                 max_tool_rounds: int = 2,
+                 leann_cli_path: str = "leann") -> None:
         self.cli_path = str(cli_path or "hermes")
         self.hermes_home = (str(hermes_home) if hermes_home else None) or os.environ.get("HERMES_HOME")
         self.profile = (str(profile) if profile else None) or os.environ.get("HERMES_PROFILE")
@@ -504,6 +653,8 @@ class HermesProvider:
         self.worker_id = worker_id
         self.name = "hermes"
         self.extra_args = list(extra_args or [])
+        self.max_tool_rounds = max(0, int(max_tool_rounds or 2))
+        self.leann_cli_path = str(leann_cli_path or "leann")
 
     def _build_env(self) -> Dict[str, str]:
         env = dict(os.environ)
@@ -556,27 +707,15 @@ class HermesProvider:
         status = "idle" if h.ok else "unavailable"
         return [WorkerStatus(worker_id=self.worker_id, provider=self.name, status=status)]
 
-    def run(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
-        t0 = time.time()
-        payload = dict(job)
-        payload["payload"] = _json_safe(payload.get("payload") or {})
-        prompt = _build_wechat_deep_prompt(payload)
-        full_prompt = (
-            f"{prompt}\n\n"
-            "[WECHAT_AGENT_JOB_JSON]\n"
-            f"{json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)}\n"
-            "[/WECHAT_AGENT_JOB_JSON]"
-        )
-        wait = max(5.0, float(timeout or job.get("timeout") or 90))
-
-        # Write prompt to temp file and use -q @file syntax (Windows stdin workaround)
+    def _invoke_hermes(self, prompt_text: str, wait: float) -> Dict[str, Any]:
+        """Run Hermes once with the given prompt text and return raw result."""
         import tempfile
         prompt_file: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-                f.write(full_prompt)
+                f.write(prompt_text)
                 prompt_file = Path(f.name)
-            
+
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
@@ -591,14 +730,16 @@ class HermesProvider:
                 creationflags=_NO_WINDOW_FLAGS,
                 startupinfo=startupinfo,
             )
+            return {
+                "stdout": (proc.stdout or "").strip(),
+                "stderr": (proc.stderr or "").strip(),
+                "rc": proc.returncode,
+                "ok": True,
+            }
         except subprocess.TimeoutExpired:
-            return AgentResult(False, "timeout", error="hermes chat timed out",
-                               latency=time.time() - t0, provider=self.name,
-                               worker_id=self.worker_id, raw={"cli_path": self.cli_path})
+            return {"ok": False, "error": "hermes chat timed out", "timeout": True}
         except Exception as e:
-            return AgentResult(False, "failed", error=repr(e),
-                               latency=time.time() - t0, provider=self.name,
-                               worker_id=self.worker_id)
+            return {"ok": False, "error": repr(e)}
         finally:
             if prompt_file and prompt_file.exists():
                 try:
@@ -606,23 +747,95 @@ class HermesProvider:
                 except Exception:
                     pass
 
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        if proc.returncode != 0 and not stdout:
-            return AgentResult(False, "failed",
-                               error=f"hermes chat failed (rc={proc.returncode}): {stderr[:200] or 'no output'}",
-                               latency=time.time() - t0, provider=self.name,
-                               worker_id=self.worker_id, raw={"stderr": stderr, "rc": proc.returncode})
-        
-        reply = _extract_hermes_reply(stdout)
+    def run(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
+        t0 = time.time()
+        deadline = t0 + float(timeout or job.get("timeout") or 90)
+        payload = dict(job)
+        payload["payload"] = _json_safe(payload.get("payload") or {})
+        payload["payload"]["max_tool_rounds"] = self.max_tool_rounds
+        prompt = _build_wechat_deep_prompt(payload)
+        full_prompt = (
+            f"{prompt}\n\n"
+            "[WECHAT_AGENT_JOB_JSON]\n"
+            f"{json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)}\n"
+            "[/WECHAT_AGENT_JOB_JSON]"
+        )
+
+        current_prompt = full_prompt
+        tool_round = 0
+        last_stdout = ""
+        last_stderr = ""
+        last_rc = 0
+        leann_cfg = (payload.get("payload") or {}).get("leann") or {}
+        leann_cli = str(leann_cfg.get("cli_path") or self.leann_cli_path or "leann")
+        leann_timeout = float(leann_cfg.get("timeout") or 120)
+
+        while True:
+            remaining = max(5.0, deadline - time.time())
+            result = self._invoke_hermes(current_prompt, remaining)
+            if not result.get("ok"):
+                return AgentResult(False, "timeout" if result.get("timeout") else "failed",
+                                   error=result.get("error", "hermes invocation failed"),
+                                   latency=time.time() - t0, provider=self.name,
+                                   worker_id=self.worker_id, raw={"cli_path": self.cli_path})
+            stdout = result["stdout"]
+            stderr = result["stderr"]
+            rc = result["rc"]
+            last_stdout = stdout
+            last_stderr = stderr
+            last_rc = rc
+
+            tool_call = _extract_tool_call(stdout)
+            if not tool_call or tool_round >= self.max_tool_rounds:
+                # If the model still emitted a tool call after the budget was
+                # exhausted, strip the JSON line so it cannot leak into the
+                # final WeChat reply.
+                if tool_call and tool_round >= self.max_tool_rounds:
+                    logger.warning("hermes emitted a tool call at max_tool_rounds=%s; stripping JSON from reply",
+                                   self.max_tool_rounds)
+                    stdout = _strip_leann_tool_calls(stdout)
+                reply = _extract_hermes_reply(stdout)
+                if not reply:
+                    return AgentResult(False, "failed",
+                                       error=f"hermes returned no sendable reply (rc={rc}): {stderr[:200] or 'no stderr'}",
+                                       latency=time.time() - t0, provider=self.name,
+                                       worker_id=self.worker_id, raw={"stdout": stdout, "stderr": stderr, "rc": rc})
+                if rc != 0:
+                    logger.warning("hermes chat returned rc=%s but produced a sendable reply; accepting reply", rc)
+                break
+
+            tool_name = str(tool_call.get("tool") or "").strip()
+            if tool_name == "leann_search":
+                index_name = str(tool_call.get("index_name") or "").strip()
+                query = str(tool_call.get("query") or "").strip()
+                top_k = int(tool_call.get("top_k") or 3)
+                if not index_name or not query:
+                    tool_result = "(LEANN search failed: missing index_name or query)"
+                else:
+                    raw_output = _run_leann_search(leann_cli, index_name, query, top_k, leann_timeout)
+                    tool_result = _tool_result_to_text(raw_output)
+                tool_invocation = f"leann_search({index_name!r}, {query!r}, {top_k})"
+            else:
+                tool_result = f"(unknown tool: {tool_name})"
+                tool_invocation = f"{tool_name}(...)"
+            tool_round += 1
+            current_prompt = (
+                f"{current_prompt}\n\n"
+                f"[工具调用结果 #{tool_round}]\n"
+                f"工具: {tool_invocation}\n"
+                f"结果:\n{tool_result}\n"
+                "请根据工具结果继续推理。如果已有足够信息，直接输出最终微信回复；否则可再次调用工具。"
+            )
+
         if not reply:
             return AgentResult(False, "failed", error="hermes returned no sendable reply",
                                latency=time.time() - t0, provider=self.name,
-                               worker_id=self.worker_id, raw={"stdout": stdout, "stderr": stderr})
+                               worker_id=self.worker_id, raw={"stdout": last_stdout, "stderr": last_stderr})
         return AgentResult(True, "done", reply_text=reply,
                            latency=time.time() - t0, provider=self.name,
                            worker_id=self.worker_id,
-                           raw={"profile": self.profile, "model": self.model, "rc": proc.returncode})
+                           raw={"profile": self.profile, "model": self.model, "rc": last_rc,
+                                "tool_rounds": tool_round})
 
     def submit(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
         """Start a Hermes CLI run in a background helper process.
@@ -639,6 +852,7 @@ class HermesProvider:
             session_dir.mkdir(parents=True, exist_ok=True)
             payload = dict(job)
             payload["payload"] = _json_safe(payload.get("payload") or {})
+            payload["payload"]["max_tool_rounds"] = self.max_tool_rounds
             prompt = _build_wechat_deep_prompt(payload)
             full_prompt = (
                 f"{prompt}\n\n"
@@ -814,6 +1028,8 @@ def provider_from_config(config: Dict[str, Any] | None = None,
                 toolsets=cfg_h.get("toolsets"),
                 worker_id=worker_id,
                 extra_args=cfg_h.get("extra_args") or [],
+                max_tool_rounds=cfg_h.get("max_tool_rounds", 2),
+                leann_cli_path=cfg_h.get("leann_cli_path", "leann"),
             )
         raise ValueError(f"unsupported provider: {kind}")
 
@@ -830,6 +1046,8 @@ def provider_from_config(config: Dict[str, Any] | None = None,
             toolsets=cfg_h.get("toolsets"),
             worker_id=str(cfg_h.get("worker_id") or "hermes-1"),
             extra_args=cfg_h.get("extra_args") or [],
+            max_tool_rounds=cfg_h.get("max_tool_rounds", 2),
+            leann_cli_path=cfg_h.get("leann_cli_path", "leann"),
         )
     raise ValueError(f"unsupported provider for M1: {default_name}")
 

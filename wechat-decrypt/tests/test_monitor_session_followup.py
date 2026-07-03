@@ -71,15 +71,30 @@ class SessionFollowupTests(unittest.TestCase):
                 followup = self._make_msg(text)
                 self.assertTrue(monitor._is_in_session(t, followup, cfg))
                 self.assertIn(key, monitor._active_sessions)
+
+    def test_close_hint_expires_session(self):
         t = self._make_target()
         cfg = self._cfg(t)
         trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
-        monitor._activate_session(t, trigger, cfg)
-        key = monitor._session_key(t, trigger)
-        for text in ("谢谢", "好了", "没事了"):
+        for text in ("谢谢", "好了", "没事了", "不需要", "算了"):
             with self.subTest(text=text):
                 monitor._active_sessions.clear()
                 monitor._activate_session(t, trigger, cfg)
+                key = monitor._session_key(t, trigger)
+                followup = self._make_msg(text)
+                self.assertFalse(monitor._is_in_session(t, followup, cfg))
+                self.assertNotIn(key, monitor._active_sessions)
+
+    def test_close_hint_不需要_and_算了_expire_session(self):
+        """Regression: cues recognized by reply_decision must also expire the monitor session."""
+        t = self._make_target()
+        cfg = self._cfg(t)
+        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        for text in ("不需要", "算了"):
+            with self.subTest(text=text):
+                monitor._active_sessions.clear()
+                monitor._activate_session(t, trigger, cfg)
+                key = monitor._session_key(t, trigger)
                 followup = self._make_msg(text)
                 self.assertFalse(monitor._is_in_session(t, followup, cfg))
                 self.assertNotIn(key, monitor._active_sessions)
@@ -113,6 +128,30 @@ class SessionFollowupTests(unittest.TestCase):
         monitor._activate_session(t, trigger, cfg)
         followup = self._make_msg("公交卡充值失败")
         self.assertFalse(monitor._is_in_session(t, followup, cfg))
+
+    def test_close_cue_with_trigger_expires_session(self):
+        """A message that matches a trigger AND is a close cue must close the session."""
+        t = self._make_target()
+        cfg = self._cfg(t)
+        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        monitor._activate_session(t, trigger, cfg)
+        key = monitor._session_key(t, trigger)
+        close_msg = self._make_msg("好的，谢谢")
+        plan = type('Plan', (), {'reply_mode': 'silent', 'should_reply': False, 'reason': 'session_close_or_non_followup'})()
+        monitor._maybe_expire_session_on_close_cue(t, close_msg, plan, {'session_active': True})
+        self.assertNotIn(key, monitor._active_sessions)
+
+    def test_ack_only_with_trigger_keeps_session(self):
+        """A pure ack that happens to match a trigger should not expire the session."""
+        t = self._make_target()
+        cfg = self._cfg(t)
+        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        monitor._activate_session(t, trigger, cfg)
+        key = monitor._session_key(t, trigger)
+        ack_msg = self._make_msg("好的")
+        plan = type('Plan', (), {'reply_mode': 'silent', 'should_reply': False, 'reason': 'ack_only'})()
+        monitor._maybe_expire_session_on_close_cue(t, ack_msg, plan, {'session_active': True})
+        self.assertIn(key, monitor._active_sessions)
 
 
 if __name__ == '__main__':

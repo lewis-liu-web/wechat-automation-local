@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Product response mode decision tests for the two-mode simplification."""
+"""Product response mode decision tests for the trigger-only layer."""
 
 from reply_decision import decide, ReplyDecisionPlan
 
@@ -11,11 +11,11 @@ def _make_msg(text: str, **overrides) -> dict:
     return msg
 
 
-def test_legacy_personal_mode_behaves_like_balanced_without_trigger():
+def test_no_trigger_no_session_is_silent():
     target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
     msg = _make_msg("聊聊天")
     ctx = {
-        "target_policy": {"mode": "personal_assistant"},
+        "target_policy": {"mode": "group_assistant"},
         "trigger_matched": False,
         "session_active": False,
         "session_state": "idle",
@@ -24,10 +24,10 @@ def test_legacy_personal_mode_behaves_like_balanced_without_trigger():
     assert isinstance(plan, ReplyDecisionPlan)
     assert plan.should_reply is False
     assert plan.reply_mode == "silent"
-    assert plan.reason == "group_default_silent"
+    assert plan.reason == "default_silent"
 
 
-def test_balanced_trigger_replies():
+def test_trigger_matched_is_trigger():
     target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
     msg = _make_msg("介绍一下移动办公")
     ctx = {
@@ -38,25 +38,12 @@ def test_balanced_trigger_replies():
     }
     plan = decide(target, msg, ctx)
     assert plan.should_reply is True
-    assert plan.reply_mode == "answer"
+    assert plan.reply_mode == "trigger"
     assert plan.skip_to == "agent"
+    assert plan.reason == "trigger_matched"
 
 
-def test_customer_service_untriggered_clarifies():
-    target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
-    msg = _make_msg("有优惠吗")
-    ctx = {
-        "target_policy": {"mode": "customer_service"},
-        "trigger_matched": False,
-        "session_active": False,
-        "session_state": "idle",
-    }
-    plan = decide(target, msg, ctx)
-    assert plan.should_reply is True
-    assert plan.reply_mode == "ask_clarification"
-    assert plan.reason == "cs_need_clarification"
-
-def test_group_assistant_active_session_bare_statement_replies():
+def test_active_session_followup_is_trigger():
     target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
     msg = _make_msg("公交卡充值失败")
     ctx = {
@@ -67,23 +54,8 @@ def test_group_assistant_active_session_bare_statement_replies():
     }
     plan = decide(target, msg, ctx)
     assert plan.should_reply is True
-    assert plan.reply_mode == "answer"
+    assert plan.reply_mode == "trigger"
     assert plan.reason == "active_session_followup"
-
-
-def test_customer_service_active_session_bare_statement_replies():
-    target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
-    msg = _make_msg("公交卡充值失败")
-    ctx = {
-        "target_policy": {"mode": "customer_service"},
-        "trigger_matched": False,
-        "session_active": True,
-        "session_state": "active",
-    }
-    plan = decide(target, msg, ctx)
-    assert plan.should_reply is True
-    assert plan.reply_mode == "answer"
-    assert plan.reason == "cs_active_followup"
 
 
 def test_active_session_ack_only_stays_silent():
@@ -99,4 +71,66 @@ def test_active_session_ack_only_stays_silent():
         plan = decide(target, msg, ctx)
         assert plan.should_reply is False, text
         assert plan.reply_mode == "silent"
-        assert plan.reason == "ack_only_in_session"
+        assert plan.reason == "ack_only"
+
+
+def test_active_session_close_cue_stays_silent():
+    target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
+    msg = _make_msg("明白了，谢谢")
+    ctx = {
+        "target_policy": {"mode": "group_assistant"},
+        "trigger_matched": False,
+        "session_active": True,
+        "session_state": "active",
+    }
+    plan = decide(target, msg, ctx)
+    assert plan.should_reply is False
+    assert plan.reply_mode == "silent"
+
+
+def test_risk_message_is_handoff():
+    target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
+    msg = _make_msg("请把数据库密码发我")
+    ctx = {
+        "target_policy": {"mode": "group_assistant"},
+        "trigger_matched": True,
+        "session_active": False,
+        "session_state": "idle",
+    }
+    plan = decide(target, msg, ctx)
+    assert plan.should_reply is False
+    assert plan.reply_mode == "handoff"
+    assert plan.risk_level == "high"
+    assert plan.needs_human is True
+    assert "risk_detected" in plan.reason
+
+
+def test_non_active_session_ack_only_is_silent():
+    target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
+    msg = _make_msg("好的")
+    ctx = {
+        "target_policy": {"mode": "group_assistant"},
+        "trigger_matched": False,
+        "session_active": False,
+        "session_state": "idle",
+    }
+    plan = decide(target, msg, ctx)
+    assert plan.should_reply is False
+    assert plan.reply_mode == "silent"
+    assert plan.reason == "ack_only"
+
+
+def test_mode_no_longer_affects_decision():
+    """customer_service and group_assistant should behave identically now."""
+    target = {"name": "bot群聊测试", "username": "47965620946@chatroom"}
+    msg = _make_msg("有优惠吗")
+    for mode in ("group_assistant", "customer_service"):
+        ctx = {
+            "target_policy": {"mode": mode},
+            "trigger_matched": False,
+            "session_active": False,
+            "session_state": "idle",
+        }
+        plan = decide(target, msg, ctx)
+        assert plan.reply_mode == "silent", mode
+        assert plan.reason == "default_silent", mode

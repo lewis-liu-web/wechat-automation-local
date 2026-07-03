@@ -369,8 +369,8 @@ def test_raw_agent_enqueue_payload_knowledge_hits_not_empty():
             jobs.DEFAULT_DB_PATH = orig_default
 
 
-def test_customer_service_no_kb_hit_returns_clarification_without_job():
-    """客服模式下如果没有命中 scene 知识库，应直接澄清并不入队。"""
+def test_customer_service_no_kb_hit_is_enqueued_as_standard_trigger():
+    """客服模式下如果没有命中 scene 知识库，thin-monitor 应把消息入队交给 agent 决定。"""
     with tempfile.TemporaryDirectory() as tmpdir:
         wiki_root = Path(tmpdir) / "wiki"
         kb_path = wiki_root / "desktop_pdf"
@@ -411,10 +411,8 @@ def test_customer_service_no_kb_hit_returns_clarification_without_job():
             jobs.DEFAULT_DB_PATH = db
             decision = re.generate_reply(message, target, config)
             assert decision.should_reply is True
-            assert decision.intent == "kb_clarification", decision.intent
-            assert decision.reason == "customer_service_no_kb_hit", decision.reason
-            assert "需要先查到相关资料" in decision.reply_text
+            assert decision.intent in ("deep_agent_queued", "agent_job_queued"), decision.intent
             all_jobs = jobs.list_jobs(db_path=db)
-            assert len(all_jobs) == 0
+            assert len(all_jobs) >= 1
         finally:
             jobs.DEFAULT_DB_PATH = orig_default
