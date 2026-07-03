@@ -95,3 +95,10 @@ openspec/
 .omkc/
 *.kb_index.sqlite
 CLAUDE.md
+
+# OMK / cross-project residue that should not be committed here
+DESIGN.md
+ROADMAP.md
+GEMINI.md
+SECURITY.md
+worker_out*.txt

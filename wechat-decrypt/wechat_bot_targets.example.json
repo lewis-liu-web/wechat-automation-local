@@ -22,7 +22,11 @@
       "cua_window_title": "",
       "reply_mode": "standard",
       "vision": {
-        "mode": "agent_llm"
+        "mode": "agent_llm",
+        "sources": ["mmx", "ocr"],
+        "hooks": {},
+        "fallback_metadata": true,
+        "_vision_comment": "mode: agent_llm(default)|llm_vision|hook. sources: ordered list of mmx|hook:<name>|ocr. fallback_metadata: return file format/size/dims when all sources fail."
       },
       "input_capabilities": {
         "text": true,
@@ -57,7 +61,11 @@
       "reply_template": "",
       "reply_mode": "standard",
       "vision": {
-        "mode": "agent_llm"
+        "mode": "agent_llm",
+        "sources": ["mmx", "ocr"],
+        "hooks": {},
+        "fallback_metadata": true,
+        "_vision_comment": "mode: agent_llm(default)|llm_vision|hook. sources: ordered list of mmx|hook:<name>|ocr. fallback_metadata: return file format/size/dims when all sources fail."
       },
       "input_capabilities": {
         "text": true,

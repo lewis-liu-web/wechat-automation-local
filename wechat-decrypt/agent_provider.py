@@ -155,8 +155,8 @@ def _extract_hermes_reply(stdout: str) -> str:
         hermes_reply = "\n".join(line for line in lines if line)
     if not hermes_reply:
         # Quiet mode: Hermes emits the reply followed by session metadata.
-        # Drop known metadata/warning lines, and strip an inline warning
-        # prefix that may have been merged with the reply line.
+        # Drop known metadata/warning lines and tool/init noise, and strip an
+        # inline warning prefix that may have been merged with the reply line.
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         cleaned_lines: List[str] = []
         for line in lines:
@@ -165,6 +165,8 @@ def _extract_hermes_reply(stdout: str) -> str:
             if not line:
                 continue
             if re.match(r"^(Warning:|session_id:|Session:|Duration:|Messages?|Tokens?|Resume this|Model:)", line, re.IGNORECASE):
+                continue
+            if any(p.search(line) for p in _NOISE_LINE_PATTERNS):
                 continue
             cleaned_lines.append(line)
         hermes_reply = "\n".join(cleaned_lines)

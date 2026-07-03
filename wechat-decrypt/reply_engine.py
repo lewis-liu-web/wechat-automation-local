@@ -86,12 +86,63 @@ def _extract_image_md5_from_xml(content: str) -> str | None:
     return None
 
 
-def _call_minimax_vlm(image_path: str, user_prompt: str = "简要的描述一下图片内容") -> str | None:
-    """调用 MiniMax VLM CLI 理解图片内容（通过 mmx cli 避免直接 API 余额限制）。"""
+def _resolve_vision_sources(target: Dict[str, Any] | None, config: Dict[str, Any] | None):
+    """Resolve the ordered vision source list and hook map from config/target.
+
+    Returns:
+        (sources, hooks, fallback_metadata)
+    """
+    cfg = config or {}
+    t = target or {}
+    vision_cfg: Dict[str, Any] = dict(t.get("vision") or cfg.get("vision") or {})
+
+    explicit_sources = vision_cfg.get("sources")
+    if isinstance(explicit_sources, list) and explicit_sources:
+        return (
+            [str(s) for s in explicit_sources if s],
+            dict(vision_cfg.get("hooks") or {}),
+            bool(vision_cfg.get("fallback_metadata", True)),
+        )
+
+    mode = str(vision_cfg.get("mode", "agent_llm")).lower()
+    hooks: Dict[str, Any] = dict(vision_cfg.get("hooks") or {})
+    fallback_metadata = bool(vision_cfg.get("fallback_metadata", True))
+
+    if mode == "hook":
+        hook_cmd = vision_cfg.get("hook_cmd")
+        if hook_cmd:
+            # Register the legacy hook_cmd under a default name and try it first.
+            hooks.setdefault("default", hook_cmd)
+            sources = ["hook:default", "mmx", "ocr"]
+        else:
+            sources = ["mmx", "ocr"]
+    elif mode == "llm_vision":
+        sources = ["mmx", "ocr"]
+    else:
+        # agent_llm (default): local vision is optional; still try mmx then ocr.
+        sources = ["mmx", "ocr"]
+
+    return sources, hooks, fallback_metadata
+
+
+def _call_vision_recognizer(
+    image_path: str,
+    user_prompt: str = "简要的描述一下图片内容",
+    target: Dict[str, Any] | None = None,
+    config: Dict[str, Any] | None = None,
+) -> str | None:
+    """识别图片，支持多源 fallback（mmx → hook → ocr → metadata）。"""
     try:
-        from image_handler import mmx_recognize_image
-        desc = mmx_recognize_image(image_path, prompt=user_prompt)
-        if desc and not desc.startswith("[VLM Error]"):
+        from image_handler import recognize_image_with_fallback, is_vision_error
+        sources, hooks, fallback_metadata = _resolve_vision_sources(target, config)
+        desc = recognize_image_with_fallback(
+            image_path,
+            prompt=user_prompt,
+            sources=sources,
+            hooks=hooks,
+            fallback_metadata=fallback_metadata,
+        )
+        if desc and not is_vision_error(desc):
             logger.info("[VLM] success path=%s text=%s", image_path, desc[:120])
             return desc
         logger.warning("[VLM] failed path=%s result=%s", image_path, desc)
@@ -105,26 +156,25 @@ def _prepend_vision_description(raw_text: str, desc: str) -> str:
     """把图片描述拼接到用户消息前。"""
     return f"{raw_text or ''}\n\n【系统识别：用户发送了图片，图片内容如下】{desc}".strip()
 
-def _try_llm_vision(image_path: str, raw_text: str) -> str:
+def _try_llm_vision(image_path: str, raw_text: str, target: Dict[str, Any] | None = None, config: Dict[str, Any] | None = None) -> str:
     """本地 VLM 识别图片并返回拼接后的文本（失败返回原文本）。"""
-    desc = _call_minimax_vlm(image_path)
+    desc = _call_vision_recognizer(image_path, target=target, config=config)
     if desc:
         return _prepend_vision_description(raw_text, desc)
     logger.warning("vision llm_vision failed: %s", image_path)
     return raw_text
 
 
-def _try_vision_hook(image_path: str, hook_cmd: list[str] | str, raw_text: str) -> str:
-    """调用用户自定义 hook 识别图片并返回拼接后的文本（失败返回原文本）。"""
-    try:
-        from image_handler import run_vision_hook
-        desc = run_vision_hook(image_path, hook_cmd)
-        if desc and not desc.startswith("[Vision Hook Error]"):
-            return _prepend_vision_description(raw_text, desc)
-        logger.warning("vision hook failed: %s", desc)
-    except Exception as e:
-        logger.warning("vision hook exception: %r", e)
-    return raw_text
+def _try_vision_hook(image_path: str, hook_cmd: list[str] | str, raw_text: str, target: Dict[str, Any] | None = None, config: Dict[str, Any] | None = None) -> str:
+    """调用用户自定义 hook 识别图片并返回拼接后的文本（失败返回原文本）。
+
+    已接入统一 fallback 链：hook 失败后会继续尝试 mmx/ocr/metadata。
+    """
+    # Build a one-shot vision config that puts the requested hook first.
+    vision_cfg: Dict[str, Any] = {"sources": ["hook:default", "mmx", "ocr"], "hooks": {"default": hook_cmd}}
+    effective_target = dict(target or {})
+    effective_target["vision"] = vision_cfg
+    return _try_llm_vision(image_path, raw_text, target=effective_target, config=config)
 
 def _resolve_image_for_message(message: Dict[str, Any], config: Dict[str, Any]) -> str | None:
     """对图片消息解码并调用VLM理解，返回图片描述文本。
@@ -136,7 +186,7 @@ def _resolve_image_for_message(message: Dict[str, Any], config: Dict[str, Any]) 
     # ---- 路径A: 优先使用主循环已解码图片 ----
     image_path = message.get("image_path")
     if image_path and os.path.isfile(str(image_path)):
-        desc = _call_minimax_vlm(str(image_path))
+        desc = _call_vision_recognizer(str(image_path), config=config)
         if desc:
             return f"[图片内容: {desc}]"
 
@@ -219,7 +269,7 @@ def _resolve_image_for_message(message: Dict[str, Any], config: Dict[str, Any]) 
     if not decoded_path or not os.path.isfile(decoded_path):
         return None
 
-    desc = _call_minimax_vlm(decoded_path)
+    desc = _call_vision_recognizer(decoded_path, config=config)
     if desc:
         return f"[图片内容: {desc}]"
     return None
@@ -378,13 +428,18 @@ def _recent_image_prompt_from_context(context_messages: Any, current_local_id: i
     return ""
 
 
-def _describe_images_for_agent(image_paths: List[str], prompt: str) -> List[Dict[str, str]]:
+def _describe_images_for_agent(
+    image_paths: List[str],
+    prompt: str,
+    target: Dict[str, Any] | None = None,
+    config: Dict[str, Any] | None = None,
+) -> List[Dict[str, str]]:
     descriptions: List[Dict[str, str]] = []
     if not image_paths:
         return descriptions
     user_prompt = prompt or "请简要描述图片内容，并提取对用户请求有用的信息"
     for p in image_paths[:3]:
-        desc = _call_minimax_vlm(p, user_prompt=user_prompt)
+        desc = _call_vision_recognizer(p, user_prompt=user_prompt, target=target, config=config)
         if desc:
             descriptions.append({"path": p, "description": desc})
         else:
@@ -392,11 +447,16 @@ def _describe_images_for_agent(image_paths: List[str], prompt: str) -> List[Dict
     return descriptions
 
 
-def _local_image_descriptions(image_paths: List[str], prompt: str) -> Tuple[str, List[Dict[str, str]]]:
+def _local_image_descriptions(
+    image_paths: List[str],
+    prompt: str,
+    target: Dict[str, Any] | None = None,
+    config: Dict[str, Any] | None = None,
+) -> Tuple[str, List[Dict[str, str]]]:
     """返回 (query_text, descriptions)。query_text 用于 FTS，descriptions 用于 agent payload。"""
     if not image_paths:
         return "", []
-    descs = _describe_images_for_agent(image_paths, prompt)
+    descs = _describe_images_for_agent(image_paths, prompt, target=target, config=config)
     if not descs:
         logger.warning("[VLM] no descriptions returned for paths=%s", image_paths)
         return "", []
@@ -1815,11 +1875,11 @@ def generate_reply(message: Dict[str, Any] | str,
     if image_paths and isinstance(message, dict) and not raw_agent_mode:
         vision_mode = (target.get("vision") or {}).get("mode", "agent_llm")
         if vision_mode == "llm_vision":
-            raw_text = _try_llm_vision(image_paths[0], raw_text)
+            raw_text = _try_llm_vision(image_paths[0], raw_text, target=target, config=config)
         elif vision_mode == "hook":
             hook_cmd = (target.get("vision") or {}).get("hook_cmd")
             if hook_cmd:
-                raw_text = _try_vision_hook(image_paths[0], hook_cmd, raw_text)
+                raw_text = _try_vision_hook(image_paths[0], hook_cmd, raw_text, target=target, config=config)
         # agent_llm (default): image_paths flow into provider payload, agent handles vision
     triggers = target.get("triggers") or config.get("default_triggers") or DEFAULT_TRIGGERS
     clean = strip_triggers(raw_text, triggers)
@@ -1855,7 +1915,7 @@ def generate_reply(message: Dict[str, Any] | str,
         # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
         # ---- Pre-compute image descriptions and inject into KB query ----
         # FTS query must see image content, otherwise image messages always miss the scene KB.
-        vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text)
+        vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text, target=target, config=config)
         kb_query_text = clean or raw_text
         if vision_query_text:
             kb_query_text = "%s\n\n[图片识别结果]\n%s" % (kb_query_text, vision_query_text)
@@ -1900,15 +1960,11 @@ def generate_reply(message: Dict[str, Any] | str,
                 retrieval_debug=retrieval_debug,
             )
         llm_config = dict(config.get("reply_engine", config) or {})
-        caps = get_capabilities() if get_capabilities else None
-        has_local_vision = bool(caps.local_vision_mmx) if caps else False
         image_descriptions: List[Dict[str, str]] = []
         if image_paths and not vision_image_descriptions:
-            if has_local_vision:
-                image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text)
-            else:
-                # No vision capability – mark as missing so agent_provider can degrade gracefully
-                image_descriptions = [{"path": p, "description": "[当前环境未配置视觉识别能力]"} for p in image_paths]
+            # Always attempt local recognition; the fallback chain degrades through
+            # mmx → hooks → ocr → metadata, so the agent always gets something useful.
+            image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text, target=target, config=config)
         else:
             # Reuse descriptions already computed for KB query to avoid a second VLM call.
             image_descriptions = vision_image_descriptions

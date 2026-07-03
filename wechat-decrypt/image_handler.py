@@ -669,3 +669,169 @@ def run_vision_hook(image_path: str, hook_cmd: list[str] | str, timeout: int = 1
         return f"[Vision Hook Error] timed out after {timeout}s"
     except Exception as e:
         return f"[Vision Hook Error] {e}"
+
+
+# ─────────────────────────────────────────
+# Pluggable multi-source vision fallback
+# ─────────────────────────────────────────
+
+
+def is_vision_error(text: str) -> bool:
+    """Return True if the text is an error marker from a vision source."""
+    if not text:
+        return True
+    return str(text).strip().startswith(("[VLM Error]", "[Vision Hook Error]"))
+
+
+def _image_metadata_description(image_path: str) -> str:
+    """Return a deterministic description of image metadata (format, size, dimensions).
+
+    This is the last-resort fallback when every vision source fails. It never
+    depends on external APIs or CLIs.
+    """
+    if not os.path.isfile(image_path):
+        return "[Vision Fallback] image file not found"
+    try:
+        size_bytes = os.path.getsize(image_path)
+        size_text = f"{size_bytes / 1024:.1f} KB" if size_bytes < 1024 * 1024 else f"{size_bytes / (1024 * 1024):.2f} MB"
+    except Exception:
+        size_text = "unknown size"
+
+    fmt = "unknown"
+    width = height = 0
+    # Try Pillow first
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            fmt = img.format or "unknown"
+            width, height = img.size
+    except Exception:
+        # Fallback: inspect magic bytes
+        try:
+            with open(image_path, "rb") as f:
+                header = f.read(16)
+            if header[:2] == b"\xff\xd8":
+                fmt = "JPEG"
+            elif header[:4] == b"\x89PNG":
+                fmt = "PNG"
+            elif header[:4] == b"RIFF":
+                fmt = "WebP"
+            elif header[:3] == b"GIF":
+                fmt = "GIF"
+            elif header[:4] == b"wxgf":
+                fmt = "wxgf"
+        except Exception:
+            pass
+
+    dim_text = f"{width}x{height}" if width and height else "unknown dimensions"
+    return (
+        f"[图片元数据] 格式：{fmt}，尺寸：{dim_text}，大小：{size_text}。"
+        "本地视觉识别不可用，无法提取图片内容。"
+    )
+
+
+def _try_ocr(image_path: str) -> str | None:
+    """Try to extract text from image using OCR if an engine is available.
+
+    Supported engines (in order): pytesseract, easyocr.
+    Returns extracted text or None if no engine is available or OCR fails.
+    """
+    if not os.path.isfile(image_path):
+        return None
+
+    # Try pytesseract first (lightweight wrapper, requires tesseract binary)
+    try:
+        import pytesseract
+        from PIL import Image
+        with Image.open(image_path) as img:
+            text = pytesseract.image_to_string(img, lang="chi_sim+eng").strip()
+        if text:
+            return f"[OCR 识别结果]\n{text}"
+        return None
+    except Exception:
+        pass
+
+    # Try easyocr (heavier, but works without external binary)
+    try:
+        import easyocr
+        reader = easyocr.Reader(["ch_sim", "en"])
+        results = reader.readtext(image_path, detail=0)
+        text = "\n".join(str(r) for r in results if r).strip()
+        if text:
+            return f"[OCR 识别结果]\n{text}"
+        return None
+    except Exception:
+        pass
+
+    return None
+
+
+def _try_source(image_path: str, source: str, prompt: str, hooks: dict | None) -> str | None:
+    """Try a single vision source. Return description or None if failed/unavailable."""
+    hooks = hooks or {}
+    source = str(source or "").strip()
+    if not source:
+        return None
+
+    if source == "mmx":
+        result = mmx_recognize_image(image_path, prompt=prompt)
+        return result if not is_vision_error(result) else None
+
+    if source == "ocr":
+        return _try_ocr(image_path)
+
+    if source.startswith("hook:"):
+        hook_name = source.split(":", 1)[1].strip()
+        hook_cmd = hooks.get(hook_name)
+        if not hook_cmd:
+            return None
+        result = run_vision_hook(image_path, hook_cmd)
+        return result if not is_vision_error(result) else None
+
+    # Unknown source: silently skip
+    return None
+
+
+def recognize_image_with_fallback(
+    image_path: str,
+    prompt: str = "简要的描述一下图片内容",
+    sources: list[str] | None = None,
+    hooks: dict[str, list[str] | str] | None = None,
+    fallback_metadata: bool = True,
+) -> str:
+    """Recognize an image using a configurable chain of vision sources.
+
+    Args:
+        image_path: Path to the image file.
+        prompt: Prompt for VLM sources.
+        sources: Ordered list of sources to try. Supported values:
+            - "mmx": MiniMax CLI
+            - "hook:<name>": Custom hook from ``hooks`` dict
+            - "ocr": OCR fallback (pytesseract/easyocr)
+            If None/empty, defaults to ["mmx"].
+        hooks: Mapping from hook name to command (list or string).
+        fallback_metadata: If True and all sources fail, return file metadata.
+
+    Returns:
+        Image description text, or metadata fallback, or an error marker.
+    """
+    if not os.path.isfile(image_path):
+        return "[VLM Error] image not found"
+
+    sources = list(sources) if sources else ["mmx"]
+    hooks = hooks or {}
+    last_error = ""
+
+    for source in sources:
+        try:
+            result = _try_source(image_path, source, prompt, hooks)
+            if result:
+                return result
+        except Exception as e:
+            last_error = f"{source} exception: {e}"
+            continue
+
+    if fallback_metadata:
+        return _image_metadata_description(image_path)
+
+    return f"[VLM Error] all vision sources failed{(' (' + last_error + ')') if last_error else ''}"
