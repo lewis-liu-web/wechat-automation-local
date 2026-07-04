@@ -384,9 +384,11 @@ def _build_turn(
         ctx.append({
             "local_id": e.local_id,
             "sender_id": e.sender_id,
+            "real_sender_id": e.raw.get("real_sender_id") or e.sender_id,
             "create_time": e.timestamp,
             "message_content": e.content,
             "image_path": e.image_path,
+            "status": e.raw.get("status", 1),
         })
 
     return AggregatedTurn(

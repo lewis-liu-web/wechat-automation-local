@@ -29,3 +29,47 @@ def test_provider_label_maps_known_providers():
     assert app._provider_label("echo") == "安全测试（不调用真实模型）"
     assert app._provider_label("hermes") == "Hermes 本地 Agent"
     assert app._provider_label("unknown") == "unknown"
+
+
+class _MockSessionState(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+def test_load_data_preserves_existing_cache_on_api_error(monkeypatch):
+    """Regression: binding KB calls _clear_data_cache + st.rerun(); if a
+    subsequent API call fails, the existing targets/kbs cache must not
+    be wiped to empty lists.
+    """
+    from api import ControlAPIError
+
+    state = _MockSessionState({"base_url": "http://localhost:18590"})
+    monkeypatch.setattr(app.st, "session_state", state)
+
+    def _raise(*args, **kwargs):
+        raise ControlAPIError("unreachable")
+
+    monkeypatch.setattr(app, "health", _raise)
+    monkeypatch.setattr(app, "status", _raise)
+    monkeypatch.setattr(app, "events_stats", _raise)
+    monkeypatch.setattr(app, "events_recent", _raise)
+    monkeypatch.setattr(app, "list_targets", _raise)
+    monkeypatch.setattr(app, "list_kbs", _raise)
+    monkeypatch.setattr(app, "get_default_triggers", _raise)
+
+    existing_targets = [{"name": "bot群聊测试"}]
+    existing_kbs = [{"id": "bus_index"}]
+    state["targets_all"] = existing_targets
+    state["kbs_result"] = existing_kbs
+
+    app._load_data()
+
+    assert state["targets_all"] is existing_targets
+    assert state["kbs_result"] is existing_kbs
+    assert state["data_loaded"] is True

@@ -217,5 +217,24 @@ class AggregationPipelineTests(unittest.TestCase):
         self.assertEqual(msg["mention_name"], "飞扬的跟屁虫")
         self.assertEqual(msg["sender_display_name"], "飞扬的跟屁虫")
 
+    def test_to_generate_reply_message_preserves_aggregator_context(self):
+        """Regression: context_messages must come from the aggregated window,
+        not be replaced later by monitor's build_event_context flat rows.
+        Each context entry must carry enough sender metadata for prompt building.
+        """
+        config = {"max_aggregated_messages": 2}
+        e1 = self._event(1, content="前面这条", real_sender_id=7, status=1)
+        e2 = self._event(2, content="@bot 后面这条", real_sender_id=7, status=1)
+        self.assertIsNone(agg.ingest_event(e1, config=config))
+        turn = agg.ingest_event(e2, trigger_matched=True, config=config)
+        self.assertIsNotNone(turn)
+        msg = turn.to_generate_reply_message()
+        self.assertEqual(len(msg["context_messages"]), 2)
+        self.assertEqual(msg["context_messages"][0]["local_id"], 1)
+        self.assertEqual(msg["context_messages"][1]["local_id"], 2)
+        self.assertEqual(msg["context_messages"][0].get("real_sender_id"), 7)
+        self.assertEqual(msg["context_messages"][1].get("real_sender_id"), 7)
+        self.assertEqual(msg["event_context"], turn.event_context)
+
 if __name__ == '__main__':
     unittest.main()

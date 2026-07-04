@@ -277,31 +277,38 @@ def _load_data():
     try:
         st.session_state.health_result = health(base)
     except ControlAPIError:
-        st.session_state.health_result = None
+        if "health_result" not in st.session_state:
+            st.session_state.health_result = None
     try:
         st.session_state.status_result = status(base)
     except ControlAPIError:
-        st.session_state.status_result = None
+        if "status_result" not in st.session_state:
+            st.session_state.status_result = None
     try:
         st.session_state.events_stats_result = events_stats(base_url=base)
     except ControlAPIError:
-        st.session_state.events_stats_result = None
+        if "events_stats_result" not in st.session_state:
+            st.session_state.events_stats_result = None
     try:
         st.session_state.events_recent_result = events_recent(limit=50, base_url=base)
     except ControlAPIError:
-        st.session_state.events_recent_result = None
+        if "events_recent_result" not in st.session_state:
+            st.session_state.events_recent_result = None
     try:
         st.session_state.targets_all = list_targets(kind="all", base_url=base)
     except ControlAPIError:
-        st.session_state.targets_all = []
+        if "targets_all" not in st.session_state:
+            st.session_state.targets_all = []
     try:
         st.session_state.kbs_result = list_kbs(base_url=base)
     except ControlAPIError:
-        st.session_state.kbs_result = []
+        if "kbs_result" not in st.session_state:
+            st.session_state.kbs_result = []
     try:
         st.session_state.default_triggers_result = get_default_triggers(base_url=base)
     except ControlAPIError:
-        st.session_state.default_triggers_result = []
+        if "default_triggers_result" not in st.session_state:
+            st.session_state.default_triggers_result = []
     st.session_state.data_loaded = True
 
 

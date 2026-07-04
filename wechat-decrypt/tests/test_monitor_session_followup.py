@@ -129,6 +129,41 @@ class SessionFollowupTests(unittest.TestCase):
         followup = self._make_msg("公交卡充值失败")
         self.assertFalse(monitor._is_in_session(t, followup, cfg))
 
+    def test_customer_service_followup_enters_active_session_decision(self):
+        """Regression: customer_service mode must keep the session window open
+        and route non-trigger follow-ups from the same sender to the agent.
+        """
+        import reply_decision
+        t = self._make_target(mode="customer_service")
+        cfg = self._cfg(t)
+        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        monitor._activate_session(t, trigger, cfg)
+        followup = self._make_msg("公交卡充值失败")
+        self.assertTrue(monitor._is_in_session(t, followup, cfg))
+        event_context = {
+            "session_active": True,
+            "trigger_matched": False,
+            "target_policy": {"mode": "customer_service"},
+        }
+        plan = reply_decision.decide(t, followup, event_context)
+        self.assertTrue(plan.should_reply)
+        self.assertEqual(plan.reason, "active_session_followup")
+
+    def test_is_in_session_clears_entry_when_max_turns_reached(self):
+        """Regression: once max_turns is exhausted the stale session entry
+        must be removed so reply_decision sees session_active=False.
+        """
+        t = self._make_target(session_policy={"timeout_seconds": 120, "max_turns": 2})
+        cfg = self._cfg(t)
+        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        monitor._activate_session(t, trigger, cfg)
+        key = monitor._session_key(t, trigger)
+        followup1 = self._make_msg("公交卡充值失败")
+        self.assertTrue(monitor._is_in_session(t, followup1, cfg))
+        followup2 = self._make_msg("还是失败")
+        self.assertFalse(monitor._is_in_session(t, followup2, cfg))
+        self.assertNotIn(key, monitor._active_sessions)
+
     def test_close_cue_with_trigger_expires_session(self):
         """A message that matches a trigger AND is a close cue must close the session."""
         t = self._make_target()

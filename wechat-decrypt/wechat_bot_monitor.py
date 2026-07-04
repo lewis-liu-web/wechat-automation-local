@@ -256,6 +256,7 @@ def _is_in_session(t, msg, cfg):
         turns = int(sess.get('turns') or 0)
         if max_turns > 0 and turns >= max_turns:
             log('session_miss key=%s reason=max_turns turns=%s max=%s' % (key, turns, max_turns))
+            _active_sessions.pop(key, None)
             return False
         require_followup = bool(session_policy.get('require_followup_intent', True))
         if not require_followup:
@@ -1265,7 +1266,8 @@ def main():
                     continue
 
                 agg_msg = turn.to_generate_reply_message()
-                agg_msg['context_messages'] = ctx
+                # Keep the aggregated window's own context_messages; the flat
+                # historical rows from build_event_context live in event_context.
                 # Carry forward the original message's metadata for reply_engine
                 agg_msg['target_policy'] = policy
                 agg_msg['event_context'] = event_context
@@ -1306,13 +1308,14 @@ def main():
                     decision = generate_reply(agg_msg, t, cfg)
                     gen_dt = time.time() - gen_t0
                     text = decision.reply_text
+                    ctx_len = len(agg_msg.get('context_messages') or [])
                     log('trigger hit target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
-                        t.get('name'), turn.end_local_id, len(ctx), gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
+                        t.get('name'), turn.end_local_id, ctx_len, gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
                     try:
                         detail = decision.to_dict()
                         detail['target'] = t.get('name')
                         detail['local_id'] = turn.end_local_id
-                        detail['context_count'] = len(ctx)
+                        detail['context_count'] = ctx_len
                         detail['generate_seconds'] = round(gen_dt, 3)
                         detail['reply_preview'] = (text or '')[:200]
                         log('decision_detail %s' % json.dumps(detail, ensure_ascii=False, default=str))
