@@ -1710,7 +1710,28 @@ def _enable_wechat_mcp_tool(config: Dict[str, Any]) -> bool:
     return bool(_reply_engine_config(config).get("enable_wechat_mcp_tool", False))
 
 
-def _tool_agent_available_tools(config: Dict[str, Any]) -> List[Dict[str, str]]:
+def _tool_agent_allowed_leann_indexes(config: Dict[str, Any], target: Dict[str, Any] | None = None) -> List[str]:
+    """Return the LEANN index names this target is allowed to search.
+
+    Only ``type: leann`` knowledge bases contribute. An empty list means no
+    target-specific restriction (backward compatible).
+    """
+    indexes: List[str] = []
+    if not target:
+        return indexes
+    for kb_id in resolve_target_kb_ids(config, target) or []:
+        spec = _resolve_kb_spec(config, target, kb_id)
+        if not spec:
+            continue
+        if str(spec.get("type") or "").lower() != "leann":
+            continue
+        idx = str(spec.get("index_name") or spec.get("knowledge_base_id") or "").strip()
+        if idx and idx not in indexes:
+            indexes.append(idx)
+    return indexes
+
+
+def _tool_agent_available_tools(config: Dict[str, Any], target: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     """Build the available_tools list for tool_agent mode.
 
     Only leann_search is exposed in the Python tool loop.  WeChat query tools
@@ -1718,13 +1739,17 @@ def _tool_agent_available_tools(config: Dict[str, Any]) -> List[Dict[str, str]]:
     adds a prompt hint telling the agent it may use a registered WeChat MCP
     server.
     """
-    tools: List[Dict[str, str]] = [
-        {
-            "name": "leann_search",
-            "description": "本地 LEANN 语义搜索工具，按需求检索知识库索引。",
-        }
-    ]
-    return tools
+    allowed = _tool_agent_allowed_leann_indexes(config, target)
+    description = "本地 LEANN 语义搜索工具，按需求检索知识库索引。"
+    tool: Dict[str, Any] = {
+        "name": "leann_search",
+        "description": description,
+    }
+    if allowed:
+        tool["allowed_index_names"] = allowed
+        tool["default_index_name"] = allowed[0]
+        tool["description"] = description + " 当前目标只允许使用以下索引：%s。" % ", ".join(allowed)
+    return [tool]
 
 
 def _is_raw_agent_mode(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
@@ -1817,7 +1842,7 @@ def _run_tool_agent_sync(
         "clean_text": clean or raw_text,
         "raw_text": raw_text,
         "agent_mode": "tool_agent",
-        "available_tools": _tool_agent_available_tools(config),
+        "available_tools": _tool_agent_available_tools(config, target),
         "enable_wechat_mcp_tool": _enable_wechat_mcp_tool(config),
         "leann": leann_cfg,
         "knowledge_hits": [],
@@ -2172,7 +2197,7 @@ def generate_reply(message: Dict[str, Any] | str,
                             "knowledge_bases": selected_kbs,
                             "reply_mode": "raw_agent",
                             "agent_mode": effective_agent_mode,
-                            "available_tools": _tool_agent_available_tools(config) if async_is_tool_agent else [],
+                            "available_tools": _tool_agent_available_tools(config, target) if async_is_tool_agent else [],
                             "leann": leann_cfg if async_is_tool_agent else {},
                             "response_mode": response_mode,
                             "target_policy": target_policy or {},
@@ -2253,7 +2278,7 @@ def generate_reply(message: Dict[str, Any] | str,
                         "knowledge_bases": selected_kbs,
                         "reply_mode": "raw_agent",
                         "agent_mode": effective_agent_mode,
-                        "available_tools": _tool_agent_available_tools(config) if async_is_tool_agent else [],
+                        "available_tools": _tool_agent_available_tools(config, target) if async_is_tool_agent else [],
                         "leann": leann_cfg if async_is_tool_agent else {},
                         "response_mode": response_mode,
                         "target_policy": target_policy or {},

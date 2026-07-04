@@ -320,6 +320,67 @@ def test_build_prompt_prefers_clean_text_in_tool_agent_mode():
     assert "full aggregator context" not in prompt
 
 
+def test_build_prompt_lists_allowed_index_names():
+    job = {
+        "payload": {
+            "prompt": "q",
+            "clean_text": "q",
+            "agent_mode": "tool_agent",
+            "available_tools": [
+                {"name": "leann_search", "allowed_index_names": ["idx_a", "idx_b"], "default_index_name": "idx_a"}
+            ],
+            "knowledge_hits": [],
+        },
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "idx_a" in prompt
+    assert "idx_b" in prompt
+    assert "禁止搜索未列出的索引" in prompt
+
+
+def test_hermes_provider_enforces_allowed_index_names():
+    """If the model asks for a disallowed index, do not run leann_search."""
+    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=1, leann_cli_path="leann")
+    stdout = '{"tool": "leann_search", "index_name": "forbidden", "query": "q", "top_k": 3}\n回复'
+
+    with mock.patch.object(provider, "_invoke_hermes", return_value={"ok": True, "stdout": stdout, "stderr": "", "rc": 0}), \
+         mock.patch("agent_provider._run_leann_search") as mock_leann:
+        result = provider.run({
+            "payload": {
+                "prompt": "q",
+                "agent_mode": "tool_agent",
+                "available_tools": [
+                    {"name": "leann_search", "allowed_index_names": ["allowed"], "default_index_name": "allowed"}
+                ],
+            }
+        })
+
+    assert result.ok is True
+    assert "forbidden" not in result.reply_text
+    assert mock_leann.call_count == 0
+
+
+def test_hermes_provider_uses_default_index_name_when_omitted():
+    """If the model omits index_name, fall back to default_index_name."""
+    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=1, leann_cli_path="leann")
+    stdout = '{"tool": "leann_search", "query": "q", "top_k": 3}\n回复'
+
+    with mock.patch.object(provider, "_invoke_hermes", return_value={"ok": True, "stdout": stdout, "stderr": "", "rc": 0}), \
+         mock.patch("agent_provider._run_leann_search", return_value='{"results": []}') as mock_leann:
+        result = provider.run({
+            "payload": {
+                "prompt": "q",
+                "agent_mode": "tool_agent",
+                "available_tools": [
+                    {"name": "leann_search", "allowed_index_names": ["allowed"], "default_index_name": "allowed"}
+                ],
+            }
+        })
+
+    assert result.ok is True
+    mock_leann.assert_called_once_with("leann", "allowed", "q", 3, 120)
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

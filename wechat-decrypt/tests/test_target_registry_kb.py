@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -68,6 +69,67 @@ class TestKbValidation(unittest.TestCase):
         p2.mkdir()
         out = reg.add_knowledge_base("scene.x", kb_type="local", path=str(p2), replace=True, config_path=cfg_path)
         self.assertEqual(out["path"], str(p2))
+
+
+class TestLeannKb(unittest.TestCase):
+    def _tmp_config(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        cfg_path = Path(td.name) / "targets.json"
+        cand_path = Path(td.name) / "candidates.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        cand_path.write_text('{"version": 1, "candidates": []}', encoding="utf-8")
+        return td, cfg_path, cand_path
+
+    def test_add_leann_kb_requires_index_name(self):
+        _, cfg_path, _ = self._tmp_config()
+        with self.assertRaises(ValueError) as ctx:
+            reg.add_knowledge_base("leann.x", kb_type="leann", config_path=cfg_path)
+        self.assertIn("knowledge-base-id", str(ctx.exception).lower())
+
+    def test_add_leann_kb_accepts_index_name(self):
+        _, cfg_path, _ = self._tmp_config()
+        out = reg.add_knowledge_base("leann.x", kb_type="leann", knowledge_base_id="idx_x", config_path=cfg_path)
+        self.assertEqual(out["type"], "leann")
+        self.assertEqual(out["index_name"], "idx_x")
+
+    def test_validate_kb_rejects_leann_without_index_name(self):
+        _, cfg_path, _ = self._tmp_config()
+        with self.assertRaises(ValueError) as ctx:
+            reg.add_knowledge_base("leann.x", kb_type="leann", knowledge_base_id="", config_path=cfg_path)
+        self.assertIn("index_name", str(ctx.exception).lower())
+
+    def test_bind_wiki_accepts_multiple_leann_indexes(self):
+        _, cfg_path, _ = self._tmp_config()
+        cfg = reg.load_config(cfg_path)
+        cfg["knowledge_bases"] = {
+            "leann.a": {"type": "leann", "index_name": "idx_a", "enabled": True},
+            "leann.b": {"type": "leann", "index_name": "idx_b", "enabled": True},
+        }
+        cfg["targets"] = [{"name": "群A", "username": "wxid_a", "knowledge_bases": ["leann.a"]}]
+        reg.save_json_atomic(cfg_path, cfg)
+        t = reg.bind_wiki("wxid_a", ["leann.a", "leann.b"], replace=True, config_path=cfg_path)
+        self.assertEqual(sorted(t["knowledge_bases"]), ["leann.a", "leann.b"])
+
+    def test_list_knowledge_bases_includes_index_name(self):
+        _, cfg_path, _ = self._tmp_config()
+        reg.add_knowledge_base("leann.x", kb_type="leann", knowledge_base_id="idx_x", description="desc", config_path=cfg_path)
+        rows = reg.list_knowledge_bases(config_path=cfg_path)
+        row = next((r for r in rows if r["id"] == "leann.x"), None)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["type"], "leann")
+        self.assertEqual(row["index_name"], "idx_x")
+
+    def test_search_kb_dispatches_to_leann_search(self):
+        _, cfg_path, _ = self._tmp_config()
+        cfg = reg.load_config(cfg_path)
+        cfg["knowledge_bases"] = {"leann.x": {"type": "leann", "index_name": "idx_x", "enabled": True}}
+        reg.save_json_atomic(cfg_path, cfg)
+        with mock.patch("target_registry.subprocess.run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout='{"results": [{"title": "T", "content": "C"}]}', stderr="")
+            res = reg.search_kb("leann.x", "query", limit=3, config_path=cfg_path)
+        self.assertEqual(res.get("matched_files"), 1)
+        self.assertEqual(res["hits"][0]["rel_path"], "T")
 
 
 class TestSingleSourceBinding(unittest.TestCase):

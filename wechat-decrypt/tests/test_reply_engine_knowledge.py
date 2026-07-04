@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools
+from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools, _tool_agent_allowed_leann_indexes
 import agent_provider as ap
 
 class KnowledgeArchitectureTests(unittest.TestCase):
@@ -408,6 +408,52 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.assertEqual(payload['leann'], {})
         self.assertTrue(len(payload.get('knowledge_hits', [])) > 0)
         self.assertIn('scene.a', payload['retrieval_debug']['selected_kbs'])
+
+    def test_tool_agent_allowed_leann_indexes_from_bound_kbs(self):
+        cfg = {
+            'knowledge_bases': {
+                'leann.a': {'type': 'leann', 'index_name': 'idx_a'},
+                'leann.b': {'type': 'leann', 'index_name': 'idx_b'},
+                'scene.a': {'type': 'local', 'path': 'scenes/a'},
+            }
+        }
+        target = {'knowledge_bases': ['leann.a', 'leann.b', 'scene.a']}
+        self.assertEqual(sorted(_tool_agent_allowed_leann_indexes(cfg, target)), ['idx_a', 'idx_b'])
+
+    def test_tool_agent_available_tools_restricts_to_allowed_indexes(self):
+        cfg = {
+            'knowledge_bases': {
+                'leann.a': {'type': 'leann', 'index_name': 'idx_a'},
+                'leann.b': {'type': 'leann', 'index_name': 'idx_b'},
+            }
+        }
+        target = {'knowledge_bases': ['leann.a', 'leann.b']}
+        tools = _tool_agent_available_tools(cfg, target)
+        self.assertEqual([t['name'] for t in tools], ['leann_search'])
+        self.assertEqual(sorted(tools[0]['allowed_index_names']), ['idx_a', 'idx_b'])
+        self.assertEqual(tools[0]['default_index_name'], 'idx_a')
+
+    def test_generate_reply_tool_agent_passes_allowed_index_names(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {
+                'leann.a': {'type': 'leann', 'index_name': 'idx_a'},
+            },
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = mock.Mock(ok=True, reply_text='工具查询结果回复')
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['leann.a']}, cfg)
+
+        self.assertTrue(d.should_reply)
+        job = instance.run.call_args.args[0]
+        payload = job.get('payload') or job
+        tool = payload['available_tools'][0]
+        self.assertEqual(tool['allowed_index_names'], ['idx_a'])
+        self.assertEqual(tool['default_index_name'], 'idx_a')
 
 if __name__ == '__main__':
     unittest.main()

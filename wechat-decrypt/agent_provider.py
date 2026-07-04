@@ -477,6 +477,14 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         for tool in available_tools or [{"name": "leann_search", "description": "本地 LEANN 语义搜索工具"}]:
             name = str(tool.get("name") or "")
             if name == "leann_search":
+                allowed = tool.get("allowed_index_names") or []
+                default = str(tool.get("default_index_name") or "").strip()
+                index_hint = ""
+                if allowed:
+                    index_hint = "\n  当前目标允许使用的 index_name: %s。" % ", ".join(allowed)
+                    if default:
+                        index_hint += "\n  如果省略 index_name，默认使用: %s。" % default
+                    index_hint += "\n  禁止搜索未列出的索引。"
                 tool_schema_parts.append(
                     "leann_search(index_name, query, top_k)\n"
                     "  参数:\n"
@@ -487,6 +495,7 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
                     "  调用方式: 在任意一行单独输出 JSON 对象:\n"
                     '    {"tool": "leann_search", "index_name": "your_index", "query": "your query", "top_k": 3}\n'
                     "  系统会执行该工具并把结果追加到对话中，你可以继续推理。"
+                    f"{index_hint}"
                 )
         tool_schema = "\n\n".join(tool_schema_parts) + f"\n  最多允许 {max_tool_rounds} 轮工具调用。"
         if enable_wechat_mcp_tool:
@@ -769,6 +778,16 @@ class HermesProvider:
         leann_cfg = (payload.get("payload") or {}).get("leann") or {}
         leann_cli = str(leann_cfg.get("cli_path") or self.leann_cli_path or "leann")
         leann_timeout = float(leann_cfg.get("timeout") or 120)
+        available_tools = (payload.get("payload") or {}).get("available_tools") or []
+        allowed_index_names: List[str] = []
+        default_index_name = ""
+        for tool in available_tools or []:
+            if str(tool.get("name") or "").strip() == "leann_search":
+                raw_allowed = tool.get("allowed_index_names") or []
+                if raw_allowed:
+                    allowed_index_names = [str(x).strip() for x in raw_allowed if str(x).strip()]
+                    default_index_name = str(tool.get("default_index_name") or raw_allowed[0]).strip()
+                break
 
         while True:
             remaining = max(5.0, deadline - time.time())
@@ -807,9 +826,13 @@ class HermesProvider:
             tool_name = str(tool_call.get("tool") or "").strip()
             if tool_name == "leann_search":
                 index_name = str(tool_call.get("index_name") or "").strip()
+                if not index_name and default_index_name:
+                    index_name = default_index_name
                 query = str(tool_call.get("query") or "").strip()
                 top_k = int(tool_call.get("top_k") or 3)
-                if not index_name or not query:
+                if allowed_index_names and index_name not in allowed_index_names:
+                    tool_result = f"(LEANN search failed: index_name '{index_name}' is not in the allowed list: {allowed_index_names})"
+                elif not index_name or not query:
                     tool_result = "(LEANN search failed: missing index_name or query)"
                 else:
                     raw_output = _run_leann_search(leann_cli, index_name, query, top_k, leann_timeout)

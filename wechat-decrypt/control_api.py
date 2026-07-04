@@ -509,7 +509,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             q = str((params.get("q") or [""])[0]).strip()
             limit = int((params.get("limit") or ["5"])[0])
             try:
-                return _ok(**reg.search_local_kb(m[0], q, limit=limit))
+                return _ok(**reg.search_kb(m[0], q, limit=limit))
             except Exception as e:
                 return _err("search failed: %s" % (e,))
         if method == "POST" and (m := _match(path, "/kbs/{key}/open")):
@@ -519,7 +519,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         if method == "GET" and (m := _match(path, "/kbs/{key}/diagnose")):
             q = str((params.get("q") or [""])[0]).strip()
             try:
-                return _ok(**reg.diagnose_local_kb(m[0], query=q))
+                return _ok(**reg.diagnose_kb(m[0], query=q))
             except Exception as e:
                 return _err("diagnose failed: %s" % (e,))
         if method == "POST" and (m := _match(path, "/targets/{key}/kbs/replace")):

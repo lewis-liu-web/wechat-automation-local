@@ -866,6 +866,7 @@ def list_knowledge_bases(config_path=CONFIG_PATH):
             "type": spec.get("type") or "local",
             "enabled": spec.get("enabled", True),
             "knowledge_base_id": spec.get("knowledge_base_id") or "",
+            "index_name": spec.get("index_name") or "",
             "path": spec.get("path") or spec.get("dir") or "",
             "source": _kb_source(spec),
             "scope": spec.get("scope") or "scene",
@@ -921,7 +922,7 @@ def validate_kb_config(kb_id, spec, config_path=CONFIG_PATH):
     kb_type = str(spec.get("type") or "").strip().lower()
     if not kb_type:
         raise ValueError("知识库 '%s' 缺少 type 字段" % kb_id)
-    if kb_type not in ("local", "getnote", "ima", "hook"):
+    if kb_type not in ("local", "getnote", "ima", "hook", "leann"):
         raise ValueError("知识库 '%s' 不支持的类型: %s" % (kb_id, kb_type))
     if not isinstance(spec.get("enabled", True), bool):
         raise ValueError("知识库 '%s' enabled 必须是布尔值" % kb_id)
@@ -935,6 +936,9 @@ def validate_kb_config(kb_id, spec, config_path=CONFIG_PATH):
     elif kb_type == "hook":
         if not spec.get("executable"):
             raise ValueError("知识库 '%s' 必须提供 executable" % kb_id)
+    elif kb_type == "leann":
+        if not spec.get("index_name"):
+            raise ValueError("知识库 '%s' 必须提供 index_name" % kb_id)
 
 
 def _local_kb_dir(kb_id, spec, config_path=CONFIG_PATH):
@@ -980,6 +984,17 @@ def add_knowledge_base(kb_id, kb_type="getnote", knowledge_base_id=None, path=No
             raise ValueError("--path is required for local knowledge base")
         spec["path"] = path
         spec["scope"] = scope or "scene"
+    elif kb_type == "leann":
+        if not knowledge_base_id:
+            raise ValueError("--kid/--knowledge-base-id (用作 LEANN index_name) 是 leann 类型必填")
+        spec["index_name"] = str(knowledge_base_id).strip()
+        spec["scope"] = scope or "scene"
+        if executable:
+            spec["executable"] = str(executable).strip()
+        if limit is not None:
+            spec["limit"] = int(limit)
+        if timeout is not None:
+            spec["timeout"] = int(timeout)
     else:
         raise ValueError("unsupported knowledge base type: %s" % kb_type)
     if description:
@@ -1045,6 +1060,8 @@ def _kb_source(spec):
     typ = str(spec.get("type") or "local").strip().lower()
     if typ == "local":
         return "local_folder"
+    if typ == "leann":
+        return "leann"
     return typ
 
 
@@ -1138,6 +1155,10 @@ def get_kb_info(kb_id, config_path=CONFIG_PATH):
         info.update(_resolve_getnote_kb_info(spec))
     elif spec.get("type") == "ima":
         info.update(_resolve_ima_kb_info(spec))
+    elif spec.get("type") == "leann":
+        diag = diagnose_leann_kb(spec)
+        info["exists"] = bool(diag.get("ok"))
+        info["online_error"] = diag.get("error") or ""
     return info
 
 
@@ -1400,6 +1421,124 @@ def search_local_kb(kb_id, query, limit=5, config_path=CONFIG_PATH):
         "total_files": total,
         "query": query,
     }
+
+
+def _leann_exe(spec):
+    return str(spec.get("executable") or spec.get("cli") or "leann").strip() or "leann"
+
+
+def search_leann_kb(spec, query, limit=5):
+    """Run leann search against the configured LEANN index."""
+    index_name = str(spec.get("index_name") or "").strip()
+    if not index_name:
+        raise ValueError("LEANN 知识库缺少 index_name")
+    exe = _leann_exe(spec)
+    env = dict(os.environ)
+    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    cmd = [
+        exe,
+        "search",
+        index_name,
+        str(query or ""),
+        "--top-k",
+        str(int(limit or 5)),
+        "--json",
+        "--non-interactive",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(1.0, float(spec.get("timeout") or 120)),
+            env=env,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+    except Exception as e:
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query, "error": str(e)}
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query,
+                "error": "leann search failed rc=%s stderr=%s" % (proc.returncode, (proc.stderr or "")[:200])}
+    try:
+        payload = json.loads(proc.stdout)
+    except Exception as e:
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query, "error": str(e)}
+    if isinstance(payload, dict):
+        results = payload.get("results") or payload.get("data") or payload.get("hits") or []
+    elif isinstance(payload, list):
+        results = payload
+    else:
+        results = []
+    hits = []
+    for idx, item in enumerate(results[:max(1, int(limit or 5))], start=1):
+        if isinstance(item, dict):
+            title = str(item.get("title") or item.get("id") or "").strip()
+            content = str(item.get("content") or item.get("text") or item.get("summary") or "").strip()
+            rel = title or str(idx)
+        else:
+            rel = str(idx)
+            content = str(item)
+        hits.append({
+            "rel_path": rel,
+            "score": None,
+            "snippet": content[:320],
+        })
+    return {"hits": hits, "matched_files": len(hits), "total_files": len(results), "query": query}
+
+
+def search_kb(kb_id, query, limit=5, config_path=CONFIG_PATH):
+    """Dispatch search by KB type."""
+    cfg = load_config(config_path)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    kb_type = str(spec.get("type") or "local").lower()
+    if kb_type == "leann":
+        return search_leann_kb(spec, query, limit=limit)
+    return search_local_kb(kb_id, query, limit=limit, config_path=config_path)
+
+
+def diagnose_leann_kb(spec):
+    """Check that the configured LEANN index exists."""
+    index_name = str(spec.get("index_name") or "").strip()
+    if not index_name:
+        raise ValueError("LEANN 知识库缺少 index_name")
+    exe = _leann_exe(spec)
+    env = dict(os.environ)
+    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    try:
+        proc = subprocess.run(
+            [exe, "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            env=env,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+    except Exception as e:
+        return {"ok": False, "index_name": index_name, "error": str(e)}
+    if proc.returncode != 0:
+        return {"ok": False, "index_name": index_name,
+                "error": "leann list failed rc=%s stderr=%s" % (proc.returncode, (proc.stderr or "")[:200])}
+    output = proc.stdout or ""
+    exists = index_name in output.split()
+    return {"ok": exists, "index_name": index_name, "listed": exists, "error": "" if exists else "索引不存在"}
+
+
+def diagnose_kb(kb_id, query='', config_path=CONFIG_PATH):
+    """Dispatch diagnosis by KB type."""
+    cfg = load_config(config_path)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
+    if not spec:
+        raise ValueError("知识库不存在: %s" % kb_id)
+    kb_type = str(spec.get("type") or "local").lower()
+    if kb_type == "leann":
+        return diagnose_leann_kb(spec)
+    return diagnose_local_kb(kb_id, query=query, config_path=config_path)
 
 
 def _convert_file_to_markdown(path):

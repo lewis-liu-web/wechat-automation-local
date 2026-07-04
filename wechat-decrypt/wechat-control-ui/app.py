@@ -152,6 +152,7 @@ KB_TYPE_LABELS = {
     "getnote": "Get笔记在线知识库",
     "ima": "IMA 在线知识库",
     "hook": "外部适配器",
+    "leann": "LEANN 向量索引",
 }
 
 KB_SOURCE_LABELS = {
@@ -160,6 +161,7 @@ KB_SOURCE_LABELS = {
     "getnote": "Get笔记 在线知识库",
     "ima": "IMA 在线知识库",
     "hook": "外部适配器知识库",
+    "leann": "LEANN 向量索引",
 }
 
 CATEGORY_LABELS = {
@@ -947,6 +949,35 @@ def _page_knowledge():
                     st.error("创建失败：%s" % (e,))
 
     st.divider()
+    st.subheader("新增 LEANN 索引")
+    lc1, lc2, lc3, lc4 = st.columns([2, 2, 2, 1])
+    with lc1:
+        leann_new_id = st.text_input("别名", placeholder="例如：work_kb", key="kb_leann_new_id")
+    with lc2:
+        leann_new_desc = st.text_input("说明", placeholder="例如：工作资料向量索引", key="kb_leann_new_desc")
+    with lc3:
+        leann_index_name = st.text_input("LEANN 索引名", placeholder="例如：work_kb", key="kb_leann_index_name")
+    with lc4:
+        st.write("")
+        if st.button("创建", use_container_width=True, key="kb_create_leann"):
+            if not leann_new_id.strip() or not leann_index_name.strip():
+                st.warning("别名和索引名不能为空")
+            else:
+                try:
+                    save_kb({
+                        "id": leann_new_id.strip(),
+                        "type": "leann",
+                        "knowledge_base_id": leann_index_name.strip(),
+                        "description": leann_new_desc.strip(),
+                        "replace": False,
+                    }, base_url=base)
+                    _clear_data_cache()
+                    st.success("已创建 LEANN 索引绑定")
+                    st.rerun()
+                except ControlAPIError as e:
+                    st.error("创建失败：%s" % (e,))
+
+    st.divider()
     st.subheader("绑定知识库到目标")
     if not targets:
         st.caption("暂无可绑定目标。")
@@ -983,6 +1014,9 @@ def _page_knowledge():
                     bits.append("文件 %d" % fc2)
                 if bits:
                     count = "，".join(bits)
+            elif kb_type == "leann":
+                idx = kb.get("index_name") or kb.get("knowledge_base_id") or ""
+                count = "索引 %s" % idx if idx else "未配置索引"
             enabled = "已启用" if kb.get("enabled") else "已停用"
             return "%s · %s · %s · %s" % (kb_id, src_label, count or "在线", enabled)
         kb_source_by_id = {}
@@ -1001,7 +1035,7 @@ def _page_knowledge():
         selected = st.multiselect("绑定知识库", options=kb_ids, default=current, key="kb_bind_select_%s" % target_key, format_func=_kb_option_label)
         selected_sources = {kb_source_by_id.get(x, "local_folder") for x in selected}
         if len(selected_sources) > 1:
-            st.warning("一个监听目标只能绑定同源知识库。请只选同一个来源，例如只选 Obsidian、只选普通本地文件夹，或只选 Get笔记。")
+            st.warning("一个监听目标只能绑定同源知识库。请只选同一个来源，例如只选 Obsidian、只选普通本地文件夹、只选 Get笔记，或只选 LEANN 索引。")
         elif selected_sources:
             only_source = next(iter(selected_sources))
             st.caption("当前绑定来源：%s" % _label(KB_SOURCE_LABELS, only_source))
@@ -1033,9 +1067,9 @@ def _page_knowledge():
                         format_func=lambda kb_id: _kb_option_label(kb_id),
                     )
                 diag_type = kb_type_by_id.get(diag_kb, "local")
-                diag_supported = diag_type == "local"
+                diag_supported = diag_type in ("local", "leann")
                 if not diag_supported:
-                    st.info("%s 暂不支持模拟检索/诊断，仅本地知识库（Obsidian/本地文件夹）支持。" % _label(KB_SOURCE_LABELS, kb_source_by_id.get(diag_kb, "local_folder")))
+                    st.info("%s 暂不支持模拟检索/诊断，仅本地知识库（Obsidian/本地文件夹）和 LEANN 索引支持。" % _label(KB_SOURCE_LABELS, kb_source_by_id.get(diag_kb, "local_folder")))
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("模拟检索", key="target_kb_search_%s" % target_key, use_container_width=True, disabled=not diag_supported):
@@ -1049,11 +1083,11 @@ def _page_knowledge():
                                 st.error("查询失败：%s" % (e,))
                 with c2:
                     if st.button("诊断索引", key="target_kb_diag_%s" % target_key, use_container_width=True, disabled=not diag_supported):
-                        if not q.strip():
+                        if not q.strip() and diag_type != "leann":
                             st.warning("请先输入查询词")
                         else:
                             try:
-                                res = diagnose_kb(diag_kb, q.strip(), base_url=base)
+                                res = diagnose_kb(diag_kb, (q or "").strip(), base_url=base)
                                 st.session_state["target_kb_diag_result_%s" % target_key] = res
                             except ControlAPIError as e:
                                 st.error("诊断失败：%s" % (e,))
@@ -1064,7 +1098,9 @@ def _page_knowledge():
                 if not hits:
                     st.caption("没有命中。")
                 for h in hits:
-                    st.markdown("- **%s**（分数 %d）" % (h.get("rel_path"), h.get("score")))
+                    score = h.get("score")
+                    score_txt = "（分数 %d）" % score if isinstance(score, int) else ""
+                    st.markdown("- **%s**%s" % (h.get("rel_path"), score_txt))
                     snippet = (h.get("snippet") or "").strip()
                     if snippet:
                         st.caption("  " + snippet[:160].replace("\n", " "))
@@ -1111,6 +1147,9 @@ def _page_knowledge():
                         suffix = detail
                     else:
                         suffix = " · 在线知识库（名称未获取：%s）" % (kb.get("online_error") or "未知")
+                elif kb_type == "leann":
+                    idx = kb.get("index_name") or kb.get("knowledge_base_id") or ""
+                    suffix = " · LEANN 索引：%s" % idx if idx else " · LEANN 索引未配置"
                 else:
                     suffix = ""
                 st.markdown("**%s**  %s%s" % (kb_id, "已启用" if enabled else "已停用", suffix))
@@ -1126,6 +1165,8 @@ def _page_knowledge():
                     st.caption("路径：%s" % kb.get("path"))
                 if kb.get("knowledge_base_id"):
                     st.caption("外部ID：%s" % kb.get("knowledge_base_id"))
+                if kb.get("index_name"):
+                    st.caption("LEANN 索引名：%s" % kb.get("index_name"))
             with cols[1]:
                 # 未注册（wiki 扫描得到）的 KB：禁用启用/停用/删除，仅允许打开与查询
                 mutation_disabled = not managed
