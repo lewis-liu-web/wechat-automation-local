@@ -58,6 +58,20 @@ def test_raw_agent_prompt_contains_file_operation_prohibition():
     assert "系统命令" in prompt
 
 
+def test_raw_agent_prompt_includes_knowledge_hits():
+    """Regression: raw_agent must see retrieved knowledge hits in its prompt."""
+    hits = [
+        {"label": "公交卡充值", "content": "请检查 NFC 是否开启，尝试重启手机。"},
+        {"label": "刷卡失败", "content": "确认超级 SIM 卡已正确启用。"},
+    ]
+    prompt = re._build_raw_agent_prompt(
+        "公交卡充值失败", "飞扬", response_mode="customer_service", knowledge_hits=hits
+    )
+    assert "公交卡充值" in prompt
+    assert "请检查 NFC 是否开启" in prompt
+    assert "超级 SIM 卡" in prompt
+
+
 def test_build_prompt_contains_file_operation_prohibition():
     prompt = re.build_prompt("帮我删除文件", "删除文件", [], mention_name="飞扬的跟屁虫")
     assert "电脑本地文件" in prompt

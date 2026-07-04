@@ -1774,9 +1774,27 @@ def _is_raw_agent_mode(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
     return mode in {"raw", "raw_agent", "agent_raw"}
 
 
-def _build_raw_agent_prompt(clean_text: str, mention_name: str, response_mode: str = "group_assistant") -> str:
+def _build_raw_agent_prompt(
+    clean_text: str,
+    mention_name: str,
+    response_mode: str = "group_assistant",
+    knowledge_hits: List[Dict[str, Any]] | None = None,
+) -> str:
     mode_instruction = _mode_instruction(response_mode)
     mention_rule = f"如需回复，建议以 @{mention_name} + 空格 开头。" if mention_name else "如需回复，建议直接输出适合微信群发送的一段话。"
+    knowledge_block = ""
+    if knowledge_hits:
+        lines = []
+        for i, h in enumerate(knowledge_hits, start=1):
+            if isinstance(h, dict):
+                label = str(h.get("label") or "")
+                content = str(h.get("content") or "")
+            elif isinstance(h, (list, tuple)) and len(h) >= 2:
+                label, content = str(h[0]), str(h[1])
+            else:
+                label, content = "", str(h)
+            lines.append(f"[{i}] {label}\n{content}")
+        knowledge_block = "\n[知识库资料]\n" + "\n\n".join(lines) + "\n\n"
     return (
         "你正在执行 wechat-raw-agent 任务。请根据用户消息和群聊上下文，只输出最终要发送到微信群的一段中文回复。\n"
         f"{mode_instruction}\n"
@@ -1787,6 +1805,7 @@ def _build_raw_agent_prompt(clean_text: str, mention_name: str, response_mode: s
         "3. 不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序。\n"
         "4. 不确定就说不确定，不要编造事实。\n"
         "5. 最多300字。\n\n"
+        f"{knowledge_block}"
         f"[用户消息]\n{clean_text}\n\n"
         "请只输出要发送到微信群的一段中文回复。"
     )
@@ -2123,7 +2142,7 @@ def generate_reply(message: Dict[str, Any] | str,
         else:
             # Reuse descriptions already computed for KB query to avoid a second VLM call.
             image_descriptions = vision_image_descriptions
-        prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode)
+        prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode, knowledge_hits=payload_knowledge_hits)
         # Inject readable aggregator context before the [用户消息] block
         if aggregator_summary["is_aggregated"] and aggregator_summary["text_parts_count"] >= 2:
             prefix_lines = [f"以下是你需要回复的连续对话（共 {aggregator_summary['text_parts_count']} 条消息）："]
