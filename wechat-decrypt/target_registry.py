@@ -1809,7 +1809,7 @@ def build_leann_kb(kb_id, docs_dir=None, force=False, config_path=CONFIG_PATH):
     cmd = [exe, "build", index_name, "--docs", str(resolved_docs_dir)]
     if force:
         cmd.append("--force")
-    timeout = float((cfg.get("reply_engine") or {}).get("leann", {}).get("timeout", 120))
+    timeout = float((cfg.get("reply_engine") or {}).get("leann", {}).get("timeout", 1800))
     log_dir = Path(config_path).parent / "logs"
     log_dir.mkdir(exist_ok=True)
     build_id = "leann_build_%s_%s" % (kb_id, uuid.uuid4().hex[:12])
