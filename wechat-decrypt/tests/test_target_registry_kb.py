@@ -658,23 +658,36 @@ class TestLeannBuild(unittest.TestCase):
     def test_build_leann_kb_starts_job(self, mock_run):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"
-            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "docs_dir": tmp, "enabled": True}}}))
             result = reg.build_leann_kb("wk", config_path=str(cfg_path))
             self.assertEqual(result["status"], "started")
             self.assertEqual(result["index_name"], "work")
+            self.assertEqual(result["docs_dir"], tmp)
             self.assertTrue(result["build_id"].startswith("leann_build_wk_"))
             self.assertGreater(len(result["build_id"]), len("leann_build_wk_"))
             mock_run.assert_called_once()
 
     @mock.patch("target_registry._run_leann_build_async")
-    def test_build_leann_kb_passes_docs_and_force(self, mock_run):
+    def test_build_leann_kb_passes_docs_dir_and_force(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / "docs"
+            docs.mkdir()
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            reg.build_leann_kb("wk", docs_dir=str(docs), force=True, config_path=str(cfg_path))
+            call_args = mock_run.call_args
+            self.assertIn("build", call_args.args[1])
+            self.assertIn("--docs", call_args.args[1])
+            self.assertIn(str(docs), call_args.args[1])
+            self.assertIn("--force", call_args.args[1])
+
+    def test_build_leann_kb_rejects_missing_docs_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"
             cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
-            reg.build_leann_kb("wk", docs=["docs/a", "docs/b"], force=True, config_path=str(cfg_path))
-            call_args = mock_run.call_args
-            self.assertIn("build", call_args.args[1])
-            self.assertIn("--force", call_args.args[1])
+            with self.assertRaises(ValueError) as ctx:
+                reg.build_leann_kb("wk", config_path=str(cfg_path))
+            self.assertIn("docs_dir", str(ctx.exception).lower())
 
     def test_build_leann_kb_rejects_non_leann(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -763,26 +776,29 @@ class TestLeannBuild(unittest.TestCase):
             self.assertNotIn("proc", reg._LEANN_BUILD_JOBS.get("bid_timeout", {}))
 
     @mock.patch("target_registry._run_leann_build_async")
-    def test_build_leann_kb_empty_docs_fallback(self, mock_run):
+    def test_build_leann_kb_uses_docs_dir_from_spec(self, mock_run):
         with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / "docs"
+            docs.mkdir()
             cfg_path = Path(tmp) / "cfg.json"
-            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
-            reg.build_leann_kb("wk", docs=[], config_path=str(cfg_path))
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "docs_dir": str(docs), "enabled": True}}}))
+            reg.build_leann_kb("wk", config_path=str(cfg_path))
             call_args = mock_run.call_args
             cmd = call_args.args[1]
             self.assertIn("--docs", cmd)
-            self.assertIn(".", cmd)
+            self.assertIn(str(docs), cmd)
 
     @mock.patch("target_registry._run_leann_build_async")
     def test_build_leann_kb_preregisters_started_status(self, mock_run):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"
-            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "docs_dir": tmp, "enabled": True}}}))
             result = reg.build_leann_kb("wk", config_path=str(cfg_path))
             build_id = result["build_id"]
             status = reg.get_leann_build_status(build_id)
             self.assertEqual(status["status"], "started")
             self.assertEqual(status["log_path"], result["log_path"])
+            self.assertEqual(status["docs_dir"], tmp)
             self.assertIn(build_id, reg._LEANN_BUILD_JOBS)
 
     def test_trim_leann_build_jobs_caps_terminal_jobs(self):
@@ -803,6 +819,63 @@ class TestLeannBuild(unittest.TestCase):
         self.assertLessEqual(len(reg._LEANN_BUILD_JOBS), 51)
         self.assertIn("running", reg._LEANN_BUILD_JOBS)
         self.assertNotIn("bid_000", reg._LEANN_BUILD_JOBS)
+
+    def test_list_leann_indexes_scans_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text("{}")
+            indexes_dir = Path(tmp) / ".leann" / "indexes"
+            (indexes_dir / "idx_a").mkdir(parents=True)
+            (indexes_dir / "idx_b").mkdir(parents=True)
+            result = reg.list_leann_indexes(config_path=str(cfg_path))
+        self.assertEqual([i["name"] for i in result["indexes"]], ["idx_a", "idx_b"])
+        self.assertEqual(result["error"], "")
+        self.assertIn("cwd", result)
+
+    def test_list_leann_indexes_returns_empty_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text("{}")
+            result = reg.list_leann_indexes(config_path=str(cfg_path))
+        self.assertEqual(result["indexes"], [])
+        self.assertEqual(result["error"], "")
+
+    def test_get_leann_index_info_reads_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text("{}")
+            index_dir = Path(tmp) / ".leann" / "indexes" / "my_idx"
+            index_dir.mkdir(parents=True)
+            meta = index_dir / "documents.leann.meta.json"
+            meta.write_text(json.dumps({"document_count": 42, "created_at": "2026-07-04T10:00:00"}))
+            info = reg.get_leann_index_info("my_idx", config_path=str(cfg_path))
+        self.assertTrue(info["exists"])
+        self.assertEqual(info["document_count"], 42)
+        self.assertEqual(info["created_at"], "2026-07-04T10:00:00")
+
+    def test_get_leann_index_info_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text("{}")
+            info = reg.get_leann_index_info("missing", config_path=str(cfg_path))
+        self.assertFalse(info["exists"])
+
+    @mock.patch("target_registry._run_leann_build_async")
+    def test_build_state_persists_and_reloads(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "docs_dir": tmp, "enabled": True}}}))
+            reg._LEANN_BUILD_JOBS.clear()
+            reg.build_leann_kb("wk", config_path=str(cfg_path))
+            state_path = Path(tmp) / "logs" / "leann_build_state.json"
+            self.assertTrue(state_path.exists())
+            # Simulate a fresh module load by clearing and reloading.
+            reg._LEANN_BUILD_JOBS.clear()
+            loaded = reg._load_leann_build_state(config_path=str(cfg_path))
+            self.assertEqual(len(loaded), 1)
+            bid = list(loaded.keys())[0]
+            self.assertEqual(loaded[bid]["status"], "started")
+            self.assertEqual(loaded[bid]["kb_id"], "wk")
 
 
 if __name__ == "__main__":

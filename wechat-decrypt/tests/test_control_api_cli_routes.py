@@ -138,3 +138,42 @@ class TestAgentOnOffDutyRoute:
         assert status == 200
         assert resp.get("ok") is True
         assert resp.get("action") == "not_on_duty"
+
+
+class TestLeannRoutes:
+    def test_list_leann_indexes_route(self, monkeypatch):
+        td, cfg_path, cand_path = _tmp_config()
+        monkeypatch.setattr(control_api.reg, "CONFIG_PATH", str(cfg_path))
+        called = []
+        def _fake_list(config_path):
+            called.append(config_path)
+            return {"indexes": [{"name": "idx_a"}], "error": "", "cwd": "/tmp"}
+        monkeypatch.setattr(control_api.reg, "list_leann_indexes", _fake_list)
+        status, resp = _route("GET", "/kbs/leann/indexes")
+        assert status == 200
+        assert resp.get("ok") is True
+        assert resp["indexes"] == [{"name": "idx_a"}]
+        assert called
+
+    def test_leann_index_info_route(self, monkeypatch):
+        td, cfg_path, cand_path = _tmp_config()
+        monkeypatch.setattr(control_api.reg, "CONFIG_PATH", str(cfg_path))
+        called = []
+        def _fake_info(name, config_path):
+            called.append((name, config_path))
+            return {"name": name, "exists": True}
+        monkeypatch.setattr(control_api.reg, "get_leann_index_info", _fake_info)
+        status, resp = _route("GET", "/kbs/leann/indexes/my_idx/info")
+        assert status == 200
+        assert resp["exists"] is True
+        assert called[0][0] == "my_idx"
+
+    def test_leann_build_requires_docs_dir(self, monkeypatch):
+        td, cfg_path, cand_path = _tmp_config()
+        monkeypatch.setattr(control_api.reg, "CONFIG_PATH", str(cfg_path))
+        cfg = reg.load_config(str(cfg_path))
+        cfg["knowledge_bases"] = {"wk": {"type": "leann", "index_name": "work", "enabled": True}}
+        reg.save_json_atomic(str(cfg_path), cfg)
+        status, resp = _route("POST", "/kbs/wk/leann/build", body={"force": True})
+        assert status == 400
+        assert "docs_dir" in resp.get("error", "").lower()

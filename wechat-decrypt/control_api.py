@@ -453,7 +453,11 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         # ---- knowledge bases ----
         if method == "GET" and path == "/kbs":
-            return _ok(knowledge_bases=reg.list_kbs_extended())
+            return _ok(knowledge_bases=reg.list_kbs_extended(config_path=reg.CONFIG_PATH))
+        if method == "GET" and path == "/kbs/leann/indexes":
+            return _ok(**reg.list_leann_indexes(config_path=reg.CONFIG_PATH))
+        if method == "GET" and (m := _match(path, "/kbs/leann/indexes/{name}/info")):
+            return _ok(**reg.get_leann_index_info(m[0], config_path=reg.CONFIG_PATH))
         if method == "POST" and path == "/kbs":
             kb_id = str(body.get("id") or "").strip()
             if not kb_id:
@@ -481,6 +485,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                         enabled=body.get("enabled", True),
                         replace=bool(body.get("replace")),
                         source=body.get("source"),
+                        docs_dir=body.get("docs_dir"),
                     )
                 return _ok(action="saved", knowledge_base=out)
             except Exception as e:
@@ -524,10 +529,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return _err("diagnose failed: %s" % (e,))
         if method == "POST" and (m := _match(path, "/kbs/{key}/leann/build")):
             body = body or {}
-            docs = body.get("docs")
+            docs_dir = body.get("docs_dir")
             force = bool(body.get("force"))
             try:
-                return _ok(**reg.build_leann_kb(m[0], docs=docs, force=force))
+                return _ok(**reg.build_leann_kb(m[0], docs_dir=docs_dir, force=force, config_path=reg.CONFIG_PATH))
             except Exception as e:
                 return _err("build failed: %s" % (e,))
         if method == "GET" and (m := _match(path, "/kbs/{key}/leann/build/status")):

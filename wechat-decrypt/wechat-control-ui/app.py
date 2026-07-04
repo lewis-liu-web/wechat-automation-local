@@ -32,6 +32,8 @@ from api import (  # noqa: E402
     agent_worker_status,
     build_leann_kb,
     leann_build_status,
+    leann_index_info,
+    list_leann_indexes,
     agent_provider_health,
     get_agent_job,
     diagnose_kb,
@@ -961,40 +963,87 @@ def _page_knowledge():
                 st.info(msg["text"])
             elif msg.get("type") == "warning":
                 st.warning(msg["text"])
-    lc1, lc2, lc3, lc4 = st.columns([2, 2, 2, 1])
+
+    # Discover existing LEANN indexes created by `leann` in the runtime directory.
+    leann_index_options = ["(新建)"]
+    leann_index_error = ""
+    try:
+        leann_list_res = list_leann_indexes(base_url=base)
+        leann_index_names = [i.get("name") for i in (leann_list_res.get("indexes") or []) if i.get("name")]
+        leann_index_options.extend([n for n in leann_index_names if n])
+        leann_index_error = leann_list_res.get("error") or ""
+    except ControlAPIError as e:
+        leann_index_error = str(e)
+    if leann_index_error:
+        st.caption("⚠️ 读取现有 LEANN 索引列表失败：%s" % leann_index_error)
+
+    local_kb_paths = {
+        kb.get("id"): (kb.get("path") or "")
+        for kb in kbs
+        if kb.get("type") == "local" and kb.get("path")
+    }
+
+    leann_mode = st.selectbox("选择已有索引或新建", options=leann_index_options, key="kb_leann_mode")
+    is_new_leann = leann_mode == "(新建)"
+    lc1, lc2 = st.columns([2, 2])
     with lc1:
         leann_new_id = st.text_input("别名", placeholder="例如：work_kb", key="kb_leann_new_id")
     with lc2:
         leann_new_desc = st.text_input("说明", placeholder="例如：工作资料向量索引", key="kb_leann_new_desc")
-    with lc3:
-        leann_index_name = st.text_input("LEANN 索引名", placeholder="例如：work_kb", key="kb_leann_index_name")
-    with lc4:
+    if is_new_leann:
+        leann_index_name = st.text_input("LEANN 索引名", value=leann_new_id.strip(), placeholder="例如：work_kb", key="kb_leann_index_name")
+    else:
+        leann_index_name = leann_mode
+        st.caption("将绑定到已有索引：**%s**" % leann_mode)
+
+    docs_dir_col, copy_col = st.columns([3, 1])
+    with docs_dir_col:
+        leann_docs_dir = st.text_input(
+            "来源目录（要索引的文件夹）",
+            placeholder="例如 wiki/workdocs 或 C:\\docs\\work",
+            key="kb_leann_docs_dir",
+            help="相对路径会基于 wiki_dir 解析，绝对路径按原样使用。",
+        )
+    with copy_col:
         st.write("")
-        leann_build_now = st.checkbox("创建后立即后台构建索引", value=False, key="kb_leann_build_now")
-        if st.button("创建", use_container_width=True, key="kb_create_leann"):
-            if not leann_new_id.strip() or not leann_index_name.strip():
-                st.warning("别名和索引名不能为空")
-            else:
-                try:
-                    save_kb({
-                        "id": leann_new_id.strip(),
-                        "type": "leann",
-                        "knowledge_base_id": leann_index_name.strip(),
-                        "description": leann_new_desc.strip(),
-                        "replace": False,
-                    }, base_url=base)
-                    messages = [{"type": "success", "text": "已创建 LEANN 索引绑定"}]
-                    if leann_build_now:
-                        try:
-                            build_result = build_leann_kb(leann_new_id.strip(), force=True, base_url=base)
-                            messages.append({"type": "info", "text": "已启动后台构建：%s" % build_result.get("build_id")})
-                        except ControlAPIError as e:
-                            messages.append({"type": "warning", "text": "索引绑定已创建，但后台构建启动失败：%s" % (e,)})
-                    st.session_state[leann_create_msg_key] = messages
-                    _clear_data_cache()
-                    st.rerun()
-                except ControlAPIError as e:
-                    st.error("创建失败：%s" % (e,))
+        copy_from = st.selectbox(
+            "从本地 KB 复制路径",
+            options=[""] + list(local_kb_paths.keys()),
+            key="kb_leann_copy_from",
+            label_visibility="collapsed",
+        )
+        if copy_from and copy_from in local_kb_paths:
+            st.session_state["kb_leann_docs_dir"] = local_kb_paths[copy_from]
+            st.rerun()
+
+    leann_build_now = st.checkbox("创建后立即后台构建索引", value=False, key="kb_leann_build_now")
+    if st.button("创建", use_container_width=True, key="kb_create_leann"):
+        if not leann_new_id.strip() or not leann_index_name.strip():
+            st.warning("别名和索引名不能为空")
+        else:
+            try:
+                payload = {
+                    "id": leann_new_id.strip(),
+                    "type": "leann",
+                    "knowledge_base_id": leann_index_name.strip(),
+                    "description": leann_new_desc.strip(),
+                    "replace": False,
+                }
+                if leann_docs_dir.strip():
+                    payload["docs_dir"] = leann_docs_dir.strip()
+                save_kb(payload, base_url=base)
+                messages = [{"type": "success", "text": "已创建 LEANN 索引绑定"}]
+                if leann_build_now:
+                    try:
+                        build_result = build_leann_kb(leann_new_id.strip(), force=True, base_url=base)
+                        messages.append({"type": "info", "text": "已启动后台构建：%s" % build_result.get("build_id")})
+                    except ControlAPIError as e:
+                        messages.append({"type": "warning", "text": "索引绑定已创建，但后台构建启动失败：%s" % (e,)})
+                st.session_state[leann_create_msg_key] = messages
+                _clear_data_cache()
+                st.rerun()
+            except ControlAPIError as e:
+                st.error("创建失败：%s" % (e,))
 
     st.divider()
     st.subheader("绑定知识库到目标")
@@ -1035,7 +1084,8 @@ def _page_knowledge():
                     count = "，".join(bits)
             elif kb_type == "leann":
                 idx = kb.get("index_name") or kb.get("knowledge_base_id") or ""
-                count = "索引 %s" % idx if idx else "未配置索引"
+                exists = bool(kb.get("exists"))
+                count = "索引 %s%s" % (idx, " · 存在" if exists else " · 缺失") if idx else "未配置索引"
             enabled = "已启用" if kb.get("enabled") else "已停用"
             return "%s · %s · %s · %s" % (kb_id, src_label, count or "在线", enabled)
         kb_source_by_id = {}
@@ -1058,6 +1108,10 @@ def _page_knowledge():
         elif selected_sources:
             only_source = next(iter(selected_sources))
             st.caption("当前绑定来源：%s" % _label(KB_SOURCE_LABELS, only_source))
+            if only_source == "leann":
+                allowed = [kb.get("index_name") or kb.get("id") or "?" for kb in kbs if kb.get("id") in selected and kb.get("type") == "leann"]
+                if allowed:
+                    st.info("该目标在工具 Agent 模式下只能检索以下 LEANN 索引：%s。" % ", ".join(allowed))
         if st.button("保存绑定", key="kb_bind_save"):
             if len(selected_sources) > 1:
                 st.error("保存失败：不能混用不同来源的知识库。")
@@ -1168,7 +1222,11 @@ def _page_knowledge():
                         suffix = " · 在线知识库（名称未获取：%s）" % (kb.get("online_error") or "未知")
                 elif kb_type == "leann":
                     idx = kb.get("index_name") or kb.get("knowledge_base_id") or ""
-                    suffix = " · LEANN 索引：%s" % idx if idx else " · LEANN 索引未配置"
+                    idx_exists = bool(kb.get("exists"))
+                    suffix = " · LEANN 索引：%s %s" % (
+                        idx,
+                        "（存在）" if idx_exists else "（缺失）" if idx else "",
+                    ) if idx else " · LEANN 索引未配置"
                 else:
                     suffix = ""
                 st.markdown("**%s**  %s%s" % (kb_id, "已启用" if enabled else "已停用", suffix))
@@ -1187,10 +1245,21 @@ def _page_knowledge():
                 if kb.get("index_name"):
                     st.caption("LEANN 索引名：%s" % kb.get("index_name"))
                 if kb_type == "leann":
+                    docs_dir = kb.get("docs_dir") or ""
+                    docs_dir_resolved = kb.get("docs_dir_resolved") or ""
+                    if docs_dir:
+                        st.caption("来源目录：%s%s" % (docs_dir, " → %s" % docs_dir_resolved if docs_dir_resolved and docs_dir_resolved != docs_dir else ""))
+                    else:
+                        st.warning("未配置来源目录（docs_dir），无法构建索引。请编辑知识库补充。")
+                    if kb.get("index_path"):
+                        st.caption("物理位置：%s" % kb.get("index_path"))
                     build_state_key = "leann_build_state_%s" % kb_id
+                    can_build = bool(docs_dir_resolved or docs_dir)
                     build_col1, build_col2 = st.columns([1, 2])
                     with build_col1:
-                        if st.button("🔄 重建索引", key="leann_rebuild_%s" % kb_id, use_container_width=True):
+                        rebuild_disabled = not can_build
+                        rebuild_help = "先配置来源目录" if rebuild_disabled else None
+                        if st.button("🔄 重建索引", key="leann_rebuild_%s" % kb_id, use_container_width=True, disabled=rebuild_disabled, help=rebuild_help):
                             try:
                                 result = build_leann_kb(kb_id, force=True, base_url=base)
                                 st.session_state[build_state_key] = result
@@ -1199,6 +1268,9 @@ def _page_knowledge():
                                 st.error("启动失败：%s" % (e,))
                     with build_col2:
                         current = st.session_state.get(build_state_key)
+                        # Also show persisted latest build if no in-session build.
+                        if not current and kb.get("last_build_id"):
+                            current = {"build_id": kb.get("last_build_id")}
                         if current:
                             try:
                                 status_info = leann_build_status(kb_id, current.get("build_id"), base_url=base)
@@ -1207,8 +1279,12 @@ def _page_knowledge():
                                 status_info = {}
                             status = status_info.get("status", "unknown")
                             error = status_info.get("error") or ""
+                            updated = status_info.get("updated_at")
+                            status_text = status
+                            if updated:
+                                status_text += " · %s" % time.strftime("%H:%M:%S", time.localtime(updated))
                             if status == "done":
-                                st.success("构建完成")
+                                st.success("构建完成 · %s" % status_text)
                             elif status == "failed":
                                 extra = ""
                                 if error:
@@ -1218,13 +1294,20 @@ def _page_knowledge():
                                     extra += "（返回码 %s）" % rc
                                 st.error("构建失败%s" % extra)
                             elif status == "running":
-                                st.info("构建中…")
+                                st.info("构建中… · %s" % status_text)
                             elif status == "started":
-                                st.info("已启动")
+                                st.info("已启动 · %s" % status_text)
                             else:
-                                st.caption("状态：%s" % status)
+                                st.caption("状态：%s" % status_text)
                             log_path = status_info.get("log_path")
-                            if log_path:
+                            if log_path and Path(log_path).exists():
+                                with st.expander("查看日志", expanded=False):
+                                    try:
+                                        log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+                                        st.text_area("日志", value=log_text[-4000:], height=200, disabled=True, label_visibility="collapsed")
+                                    except Exception as e:
+                                        st.caption("无法读取日志：%s" % e)
+                            elif log_path:
                                 st.caption("日志：%s" % log_path)
             with cols[1]:
                 # 未注册（wiki 扫描得到）的 KB：禁用启用/停用/删除，仅允许打开与查询

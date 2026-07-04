@@ -195,12 +195,23 @@ def replace_target_kbs(key: str, knowledge_bases: List[str],
                     base_url=base_url, body={"knowledge_bases": knowledge_bases})
 
 
-def build_leann_kb(kb_id: str, docs: Optional[List[str]] = None, force: bool = False,
+def list_leann_indexes(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """List LEANN indexes known in the runtime directory."""
+    return _request("GET", "/kbs/leann/indexes", base_url=base_url, timeout=15)
+
+
+def leann_index_info(index_name: str, base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """Return metadata for a LEANN index."""
+    return _request("GET", "/kbs/leann/indexes/%s/info" % urllib.parse.quote(index_name, safe=""),
+                    base_url=base_url, timeout=15)
+
+
+def build_leann_kb(kb_id: str, docs_dir: Optional[str] = None, force: bool = False,
                    base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     """Start an asynchronous LEANN build for a knowledge base."""
     body: Dict[str, Any] = {"force": force}
-    if docs:
-        body["docs"] = list(docs)
+    if docs_dir:
+        body["docs_dir"] = str(docs_dir)
     return _request("POST", "/kbs/%s/leann/build" % urllib.parse.quote(kb_id, safe=""),
                     base_url=base_url, body=body, timeout=10)
 
@@ -510,6 +521,8 @@ __all__ = [
     "open_kb_obsidian",
     "diagnose_kb",
     "import_kb",
+    "list_leann_indexes",
+    "leann_index_info",
     "build_leann_kb",
     "leann_build_status",
     "replace_target_kbs",
