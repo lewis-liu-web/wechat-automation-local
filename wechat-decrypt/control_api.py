@@ -522,6 +522,19 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return _ok(**reg.diagnose_kb(m[0], query=q))
             except Exception as e:
                 return _err("diagnose failed: %s" % (e,))
+        if method == "POST" and (m := _match(path, "/kbs/{key}/leann/build")):
+            body = body or {}
+            docs = body.get("docs")
+            force = bool(body.get("force"))
+            try:
+                return _ok(**reg.build_leann_kb(m[0], docs=docs, force=force))
+            except Exception as e:
+                return _err("build failed: %s" % (e,))
+        if method == "GET" and (m := _match(path, "/kbs/{key}/leann/build/status")):
+            build_id = str((params.get("build_id") or [""])[0]).strip()
+            status = reg.get_leann_build_status(build_id)
+            status.setdefault("key", m[0])
+            return _ok(**status)
         if method == "POST" and (m := _match(path, "/targets/{key}/kbs/replace")):
             kbs = list(body.get("knowledge_bases") or [])
             return _ok(action="bound", target=reg.bind_wiki(m[0], kbs, replace=True))

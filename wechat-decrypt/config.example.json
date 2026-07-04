@@ -11,6 +11,7 @@
         "leann": {
             "cli_path": "leann",
             "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+            "cache_dir": "D:\\cache\\leann",
             "timeout": 120
         }
     },

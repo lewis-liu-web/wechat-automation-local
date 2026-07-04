@@ -16,12 +16,18 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Windows: suppress console window for subprocess calls
 _NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# In-memory tracking for asynchronous LEANN index builds.
+_LEANN_BUILD_JOBS: Dict[str, Dict[str, Any]] = {}
+_LEANN_BUILD_LOCK = threading.RLock()
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "wechat_bot_targets.json"
@@ -1156,7 +1162,7 @@ def get_kb_info(kb_id, config_path=CONFIG_PATH):
     elif spec.get("type") == "ima":
         info.update(_resolve_ima_kb_info(spec))
     elif spec.get("type") == "leann":
-        diag = diagnose_leann_kb(spec)
+        diag = diagnose_leann_kb(spec, config_path=config_path, cfg=cfg)
         info["exists"] = bool(diag.get("ok"))
         info["online_error"] = diag.get("error") or ""
     return info
@@ -1427,14 +1433,51 @@ def _leann_exe(spec):
     return str(spec.get("executable") or spec.get("cli") or "leann").strip() or "leann"
 
 
-def search_leann_kb(spec, query, limit=5):
+def _leann_env(cfg=None, config_path=CONFIG_PATH):
+    """Return an environment dict for LEANN subprocesses.
+
+    Defaults embedding model caches to D:\\cache\\leann and sets the HF mirror
+    endpoint so model downloads work reliably on Chinese networks.
+    """
+    if cfg is None:
+        cfg = load_config(config_path)
+    cache_root = Path(cfg.get("reply_engine", {}).get("leann", {}).get("cache_dir", r"D:\cache\leann"))
+    env = dict(os.environ)
+    env["HF_HOME"] = str(cache_root / "huggingface")
+    env["SENTENCE_TRANSFORMERS_HOME"] = str(cache_root / "sentence_transformers")
+    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    return env
+
+
+def migrate_leann_cache(src_dir, dst_dir):
+    """Copy an existing HuggingFace / sentence-transformers cache tree to a new location."""
+    src = Path(src_dir)
+    dst = Path(dst_dir)
+    if not src.exists():
+        return {"copied": False, "reason": "source does not exist", "src": str(src), "dst": str(dst)}
+    if dst.exists() and any(dst.iterdir()):
+        return {"copied": False, "reason": "destination not empty", "src": str(src), "dst": str(dst)}
+    dst.mkdir(parents=True, exist_ok=True)
+    copied_files = 0
+    for item in src.rglob("*"):
+        if item.is_file():
+            rel = item.relative_to(src)
+            target = dst / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            copied_files += 1
+    return {"copied": True, "src": str(src), "dst": str(dst), "files": copied_files}
+
+
+def search_leann_kb(spec, query, limit=5, config_path=CONFIG_PATH, cfg=None):
     """Run leann search against the configured LEANN index."""
+    if cfg is None:
+        cfg = load_config(config_path)
     index_name = str(spec.get("index_name") or "").strip()
     if not index_name:
         raise ValueError("LEANN 知识库缺少 index_name")
     exe = _leann_exe(spec)
-    env = dict(os.environ)
-    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    env = _leann_env(cfg=cfg)
     cmd = [
         exe,
         "search",
@@ -1496,18 +1539,19 @@ def search_kb(kb_id, query, limit=5, config_path=CONFIG_PATH):
         raise ValueError("知识库不存在: %s" % kb_id)
     kb_type = str(spec.get("type") or "local").lower()
     if kb_type == "leann":
-        return search_leann_kb(spec, query, limit=limit)
+        return search_leann_kb(spec, query, limit=limit, config_path=config_path, cfg=cfg)
     return search_local_kb(kb_id, query, limit=limit, config_path=config_path)
 
 
-def diagnose_leann_kb(spec):
+def diagnose_leann_kb(spec, config_path=CONFIG_PATH, cfg=None):
     """Check that the configured LEANN index exists."""
+    if cfg is None:
+        cfg = load_config(config_path)
     index_name = str(spec.get("index_name") or "").strip()
     if not index_name:
         raise ValueError("LEANN 知识库缺少 index_name")
     exe = _leann_exe(spec)
-    env = dict(os.environ)
-    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    env = _leann_env(cfg=cfg)
     try:
         proc = subprocess.run(
             [exe, "list"],
@@ -1537,8 +1581,150 @@ def diagnose_kb(kb_id, query='', config_path=CONFIG_PATH):
         raise ValueError("知识库不存在: %s" % kb_id)
     kb_type = str(spec.get("type") or "local").lower()
     if kb_type == "leann":
-        return diagnose_leann_kb(spec)
+        return diagnose_leann_kb(spec, config_path=config_path, cfg=cfg)
     return diagnose_local_kb(kb_id, query=query, config_path=config_path)
+
+
+def _trim_leann_build_jobs(max_jobs=50):
+    """Cap the number of terminal LEANN build jobs kept in memory."""
+    with _LEANN_BUILD_LOCK:
+        terminal = [
+            (bid, job)
+            for bid, job in _LEANN_BUILD_JOBS.items()
+            if job.get("status") in ("done", "failed")
+        ]
+        if len(terminal) <= max_jobs:
+            return
+        terminal_sorted = sorted(terminal, key=lambda x: x[1].get("created_at", 0))
+        for bid, _ in terminal_sorted[: len(terminal) - max_jobs]:
+            _LEANN_BUILD_JOBS.pop(bid, None)
+
+
+def _run_leann_build_async(build_id, cmd, env, log_path, timeout=120):
+    def _build():
+        try:
+            with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+                f.write("[%s] START %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(cmd)))
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=f,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        env=env,
+                        creationflags=_NO_WINDOW_FLAGS,
+                    )
+                except Exception as e:
+                    err = "failed to start leann build: %s" % e
+                    f.write("[%s] ERROR %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), err))
+                    with _LEANN_BUILD_LOCK:
+                        _LEANN_BUILD_JOBS.setdefault(build_id, {}).update(
+                            {"log_path": log_path, "status": "failed", "error": err}
+                        )
+                    _trim_leann_build_jobs()
+                    return
+                with _LEANN_BUILD_LOCK:
+                    _LEANN_BUILD_JOBS.setdefault(build_id, {}).update(
+                        {"proc": proc, "log_path": log_path, "status": "running"}
+                    )
+                try:
+                    rc = proc.wait(timeout=float(timeout))
+                    status = "done" if rc == 0 else "failed"
+                    err = "" if rc == 0 else "leann build exited with code %s" % rc
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                    rc = -1
+                    status = "failed"
+                    err = "leann build timed out after %ss" % timeout
+                with _LEANN_BUILD_LOCK:
+                    job = _LEANN_BUILD_JOBS.setdefault(build_id, {})
+                    job.update({"status": status, "returncode": rc, "error": err, "log_path": log_path})
+                    job.pop("proc", None)
+                _trim_leann_build_jobs()
+                f.write("[%s] END rc=%s status=%s%s\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    rc,
+                    status,
+                    (" error=%s" % err) if err else "",
+                ))
+        except Exception as e:
+            # Last-resort catch for unexpected worker errors
+            try:
+                with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+                    f.write("[%s] WORKER ERROR %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
+            except Exception:
+                pass
+            with _LEANN_BUILD_LOCK:
+                _LEANN_BUILD_JOBS.setdefault(build_id, {}).update(
+                    {"log_path": log_path, "status": "failed", "error": str(e)}
+                )
+            _trim_leann_build_jobs()
+    t = threading.Thread(target=_build, daemon=True)
+    t.start()
+
+
+def build_leann_kb(kb_id, docs=None, force=False, config_path=CONFIG_PATH):
+    """Start an asynchronous LEANN build for the configured index.
+
+    Returns a dict with build_id, log_path, index_name, status='started'.
+    The build runs in a background thread and writes stdout/stderr to log_path.
+    """
+    cfg = load_config(config_path)
+    spec = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
+    if not spec:
+        raise ValueError("knowledge base not found: %s" % kb_id)
+    if str(spec.get("type") or "").lower() != "leann":
+        raise ValueError("knowledge base is not leann type: %s" % kb_id)
+    index_name = str(spec.get("index_name") or "").strip()
+    if not index_name:
+        raise ValueError("LEANN 知识库缺少 index_name")
+    exe = _leann_exe(spec)
+    env = _leann_env(cfg=cfg, config_path=config_path)
+    doc_paths = list(docs) if docs else ["."]
+    if not doc_paths:
+        doc_paths = ["."]
+    cmd = [exe, "build", index_name, "--docs"] + doc_paths
+    if force:
+        cmd.append("--force")
+    timeout = float((cfg.get("reply_engine") or {}).get("leann", {}).get("timeout", 120))
+    log_dir = Path(config_path).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    build_id = "leann_build_%s_%s" % (kb_id, uuid.uuid4().hex[:12])
+    log_path = log_dir / ("%s.log" % build_id)
+    log_path_str = str(log_path)
+    with _LEANN_BUILD_LOCK:
+        _LEANN_BUILD_JOBS[build_id] = {
+            "log_path": log_path_str,
+            "status": "started",
+            "created_at": time.time(),
+        }
+    _run_leann_build_async(build_id, cmd, env, log_path_str, timeout=timeout)
+    return {
+        "build_id": build_id,
+        "log_path": log_path_str,
+        "index_name": index_name,
+        "status": "started",
+    }
+
+
+def get_leann_build_status(build_id):
+    with _LEANN_BUILD_LOCK:
+        job = _LEANN_BUILD_JOBS.get(build_id)
+    if not job:
+        return {"build_id": build_id, "status": "unknown"}
+    return {
+        "build_id": build_id,
+        "status": job.get("status", "unknown"),
+        "returncode": job.get("returncode"),
+        "log_path": job.get("log_path"),
+        "error": job.get("error", ""),
+    }
 
 
 def _convert_file_to_markdown(path):

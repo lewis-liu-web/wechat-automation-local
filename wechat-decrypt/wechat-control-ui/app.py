@@ -30,6 +30,8 @@ from api import (  # noqa: E402
     agent_pool_status,
     async_loop_status,
     agent_worker_status,
+    build_leann_kb,
+    leann_build_status,
     agent_provider_health,
     get_agent_job,
     diagnose_kb,
@@ -950,6 +952,15 @@ def _page_knowledge():
 
     st.divider()
     st.subheader("新增 LEANN 索引")
+    leann_create_msg_key = "leann_create_msg"
+    if leann_create_msg_key in st.session_state:
+        for msg in st.session_state.pop(leann_create_msg_key):
+            if msg.get("type") == "success":
+                st.success(msg["text"])
+            elif msg.get("type") == "info":
+                st.info(msg["text"])
+            elif msg.get("type") == "warning":
+                st.warning(msg["text"])
     lc1, lc2, lc3, lc4 = st.columns([2, 2, 2, 1])
     with lc1:
         leann_new_id = st.text_input("别名", placeholder="例如：work_kb", key="kb_leann_new_id")
@@ -959,6 +970,7 @@ def _page_knowledge():
         leann_index_name = st.text_input("LEANN 索引名", placeholder="例如：work_kb", key="kb_leann_index_name")
     with lc4:
         st.write("")
+        leann_build_now = st.checkbox("创建后立即后台构建索引", value=False, key="kb_leann_build_now")
         if st.button("创建", use_container_width=True, key="kb_create_leann"):
             if not leann_new_id.strip() or not leann_index_name.strip():
                 st.warning("别名和索引名不能为空")
@@ -971,8 +983,15 @@ def _page_knowledge():
                         "description": leann_new_desc.strip(),
                         "replace": False,
                     }, base_url=base)
+                    messages = [{"type": "success", "text": "已创建 LEANN 索引绑定"}]
+                    if leann_build_now:
+                        try:
+                            build_result = build_leann_kb(leann_new_id.strip(), force=True, base_url=base)
+                            messages.append({"type": "info", "text": "已启动后台构建：%s" % build_result.get("build_id")})
+                        except ControlAPIError as e:
+                            messages.append({"type": "warning", "text": "索引绑定已创建，但后台构建启动失败：%s" % (e,)})
+                    st.session_state[leann_create_msg_key] = messages
                     _clear_data_cache()
-                    st.success("已创建 LEANN 索引绑定")
                     st.rerun()
                 except ControlAPIError as e:
                     st.error("创建失败：%s" % (e,))
@@ -1167,6 +1186,46 @@ def _page_knowledge():
                     st.caption("外部ID：%s" % kb.get("knowledge_base_id"))
                 if kb.get("index_name"):
                     st.caption("LEANN 索引名：%s" % kb.get("index_name"))
+                if kb_type == "leann":
+                    build_state_key = "leann_build_state_%s" % kb_id
+                    build_col1, build_col2 = st.columns([1, 2])
+                    with build_col1:
+                        if st.button("🔄 重建索引", key="leann_rebuild_%s" % kb_id, use_container_width=True):
+                            try:
+                                result = build_leann_kb(kb_id, force=True, base_url=base)
+                                st.session_state[build_state_key] = result
+                                st.success("已启动后台构建：%s" % result.get("build_id"))
+                            except ControlAPIError as e:
+                                st.error("启动失败：%s" % (e,))
+                    with build_col2:
+                        current = st.session_state.get(build_state_key)
+                        if current:
+                            try:
+                                status_info = leann_build_status(kb_id, current.get("build_id"), base_url=base)
+                            except ControlAPIError as e:
+                                st.error("读取构建状态失败：%s" % e)
+                                status_info = {}
+                            status = status_info.get("status", "unknown")
+                            error = status_info.get("error") or ""
+                            if status == "done":
+                                st.success("构建完成")
+                            elif status == "failed":
+                                extra = ""
+                                if error:
+                                    extra += "：%s" % error
+                                rc = status_info.get("returncode")
+                                if rc is not None:
+                                    extra += "（返回码 %s）" % rc
+                                st.error("构建失败%s" % extra)
+                            elif status == "running":
+                                st.info("构建中…")
+                            elif status == "started":
+                                st.info("已启动")
+                            else:
+                                st.caption("状态：%s" % status)
+                            log_path = status_info.get("log_path")
+                            if log_path:
+                                st.caption("日志：%s" % log_path)
             with cols[1]:
                 # 未注册（wiki 扫描得到）的 KB：禁用启用/停用/删除，仅允许打开与查询
                 mutation_disabled = not managed

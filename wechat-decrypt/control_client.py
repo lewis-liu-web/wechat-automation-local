@@ -195,6 +195,22 @@ def replace_target_kbs(key: str, knowledge_bases: List[str],
                     base_url=base_url, body={"knowledge_bases": knowledge_bases})
 
 
+def build_leann_kb(kb_id: str, docs: Optional[List[str]] = None, force: bool = False,
+                   base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """Start an asynchronous LEANN build for a knowledge base."""
+    body: Dict[str, Any] = {"force": force}
+    if docs:
+        body["docs"] = list(docs)
+    return _request("POST", "/kbs/%s/leann/build" % urllib.parse.quote(kb_id, safe=""),
+                    base_url=base_url, body=body, timeout=10)
+
+
+def leann_build_status(kb_id: str, build_id: str, base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """Query the status of an asynchronous LEANN build."""
+    return _request("GET", "/kbs/%s/leann/build/status" % urllib.parse.quote(kb_id, safe=""),
+                    base_url=base_url, params={"build_id": build_id}, timeout=10)
+
+
 def get_triggers(key: str, base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     res = _request("GET", "/targets/%s/triggers" % urllib.parse.quote(key, safe=""),
                    base_url=base_url)
@@ -494,6 +510,8 @@ __all__ = [
     "open_kb_obsidian",
     "diagnose_kb",
     "import_kb",
+    "build_leann_kb",
+    "leann_build_status",
     "replace_target_kbs",
     "set_target_field",
     "set_target_mode",

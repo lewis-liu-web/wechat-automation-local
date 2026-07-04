@@ -4,8 +4,10 @@
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -598,6 +600,209 @@ class TestBindWikiAutoRegister(unittest.TestCase):
         spec = cfg["knowledge_bases"]["scene.workdocs"]
         self.assertEqual(spec.get("path"), "scenes/workdocs")
         self.assertEqual(spec.get("type"), "local")
+
+
+class TestLeannEnv(unittest.TestCase):
+    def test_leann_env_uses_configured_cache_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {"reply_engine": {"leann": {"cache_dir": tmp}}}
+            env = reg._leann_env(cfg)
+            self.assertEqual(env["HF_HOME"], os.path.join(tmp, "huggingface"))
+            self.assertEqual(env["SENTENCE_TRANSFORMERS_HOME"], os.path.join(tmp, "sentence_transformers"))
+            self.assertEqual(env["HF_ENDPOINT"], "https://hf-mirror.com")
+
+    def test_leann_env_defaults_to_d_drive(self):
+        env = reg._leann_env({})
+        self.assertIn("D:", env["HF_HOME"].upper())
+        self.assertIn(r"cache\leann\huggingface", env["HF_HOME"])
+        self.assertEqual(env["HF_ENDPOINT"], "https://hf-mirror.com")
+
+
+class TestMigrateLeannCache(unittest.TestCase):
+    def test_migrate_copies_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            dst = Path(tmp) / "dst"
+            (src / "hub" / "models--x").mkdir(parents=True)
+            (src / "hub" / "models--x" / "file.txt").write_text("model")
+            result = reg.migrate_leann_cache(str(src), str(dst))
+            self.assertTrue(result["copied"])
+            self.assertEqual(result["files"], 1)
+            self.assertTrue((dst / "hub" / "models--x" / "file.txt").exists())
+            self.assertEqual((dst / "hub" / "models--x" / "file.txt").read_text(), "model")
+
+    def test_migrate_skips_nonexistent_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = reg.migrate_leann_cache(str(Path(tmp) / "missing"), str(Path(tmp) / "dst"))
+            self.assertFalse(result["copied"])
+            self.assertEqual(result["reason"], "source does not exist")
+
+    def test_migrate_skips_nonempty_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            dst = Path(tmp) / "dst"
+            src.mkdir()
+            dst.mkdir()
+            (src / "a.txt").write_text("a")
+            (dst / "b.txt").write_text("b")
+            result = reg.migrate_leann_cache(str(src), str(dst))
+            self.assertFalse(result["copied"])
+            self.assertEqual(result["reason"], "destination not empty")
+
+
+class TestLeannBuild(unittest.TestCase):
+    def setUp(self):
+        reg._LEANN_BUILD_JOBS.clear()
+
+    @mock.patch("target_registry._run_leann_build_async")
+    def test_build_leann_kb_starts_job(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            result = reg.build_leann_kb("wk", config_path=str(cfg_path))
+            self.assertEqual(result["status"], "started")
+            self.assertEqual(result["index_name"], "work")
+            self.assertTrue(result["build_id"].startswith("leann_build_wk_"))
+            self.assertGreater(len(result["build_id"]), len("leann_build_wk_"))
+            mock_run.assert_called_once()
+
+    @mock.patch("target_registry._run_leann_build_async")
+    def test_build_leann_kb_passes_docs_and_force(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            reg.build_leann_kb("wk", docs=["docs/a", "docs/b"], force=True, config_path=str(cfg_path))
+            call_args = mock_run.call_args
+            self.assertIn("build", call_args.args[1])
+            self.assertIn("--force", call_args.args[1])
+
+    def test_build_leann_kb_rejects_non_leann(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"local": {"type": "local", "path": tmp, "enabled": True}}}))
+            with self.assertRaises(ValueError) as ctx:
+                reg.build_leann_kb("local", config_path=str(cfg_path))
+            self.assertIn("not leann", str(ctx.exception).lower())
+
+    def test_build_leann_kb_rejects_missing_kb(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {}}))
+            with self.assertRaises(ValueError) as ctx:
+                reg.build_leann_kb("missing", config_path=str(cfg_path))
+            self.assertIn("not found", str(ctx.exception).lower())
+
+    def test_get_leann_build_status_unknown(self):
+        result = reg.get_leann_build_status("nonexistent")
+        self.assertEqual(result["status"], "unknown")
+
+    @mock.patch("target_registry.subprocess.Popen")
+    def test_run_leann_build_async_logs_and_updates_status(self, mock_popen):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "build.log"
+            dummy_proc = mock.Mock()
+            dummy_proc.returncode = 0
+            dummy_proc.wait.return_value = 0
+            mock_popen.return_value = dummy_proc
+            reg._run_leann_build_async("bid_123", ["leann", "build", "idx"], {"X": "1"}, str(log_path))
+            # wait briefly for daemon thread to finish
+            import time as _time
+            for _ in range(50):
+                if reg.get_leann_build_status("bid_123").get("status") in ("done", "failed"):
+                    break
+                _time.sleep(0.01)
+            status = reg.get_leann_build_status("bid_123")
+            self.assertEqual(status["status"], "done")
+            self.assertEqual(status["returncode"], 0)
+            self.assertEqual(status["log_path"], str(log_path))
+            self.assertIn("START", log_path.read_text(encoding="utf-8"))
+            self.assertIn("END rc=0", log_path.read_text(encoding="utf-8"))
+
+    @mock.patch("target_registry.subprocess.Popen")
+    def test_run_leann_build_async_records_popen_failure(self, mock_popen):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "build.log"
+            mock_popen.side_effect = FileNotFoundError("leann not found")
+            reg._run_leann_build_async("bid_fail", ["leann", "build", "idx"], {"X": "1"}, str(log_path))
+            import time as _time
+            for _ in range(50):
+                if reg.get_leann_build_status("bid_fail").get("status") == "failed":
+                    break
+                _time.sleep(0.01)
+            status = reg.get_leann_build_status("bid_fail")
+            self.assertEqual(status["status"], "failed")
+            self.assertIn("leann not found", status.get("error", ""))
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("START", log_text)
+            self.assertIn("ERROR", log_text)
+            self.assertIn("leann not found", log_text)
+
+    @mock.patch("target_registry.subprocess.Popen")
+    def test_run_leann_build_async_handles_timeout(self, mock_popen):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "build.log"
+            dummy_proc = mock.Mock()
+            # First wait() raises timeout; the reaper then calls wait(timeout=5).
+            dummy_proc.wait.side_effect = [
+                subprocess.TimeoutExpired(cmd=["leann"], timeout=0.1),
+                -1,
+            ]
+            mock_popen.return_value = dummy_proc
+            reg._run_leann_build_async("bid_timeout", ["leann", "build", "idx"], {"X": "1"}, str(log_path), timeout=0.1)
+            import time as _time
+            for _ in range(50):
+                if reg.get_leann_build_status("bid_timeout").get("status") == "failed":
+                    break
+                _time.sleep(0.01)
+            status = reg.get_leann_build_status("bid_timeout")
+            self.assertEqual(status["status"], "failed")
+            self.assertEqual(status["returncode"], -1)
+            self.assertIn("timed out", status.get("error", "").lower())
+            dummy_proc.kill.assert_called_once()
+            self.assertGreaterEqual(dummy_proc.wait.call_count, 2)
+            self.assertNotIn("proc", reg._LEANN_BUILD_JOBS.get("bid_timeout", {}))
+
+    @mock.patch("target_registry._run_leann_build_async")
+    def test_build_leann_kb_empty_docs_fallback(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            reg.build_leann_kb("wk", docs=[], config_path=str(cfg_path))
+            call_args = mock_run.call_args
+            cmd = call_args.args[1]
+            self.assertIn("--docs", cmd)
+            self.assertIn(".", cmd)
+
+    @mock.patch("target_registry._run_leann_build_async")
+    def test_build_leann_kb_preregisters_started_status(self, mock_run):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            result = reg.build_leann_kb("wk", config_path=str(cfg_path))
+            build_id = result["build_id"]
+            status = reg.get_leann_build_status(build_id)
+            self.assertEqual(status["status"], "started")
+            self.assertEqual(status["log_path"], result["log_path"])
+            self.assertIn(build_id, reg._LEANN_BUILD_JOBS)
+
+    def test_trim_leann_build_jobs_caps_terminal_jobs(self):
+        reg._LEANN_BUILD_JOBS.clear()
+        for i in range(55):
+            bid = "bid_%03d" % i
+            reg._LEANN_BUILD_JOBS[bid] = {
+                "status": "done" if i % 2 == 0 else "failed",
+                "created_at": time.time() + i,
+                "log_path": "/tmp/%s.log" % bid,
+            }
+        reg._LEANN_BUILD_JOBS["running"] = {
+            "status": "running",
+            "created_at": 0,
+            "log_path": "/tmp/running.log",
+        }
+        reg._trim_leann_build_jobs(max_jobs=50)
+        self.assertLessEqual(len(reg._LEANN_BUILD_JOBS), 51)
+        self.assertIn("running", reg._LEANN_BUILD_JOBS)
+        self.assertNotIn("bid_000", reg._LEANN_BUILD_JOBS)
 
 
 if __name__ == "__main__":
