@@ -123,12 +123,22 @@ class TestLeannKb(unittest.TestCase):
         self.assertEqual(row["index_name"], "idx_x")
 
     def test_search_kb_dispatches_to_leann_search(self):
-        _, cfg_path, _ = self._tmp_config()
+        td, cfg_path, _ = self._tmp_config()
         cfg = reg.load_config(cfg_path)
         cfg["knowledge_bases"] = {"leann.x": {"type": "leann", "index_name": "idx_x", "enabled": True}}
         reg.save_json_atomic(cfg_path, cfg)
+        # The direct-search path needs the LEANN metadata file to exist.
+        index_dir = Path(td.name) / ".leann" / "indexes" / "idx_x"
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / "documents.leann.meta.json").write_text(
+            json.dumps({"embedding_model": "facebook/contriever", "backend_name": "hnsw"}), encoding="utf-8"
+        )
         with mock.patch("target_registry.subprocess.run") as mock_run:
-            mock_run.return_value = mock.Mock(returncode=0, stdout='{"results": [{"title": "T", "content": "C"}]}', stderr="")
+            mock_run.return_value = mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"ok": True, "hits": [{"id": "1", "score": 0.5, "text": "C", "metadata": {"file_name": "T"}}]}),
+                stderr="",
+            )
             res = reg.search_kb("leann.x", "query", limit=3, config_path=cfg_path)
         self.assertEqual(res.get("matched_files"), 1)
         self.assertEqual(res["hits"][0]["rel_path"], "T")

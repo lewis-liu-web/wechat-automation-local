@@ -1502,6 +1502,10 @@ def _leann_env(cfg=None, config_path=CONFIG_PATH):
 
     Defaults embedding model caches to D:\\cache\\leann and sets the HF mirror
     endpoint so model downloads work reliably on Chinese networks.
+
+    ``HF_HUB_OFFLINE=1`` is set because the runtime network path to
+    huggingface.co is unreliable and the required models are expected to be
+    cached locally after the first build.
     """
     if cfg is None:
         cfg = load_config(config_path)
@@ -1509,8 +1513,35 @@ def _leann_env(cfg=None, config_path=CONFIG_PATH):
     env = dict(os.environ)
     env["HF_HOME"] = str(cache_root / "huggingface")
     env["SENTENCE_TRANSFORMERS_HOME"] = str(cache_root / "sentence_transformers")
+    env["HF_HUB_OFFLINE"] = "1"
     env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     return env
+
+
+def _leann_python_path(spec, cfg=None, config_path=CONFIG_PATH):
+    """Return the Python interpreter that ships with leann-core.
+
+    The official ``leann`` CLI is a shim that invokes this interpreter.  We
+    need it because only the leann-core venv has sentence_transformers and
+    the custom faiss build required by the LEANN index files.
+    """
+    explicit = str(spec.get("python") or spec.get("python_path") or "").strip()
+    if explicit:
+        return explicit
+    if cfg is None:
+        cfg = load_config(config_path)
+    explicit_cfg = str((cfg.get("reply_engine") or {}).get("leann", {}).get("python_path", "")).strip()
+    if explicit_cfg:
+        return explicit_cfg
+    # Derive from the leann executable location: <...>/Scripts/leann.exe -> <...>/Scripts/python.exe
+    exe = Path(_leann_exe(spec))
+    if exe.name.lower().endswith(".exe") and exe.parent.name.lower() == "scripts":
+        derived = exe.parent / "python.exe"
+        if derived.exists():
+            return str(derived)
+    # Final fallback to the standard uv tool path.
+    fallback = Path.home() / "AppData" / "Roaming" / "uv" / "tools" / "leann-core" / "Scripts" / "python.exe"
+    return str(fallback)
 
 
 def migrate_leann_cache(src_dir, dst_dir):
@@ -1588,24 +1619,43 @@ def get_leann_index_info(index_name, config_path=CONFIG_PATH):
     return out
 
 
+def _leann_index_dir(index_name: str, config_path=CONFIG_PATH):
+    """Return the on-disk directory for a LEANN index name."""
+    base = Path(config_path).resolve().parent
+    return base / ".leann" / "indexes" / index_name
+
+
 def search_leann_kb(spec, query, limit=5, config_path=CONFIG_PATH, cfg=None):
-    """Run leann search against the configured LEANN index."""
+    """Search a LEANN index using a direct FAISS path.
+
+    The official ``leann search`` CLI is bypassed because it currently crashes
+    on Windows in --json mode (ctypes CDLL(None) flush) and in recompute mode
+    (ZMQ/faiss abort).  Instead we run ``leann_search_direct.py`` with the
+    leann-core Python interpreter, which builds a plain FAISS HNSW index from
+    the LEANN passages file and searches it directly.
+    """
     if cfg is None:
         cfg = load_config(config_path)
     index_name = str(spec.get("index_name") or "").strip()
     if not index_name:
         raise ValueError("LEANN 知识库缺少 index_name")
-    exe = _leann_exe(spec)
-    env = _leann_env(cfg=cfg)
+
+    index_dir = _leann_index_dir(index_name, config_path=config_path)
+    meta_path = index_dir / "documents.leann.meta.json"
+    if not meta_path.exists():
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query,
+                "error": "LEANN index metadata not found: %s" % meta_path}
+
+    python_path = _leann_python_path(spec, cfg=cfg, config_path=config_path)
+    script_path = Path(config_path).resolve().parent / "leann_search_direct.py"
+    env = _leann_env(cfg=cfg, config_path=config_path)
     cmd = [
-        exe,
-        "search",
-        index_name,
+        python_path,
+        str(script_path),
+        str(index_dir),
         str(query or ""),
         "--top-k",
         str(int(limit or 5)),
-        "--json",
-        "--non-interactive",
     ]
     try:
         proc = subprocess.run(
@@ -1620,34 +1670,40 @@ def search_leann_kb(spec, query, limit=5, config_path=CONFIG_PATH, cfg=None):
         )
     except Exception as e:
         return {"hits": [], "matched_files": 0, "total_files": 0, "query": query, "error": str(e)}
-    if proc.returncode != 0 or not (proc.stdout or "").strip():
+    if proc.returncode != 0:
         return {"hits": [], "matched_files": 0, "total_files": 0, "query": query,
-                "error": "leann search failed rc=%s stderr=%s" % (proc.returncode, (proc.stderr or "")[:200])}
+                "error": "leann direct search failed rc=%s stderr=%s" % (proc.returncode, (proc.stderr or "")[:400])}
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query,
+                "error": "leann direct search returned empty stdout"}
     try:
-        payload = json.loads(proc.stdout)
+        payload = json.loads(stdout)
     except Exception as e:
-        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query, "error": str(e)}
-    if isinstance(payload, dict):
-        results = payload.get("results") or payload.get("data") or payload.get("hits") or []
-    elif isinstance(payload, list):
-        results = payload
-    else:
-        results = []
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query,
+                "error": "invalid JSON from leann direct search: %s stdout=%s" % (e, stdout[:400])}
+    if not payload.get("ok"):
+        return {"hits": [], "matched_files": 0, "total_files": 0, "query": query,
+                "error": payload.get("error") or "leann direct search failed"}
+
+    results = payload.get("hits", [])
     hits = []
     for idx, item in enumerate(results[:max(1, int(limit or 5))], start=1):
-        if isinstance(item, dict):
-            title = str(item.get("title") or item.get("id") or "").strip()
-            content = str(item.get("content") or item.get("text") or item.get("summary") or "").strip()
-            rel = title or str(idx)
-        else:
-            rel = str(idx)
-            content = str(item)
+        item_id = str(item.get("id") or "").strip()
+        title = str(item.get("metadata", {}).get("file_name") or "").strip()
+        content = str(item.get("text") or "").strip()
         hits.append({
-            "rel_path": rel,
-            "score": None,
+            "id": item_id or str(idx),
+            "rel_path": title or str(idx),
+            "score": item.get("score"),
             "snippet": content[:320],
         })
-    return {"hits": hits, "matched_files": len(hits), "total_files": len(results), "query": query}
+    return {
+        "hits": hits,
+        "matched_files": len(hits),
+        "total_files": len(results),
+        "query": query,
+    }
 
 
 def search_kb(kb_id, query, limit=5, config_path=CONFIG_PATH):

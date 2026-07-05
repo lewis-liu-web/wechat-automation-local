@@ -1274,7 +1274,12 @@ def _retrieve_leann_kb(query: str, spec: Dict[str, Any], per_limit: int, config:
     for idx, item in enumerate(hits, start=1):
         if not isinstance(item, dict):
             continue
-        rel = str(item.get("rel_path") or item.get("title") or item.get("id") or f"hit_{idx}").strip()
+        item_id = str(item.get("id") or "").strip()
+        rel = str(item.get("rel_path") or item.get("title") or "").strip() or f"hit_{idx}"
+        # LEANN returns multiple passages from the same source file; include the
+        # passage id in rel_path so cross-provider dedup keeps distinct chunks.
+        if item_id:
+            rel = "%s#%s" % (rel, item_id)
         content = str(item.get("snippet") or item.get("content") or item.get("text") or "").strip()
         if not content:
             continue
