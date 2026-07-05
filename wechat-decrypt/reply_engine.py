@@ -1269,6 +1269,23 @@ def _retrieve_leann_kb(query: str, spec: Dict[str, Any], per_limit: int, config:
     hits = result.get("hits") if isinstance(result, dict) else []
     if not hits:
         return []
+    # Normalize faiss distances within this result set to a 1-10 integer scale
+    # so semantic hits compete fairly with token-count scores from other KBs.
+    # Lower distance = better, so the closest hit becomes 10 and the farthest 1.
+    distances: List[float] = []
+    for item in hits:
+        if not isinstance(item, dict):
+            continue
+        try:
+            distances.append(float(item.get("score")))
+        except Exception:
+            pass
+    if distances:
+        dmin, dmax = min(distances), max(distances)
+        span = (dmax - dmin) if dmax > dmin else 1.0
+        dist_score = {d: max(1, int(((dmax - d) / span) * 9) + 1) for d in distances}
+    else:
+        dist_score = {}
     out: List[KnowledgeHit] = []
     max_chars = int(spec.get("hit_max_chars") or _DEFAULT_HIT_MAX_CHARS)
     for idx, item in enumerate(hits, start=1):
@@ -1283,10 +1300,13 @@ def _retrieve_leann_kb(query: str, spec: Dict[str, Any], per_limit: int, config:
         content = str(item.get("snippet") or item.get("content") or item.get("text") or "").strip()
         if not content:
             continue
-        score = item.get("score")
         try:
-            score_int = int(float(score)) if score is not None else max(1, per_limit - len(out))
+            dist = float(item.get("score")) if item.get("score") is not None else None
         except Exception:
+            dist = None
+        if dist is not None:
+            score_int = dist_score.get(dist, 5)
+        else:
             score_int = max(1, per_limit - len(out))
         out.append(KnowledgeHit("leann", kb_id, str(spec.get("scope") or "scene"), rel, content[:max_chars], score_int))
         if len(out) >= per_limit:
@@ -1339,6 +1359,10 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
                 core_hits.append(h)
             else:
                 scene_hits.append(h)
+
+    # Rank scene hits across providers by score so a strong semantic match from
+    # LEANN is not crowded out just because it was fetched after getnote/ima.
+    scene_hits.sort(key=lambda h: h.score, reverse=True)
 
     # Cross-provider dedup: the same note/document may surface from getnote + ima.
     seen: set = set()
