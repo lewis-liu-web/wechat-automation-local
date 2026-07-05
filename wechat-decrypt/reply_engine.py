@@ -1256,6 +1256,39 @@ def _retrieve_hook_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Know
             break
     return out
 
+
+def _retrieve_leann_kb(query: str, spec: Dict[str, Any], per_limit: int, config: Dict[str, Any]) -> List[KnowledgeHit]:
+    """Retrieve hits from a LEANN semantic index via target_registry."""
+    if not _target_registry:
+        return []
+    kb_id = str(spec.get("id") or spec.get("knowledge_base_id") or "leann")
+    try:
+        result = _target_registry.search_leann_kb(spec, query, limit=per_limit, cfg=config)
+    except Exception:
+        return []
+    hits = result.get("hits") if isinstance(result, dict) else []
+    if not hits:
+        return []
+    out: List[KnowledgeHit] = []
+    max_chars = int(spec.get("hit_max_chars") or _DEFAULT_HIT_MAX_CHARS)
+    for idx, item in enumerate(hits, start=1):
+        if not isinstance(item, dict):
+            continue
+        rel = str(item.get("rel_path") or item.get("title") or item.get("id") or f"hit_{idx}").strip()
+        content = str(item.get("snippet") or item.get("content") or item.get("text") or "").strip()
+        if not content:
+            continue
+        score = item.get("score")
+        try:
+            score_int = int(float(score)) if score is not None else max(1, per_limit - len(out))
+        except Exception:
+            score_int = max(1, per_limit - len(out))
+        out.append(KnowledgeHit("leann", kb_id, str(spec.get("scope") or "scene"), rel, content[:max_chars], score_int))
+        if len(out) >= per_limit:
+            break
+    return out
+
+
 def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any],
                                limit: int = 6, core_limit: int | None = None,
                                scene_limit: int | None = None) -> Dict[str, List[KnowledgeHit]]:
@@ -1294,6 +1327,8 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
             batch = _retrieve_getnote_kb(query, spec, per_limit)
         elif typ == "hook":
             batch = _retrieve_hook_kb(query, spec, per_limit)
+        elif typ == "leann":
+            batch = _retrieve_leann_kb(query, spec, per_limit, config)
         for h in batch:
             if h.scope == "core" or str(h.rel_path).startswith("core/"):
                 core_hits.append(h)

@@ -109,6 +109,36 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
 
+    def test_leann_kb_retrieved_as_scene_hits(self):
+        """Regression: type=leann knowledge bases must be searched and returned
+        as scene hits so raw_agent prompt includes them.
+        """
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {
+                'bus_index': {'type': 'leann', 'index_name': 'work_kb_bus'},
+            },
+        }
+
+        def fake_search(spec, query, limit=5, config_path=None, cfg=None):
+            return {
+                "hits": [
+                    {"rel_path": "公交卡充值.md", "score": 0.9, "snippet": "请检查 NFC 是否开启。"},
+                    {"rel_path": "刷卡失败.md", "score": 0.8, "snippet": "确认超级 SIM 卡已启用。"},
+                ],
+                "matched_files": 2,
+                "total_files": 2,
+                "query": query,
+            }
+
+        with mock.patch('reply_engine._target_registry.search_leann_kb', fake_search):
+            layers = retrieve_knowledge_layers('公交卡充值失败', cfg, {'knowledge_bases': ['bus_index']})
+        contents = '\n'.join(h.content for h in layers['scene'])
+        self.assertIn('NFC', contents)
+        self.assertIn('超级 SIM', contents)
+
     def test_local_kb_fts_matches_body_content_with_punctuation(self):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
