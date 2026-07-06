@@ -763,6 +763,42 @@ def _page_targets():
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
+                    with st.expander("薄化模式 / Agent 工具模式", expanded=False):
+                        st.caption("薄化模式：monitor 只负责监听和发送，知识库检索、视觉、会话管理都交给 agent 侧。需在 Hermes 配置中注册 wechat_auto skill 与 wechat/leann MCP server。")
+                        thin_monitor = st.toggle(
+                            "启用薄化模式",
+                            value=bool(t.get("thin_monitor")),
+                            key="thin_monitor_%s" % widget_key,
+                        )
+                        if st.button("保存薄化模式", key="save_thin_monitor_%s" % widget_key, use_container_width=False):
+                            try:
+                                set_target_field(action_key, "thin_monitor", thin_monitor, base_url=base)
+                                st.success("已%s薄化模式" % ("启用" if thin_monitor else "关闭"))
+                                _clear_data_cache()
+                                st.rerun()
+                            except ControlAPIError as e:
+                                st.error("保存失败：%s" % (e,))
+                        st.divider()
+                        agent_mode_options = [("标准（Python 侧预检索）", "standard"), ("工具 Agent（Hermes MCP 工具循环）", "tool_agent")]
+                        valid_agent_modes = {v for _, v in agent_mode_options}
+                        current_agent_mode = t.get("agent_mode") or "standard"
+                        if current_agent_mode not in valid_agent_modes:
+                            current_agent_mode = "standard"
+                        selected_agent_label = st.selectbox(
+                            "Agent 工具模式",
+                            options=[label for label, _ in agent_mode_options],
+                            index=[v for _, v in agent_mode_options].index(current_agent_mode),
+                            key="agent_mode_%s" % widget_key,
+                        )
+                        selected_agent_mode = dict(agent_mode_options)[selected_agent_label]
+                        if st.button("保存 Agent 模式", key="save_agent_mode_%s" % widget_key, use_container_width=False):
+                            try:
+                                set_target_field(action_key, "agent_mode", selected_agent_mode, base_url=base)
+                                st.success("已切换 Agent 模式为：%s" % selected_agent_label)
+                                _clear_data_cache()
+                                st.rerun()
+                            except ControlAPIError as e:
+                                st.error("保存失败：%s" % (e,))
             with main_cols[1]:
                 if not t.get("enabled") and t.get("is_candidate"):
                     # Pre-pick category at enable time so the user can mark an
@@ -1257,7 +1293,41 @@ def _page_knowledge():
                     if docs_dir:
                         st.caption("来源目录：%s%s" % (docs_dir, " → %s" % docs_dir_resolved if docs_dir_resolved and docs_dir_resolved != docs_dir else ""))
                     else:
-                        st.warning("未配置来源目录（docs_dir），无法构建索引。请编辑知识库补充。")
+                        st.warning("未配置来源目录（docs_dir），无法构建索引。请在这里补充来源目录。")
+                    with st.expander("编辑 LEANN 来源目录", expanded=not bool(docs_dir)):
+                        new_docs_dir = st.text_input(
+                            "来源目录（要索引的文件夹）",
+                            value=docs_dir,
+                            placeholder="例如 wiki/workdocs 或 C:\\docs\\work",
+                            key="leann_docs_dir_edit_%s" % kb_id,
+                            help="相对路径会基于 wiki_dir 解析，绝对路径按原样使用。",
+                        )
+                        if st.button("保存来源目录", key="leann_docs_dir_save_%s" % kb_id, use_container_width=True):
+                            if not new_docs_dir.strip():
+                                st.warning("来源目录不能为空")
+                            else:
+                                try:
+                                    payload = {
+                                        "id": kb_id,
+                                        "type": "leann",
+                                        "knowledge_base_id": idx,
+                                        "description": kb.get("description") or "",
+                                        "enabled": enabled,
+                                        "replace": True,
+                                        "docs_dir": new_docs_dir.strip(),
+                                    }
+                                    if kb.get("executable"):
+                                        payload["executable"] = kb.get("executable")
+                                    if kb.get("limit") is not None:
+                                        payload["limit"] = kb.get("limit")
+                                    if kb.get("timeout") is not None:
+                                        payload["timeout"] = kb.get("timeout")
+                                    save_kb(payload, base_url=base)
+                                    _clear_data_cache()
+                                    st.success("已保存来源目录")
+                                    st.rerun()
+                                except ControlAPIError as e:
+                                    st.error("保存失败：%s" % (e,))
                     if kb.get("index_path"):
                         st.caption("物理位置：%s" % kb.get("index_path"))
                     build_state_key = "leann_build_state_%s" % kb_id
