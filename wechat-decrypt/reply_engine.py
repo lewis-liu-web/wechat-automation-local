@@ -1774,6 +1774,64 @@ def _enable_wechat_mcp_tool(config: Dict[str, Any]) -> bool:
     return bool(_reply_engine_config(config).get("enable_wechat_mcp_tool", False))
 
 
+def _thin_monitor_enabled(config: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    """Return whether this target should run in thin-monitor mode.
+
+    In thin mode the monitor delegates knowledge retrieval, vision, session
+    management, and reply generation to the agent side.  The monitor only keeps
+    listen/send/ack responsibilities.
+    """
+    if target.get("thin_monitor") is not None:
+        return bool(target.get("thin_monitor"))
+    return bool(_reply_engine_config(config).get("thin_monitor", False))
+
+
+def _resolve_skill_name(
+    config: Dict[str, Any],
+    target: Dict[str, Any],
+    *,
+    is_tool_agent: bool = False,
+    thin_monitor: bool = False,
+) -> str:
+    """Return the skill name to use for this reply.
+
+    Priority: target.skill_name > global thin skill (when thin/tool_agent) >
+    global default skill.
+    """
+    target_skill = str(target.get("skill_name") or "").strip()
+    if target_skill:
+        return target_skill
+    re_cfg = _reply_engine_config(config)
+    if thin_monitor or is_tool_agent:
+        return str(re_cfg.get("wechat_auto_skill") or "wechat_auto").strip() or "wechat_auto"
+    return str(re_cfg.get("skill_name") or "wechat_task").strip() or "wechat_task"
+
+
+def _wechat_side_payload(thin_monitor: bool) -> Dict[str, Any]:
+    """Return the wechat_side responsibility split for the agent payload.
+
+    In thin-monitor mode the project side only listens and sends; everything
+    else is delegated to the agent.  In the legacy path the monitor still owns
+    trigger/session/image_extract before handing content generation to the agent.
+    """
+    if thin_monitor:
+        return {
+            "responsibilities": ["listen", "send"],
+            "delegated_to_agent": [
+                "content_understanding",
+                "vision",
+                "wiki_match",
+                "rag",
+                "session_management",
+                "reply_generation",
+            ],
+        }
+    return {
+        "responsibilities": ["listen", "trigger", "session", "image_extract", "send"],
+        "delegated_to_agent": ["content_understanding", "vision", "wiki_match", "rag", "reply_generation"],
+    }
+
+
 def _tool_agent_allowed_leann_indexes(config: Dict[str, Any], target: Dict[str, Any] | None = None) -> List[str]:
     """Return the LEANN index names this target is allowed to search.
 
@@ -1921,17 +1979,20 @@ def _run_tool_agent_sync(
     leann_cfg = _leann_config(config)
     selected_kbs = resolve_target_kb_ids(config, target) or []
     response_mode = _normalize_response_mode(target.get("mode") or "group_assistant")
+    thin_monitor = _thin_monitor_enabled(config, target)
+    skill_name = _resolve_skill_name(config, target, is_tool_agent=True, thin_monitor=thin_monitor)
     payload: Dict[str, Any] = {
         "clean_text": clean or raw_text,
         "raw_text": raw_text,
         "agent_mode": "tool_agent",
+        "skill_name": skill_name,
         "available_tools": _tool_agent_available_tools(config, target),
         "enable_wechat_mcp_tool": _enable_wechat_mcp_tool(config),
         "leann": leann_cfg,
         "knowledge_hits": [],
         "knowledge_bases": selected_kbs,
         "image_paths": image_paths,
-        "context_messages": context_messages or [],
+        "context_messages": [] if thin_monitor else (context_messages or []),
         "mention_name": mention_name,
         "mode_instruction": _mode_instruction(response_mode),
         "target": {
@@ -2145,16 +2206,30 @@ def generate_reply(message: Dict[str, Any] | str,
         selected_kbs = resolve_target_kb_ids(config, target)
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
         response_mode = _normalize_response_mode((target_policy or {}).get("mode") or target.get("mode") or "group_assistant")
-        # The async deep-agent path does not implement the tool loop yet, so
-        # tool_agent config is forced back to standard mode for queued jobs.
-        # Synchronous _run_tool_agent_sync still handles tool_agent directly.
-        effective_agent_mode = "standard" if is_tool_agent else agent_mode
+        # The async deep-agent path previously forced tool_agent back to standard
+        # because the Python-level tool loop lived in HermesProvider.run.  With
+        # Hermes configured to use the WeChat/LEANN MCP servers, the async path can
+        # now keep tool_agent mode and delegate tool execution to Hermes's native
+        # MCP layer.  Synchronous _run_tool_agent_sync still handles tool_agent
+        # directly when not queued.
+        effective_agent_mode = agent_mode
         async_is_tool_agent = effective_agent_mode == "tool_agent"
+        thin_monitor = _thin_monitor_enabled(config, target)
+        delegate_to_agent = async_is_tool_agent or thin_monitor
+        effective_skill_name = _resolve_skill_name(
+            config, target, is_tool_agent=async_is_tool_agent, thin_monitor=thin_monitor
+        )
         # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
         # ---- Pre-compute image descriptions and inject into KB query ----
         # FTS query must see image content, otherwise image messages always miss the scene KB.
-        vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text, target=target, config=config)
-        if async_is_tool_agent:
+        # In thin-monitor / tool_agent mode the agent handles vision and KB retrieval
+        # itself, so skip expensive local image recognition and pre-retrieval.
+        if delegate_to_agent:
+            vision_query_text = ""
+            vision_image_descriptions = []
+        else:
+            vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text, target=target, config=config)
+        if delegate_to_agent:
             # thin-monitor mode: agent retrieves knowledge on demand via tools.
             kb_layers = {"core": [], "scene": []}
             payload_knowledge_hits = []
@@ -2199,7 +2274,11 @@ def generate_reply(message: Dict[str, Any] | str,
         # here based on KB hit status.
         llm_config = dict(config.get("reply_engine", config) or {})
         image_descriptions: List[Dict[str, str]] = []
-        if image_paths and not vision_image_descriptions:
+        if delegate_to_agent:
+            # Agent side handles vision directly; do not duplicate local image
+            # descriptions in the payload.
+            image_descriptions = []
+        elif image_paths and not vision_image_descriptions:
             # Always attempt local recognition; the fallback chain degrades through
             # mmx → hooks → ocr → metadata, so the agent always gets something useful.
             image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text, target=target, config=config)
@@ -2275,26 +2354,27 @@ def generate_reply(message: Dict[str, Any] | str,
                             "prompt": prompt,
                             "clean_text": clean,
                             "raw_text": raw_text,
-                            "skill_name": "wechat_task",
+                            "skill_name": effective_skill_name,
                             "knowledge_hits": payload_knowledge_hits,
                             "knowledge_bases": selected_kbs,
                             "reply_mode": "raw_agent",
                             "agent_mode": effective_agent_mode,
-                            "available_tools": _tool_agent_available_tools(config, target) if async_is_tool_agent else [],
-                            "leann": leann_cfg if async_is_tool_agent else {},
+                            "available_tools": _tool_agent_available_tools(config, target) if delegate_to_agent else [],
+                            "leann": leann_cfg if delegate_to_agent else {},
                             "response_mode": response_mode,
                             "target_policy": target_policy or {},
                             "mode_instruction": _mode_instruction(response_mode),
                             "retrieval_debug": {**retrieval_debug, "route": route_decision.route, "route_reason": route_decision.reason},
                             "image_paths": image_paths,
                             "image_descriptions": image_descriptions,
-                            "context_messages": payload_context_messages,
+                            "context_messages": [] if thin_monitor else payload_context_messages,
                             "mention_name": mention_name,
                             "target": {
                                 "name": target.get("name"),
                                 "username": target.get("username"),
                                 "table": target.get("table"),
                             },
+                            "wechat_side": _wechat_side_payload(thin_monitor),
                         }),
                     )
                     ack_text, ack_now = _agent_ack(response_mode)
@@ -2356,20 +2436,20 @@ def generate_reply(message: Dict[str, Any] | str,
                         "clean_text": clean,
                         "raw_text": raw_text,
                         "message_type": "image" if local_type == 3 else ("voice" if local_type == 34 else ("file" if local_type == 49 else "text")),
-                        "skill_name": "wechat_task",
+                        "skill_name": effective_skill_name,
                         "knowledge_hits": payload_knowledge_hits,
                         "knowledge_bases": selected_kbs,
                         "reply_mode": "raw_agent",
                         "agent_mode": effective_agent_mode,
-                        "available_tools": _tool_agent_available_tools(config, target) if async_is_tool_agent else [],
-                        "leann": leann_cfg if async_is_tool_agent else {},
+                        "available_tools": _tool_agent_available_tools(config, target) if delegate_to_agent else [],
+                        "leann": leann_cfg if delegate_to_agent else {},
                         "response_mode": response_mode,
                         "target_policy": target_policy or {},
                         "mode_instruction": _mode_instruction(response_mode),
                         "retrieval_debug": {**retrieval_debug, "route": str(route_name or "agent_provider"), "route_reason": str(route_reason or "agent_provider")},
                         "image_paths": image_paths,
                         "image_descriptions": image_descriptions,
-                        "context_messages": payload_context_messages,
+                        "context_messages": [] if thin_monitor else payload_context_messages,
                         "mention_name": mention_name,
                         "route": str(route_name or "agent_provider"),
                         "route_reason": str(route_reason or "agent_provider"),
@@ -2381,10 +2461,7 @@ def generate_reply(message: Dict[str, Any] | str,
                             "username": target.get("username"),
                             "table": target.get("table"),
                         },
-                        "wechat_side": {
-                            "responsibilities": ["listen", "trigger", "session", "image_extract", "send"],
-                            "delegated_to_agent": ["content_understanding", "vision", "wiki_match", "rag", "reply_generation"],
-                        },
+                        "wechat_side": _wechat_side_payload(thin_monitor),
                     }),
                 )
                 ack_text, ack_now = _agent_ack(response_mode)

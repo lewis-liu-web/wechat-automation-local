@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools, _tool_agent_allowed_leann_indexes
+from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools, _tool_agent_allowed_leann_indexes, _resolve_skill_name, _wechat_side_payload, _thin_monitor_enabled
 import agent_provider as ap
 
 class KnowledgeArchitectureTests(unittest.TestCase):
@@ -412,14 +412,14 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.assertEqual(tool_names, ['leann_search'])
         self.assertTrue(payload.get('enable_wechat_mcp_tool'))
 
-    def test_async_raw_agent_forces_standard_mode_when_config_is_tool_agent(self):
-        """Queued deep-agent jobs must not claim tool_agent; async path has no tool loop."""
+    def test_async_raw_agent_propagates_tool_agent_when_delegate_to_agent(self):
+        """Queued deep-agent jobs must keep tool_agent mode; Hermes MCP handles tool loop."""
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         cfg = {
             'wiki_dir': str(root),
             'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
-            'reply_engine': {'mode': 'raw_agent', 'agent_mode': 'tool_agent'},
+            'reply_engine': {'mode': 'raw_agent', 'agent_mode': 'tool_agent', 'wechat_auto_skill': 'wechat_auto'},
         }
         message = {
             'content': '小助手 分析一下苹果',
@@ -433,10 +433,16 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.assertIn('处理', d.reply_text)
         mock_enqueue.assert_called_once()
         payload = mock_enqueue.call_args.kwargs['payload']
-        self.assertEqual(payload['agent_mode'], 'standard')
-        self.assertEqual(payload['available_tools'], [])
-        self.assertEqual(payload['leann'], {})
-        self.assertTrue(len(payload.get('knowledge_hits', [])) > 0)
+        self.assertEqual(payload['agent_mode'], 'tool_agent')
+        self.assertEqual(payload['skill_name'], 'wechat_auto')
+        self.assertTrue(len(payload.get('available_tools', [])) > 0)
+        self.assertEqual(payload['available_tools'][0].get('name'), 'leann_search')
+        self.assertIn('cli_path', payload.get('leann', {}))
+        self.assertEqual(payload.get('knowledge_hits', []), [])
+        self.assertEqual(payload.get('image_descriptions', []), [])
+        self.assertIn('wechat_side', payload)
+        self.assertEqual(payload['wechat_side'].get('responsibilities'), ['listen', 'trigger', 'session', 'image_extract', 'send'])
+        self.assertIn('reply_generation', payload['wechat_side'].get('delegated_to_agent', []))
         self.assertIn('scene.a', payload['retrieval_debug']['selected_kbs'])
 
     def test_tool_agent_allowed_leann_indexes_from_bound_kbs(self):

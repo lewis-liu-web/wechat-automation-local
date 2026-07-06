@@ -5,9 +5,12 @@
     "wechat_process": "Weixin.exe",
     "reply_engine": {
         "_comment": "agent_mode: 'standard' (default) or 'tool_agent' (opt-in experimental deep-agent tool loop)",
+        "thin_monitor": false,
+        "wechat_auto_skill": "wechat_auto",
+        "skill_name": "wechat_task",
         "agent_mode": "standard",
         "enable_wechat_mcp_tool": false,
-        "_comment_wechat_mcp": "enable_wechat_mcp_tool only adds a prompt hint. Actual execution of WeChat message/contact query tools is handled by Hermes's native MCP layer and requires registering the WeChat MCP server in Hermes config.yaml (do NOT modify the user's actual Hermes config; this is documentation only):\n\nmcp_servers:\n  wechat:\n    command: python\n    args: [\"mcp_server.py\"]\n    cwd: \"E:/projects/GA-projects/CD-only/wechat-decrypt\"",
+        "_comment_wechat_mcp": "enable_wechat_mcp_tool only adds a prompt hint. Actual execution of WeChat message/contact query tools is handled by Hermes's native MCP layer and requires registering the WeChat MCP server in Hermes config.yaml (do NOT modify the user's actual Hermes config; this is documentation only):\n\nmcp_servers:\n  wechat:\n    command: python\n    args: [\"mcp_server.py\"]\n    cwd: \"E:/projects/GA-projects/CD-only/wechat-decrypt\"\n  leann:\n    command: python\n    args: [\"mcp_leann.py\"]\n    cwd: \"E:/projects/GA-projects/CD-only/wechat-decrypt\"\n\nprofiles:\n  wechat_auto:\n    skill: wechat_auto\n    toolsets: [\"wechat\", \"leann\"]",
         "leann": {
             "cli_path": "leann",
             "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",

@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
     _zstd = None
     _ZSTD_DCTX = None
 
-from reply_engine import DEFAULT_TRIGGERS, generate_reply, precheck, postcheck
+from reply_engine import DEFAULT_TRIGGERS, generate_reply, precheck, postcheck, _thin_monitor_enabled
 from reply_decision import decide as reply_decision_decide
 from wechat_sender import send_reply_detailed
 from message_aggregator import (
@@ -53,6 +53,158 @@ def _record_event(kind, target=None, sender=None, payload=None):
     except Exception:
         # never let telemetry break the monitor loop
         pass
+
+
+def _decrypt_image_for_message(m, t, cfg):
+    """Decrypt an image message and attach its local path.
+
+    Thin-monitor targets still need the local image file path so the agent
+    can read it (either through a multimodal provider or the decode_image MCP
+    tool).  They do not keep pending image state for fallback triggers.
+    """
+    lid = int(m.get('local_id') or 0)
+    if int(m.get('local_type') or 0) != 3:
+        return None
+    # Reuse an already-decrypted path from the main loop image block.
+    existing = m.get('image_path')
+    if existing:
+        return str(existing)
+    try:
+        from image_handler import process_image_message
+        img_path = process_image_message(
+            m, t, cfg,
+            packed_info_data_bytes=m.get('packed_info_data'),
+        )
+        if img_path:
+            m['image_path'] = img_path
+            log('image decrypted target=%s local_id=%s path=%s' % (t.get('name'), lid, img_path))
+            return img_path
+        else:
+            log('image decrypt failed target=%s local_id=%s' % (t.get('name'), lid))
+    except Exception as e:
+        log('image decrypt exception target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
+    return None
+
+
+def _build_thin_monitor_aggregated_message(t, m, cfg):
+    """Build an aggregated message + event_context for the thin-monitor path."""
+    event = event_from_monitor_message(m, t)
+    policy = resolve_target_policy(cfg, t)
+    ctx_policy = policy.get('context_policy') or {}
+    context_limit = int(ctx_policy.get('max_messages') or cfg.get('context_limit') or 30)
+    ctx, event_context = build_event_context(t, m, cfg, limit=context_limit)
+    event_context['target_policy'] = policy
+    event_context['trigger_matched'] = False
+    event_context['in_session'] = False
+    event_context['sender'] = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
+    event_context['sender_username'] = m.get('sender_username') or ''
+    event_context['sender_display_name'] = m.get('sender_display_name') or ''
+    event_context['mention_name'] = m.get('mention_name') or m.get('sender_display_name') or ''
+    # Thin-monitor does not manage sessions, but reading the entry keeps the
+    # event_context schema compatible with downstream consumers.
+    sess_entry = _active_sessions.get(_session_key(t, m)) or {}
+    event_context['session_active'] = bool(sess_entry)
+    event_context['session_state'] = 'active' if sess_entry else 'idle'
+    event_context['session_turns'] = int(sess_entry.get('turns') or 0)
+
+    turn = ingest_event(
+        event,
+        trigger_matched=False,
+        in_session=False,
+        event_context=event_context,
+        target=t,
+        config=cfg,
+    )
+    if turn is None:
+        return None, event_context, None
+
+    agg_msg = turn.to_generate_reply_message()
+    agg_msg['target_policy'] = policy
+    agg_msg['event_context'] = event_context
+    return agg_msg, event_context, turn
+
+
+def _handle_thin_monitor_target(t, m, cfg, *, config_path, args, contact_names, lid):
+    """Thin-monitor target: decrypt image, aggregate, enqueue to agent, send ack.
+
+    The monitor does not run trigger matching, session management, or the local
+    reply decision layer.  Everything except listen/send is delegated to the
+    agent side.
+    """
+    _decrypt_image_for_message(m, t, cfg)
+    log('new msg thin target=%s local_id=%s content=%r image=%s' % (
+        t.get('name'), lid, m.get('message_content'), m.get('image_path', '')))
+
+    agg_msg, event_context, turn = _build_thin_monitor_aggregated_message(t, m, cfg)
+    if turn is None:
+        _record_event(
+            'thin_monitor_buffered',
+            target=t.get('name'),
+            sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+            payload={'local_id': lid},
+        )
+        return lid
+
+    # High-risk requests still get an immediate safety boundary reply locally.
+    boundary = precheck(str(m.get('message_content') or ''))
+    if boundary and boundary.risk_level == 'high':
+        text = _ensure_sender_mention(postcheck(boundary.reply_text), m, contact_names)
+        if text and not args.dry_run:
+            ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
+            log('thin_pre_boundary_immediate target=%s local_id=%s ok=%s reason=%s' % (
+                t.get('name'), lid, ok, boundary.reason))
+            _record_event(
+                'send_ok' if ok else 'send_failed',
+                target=t.get('name'),
+                sender=event_context.get('sender'),
+                payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True, 'thin_monitor': True},
+            )
+        return turn.end_local_id
+
+    gen_t0 = time.time()
+    try:
+        decision = generate_reply(agg_msg, t, cfg)
+    except Exception as exc:
+        log('thin_generate_reply_error target=%s local_id=%s error=%r' % (t.get('name'), turn.end_local_id, exc))
+        _record_event(
+            'thin_monitor_generate_error',
+            target=t.get('name'),
+            sender=event_context.get('sender'),
+            payload={'local_id': turn.end_local_id, 'error': repr(exc)},
+        )
+        return turn.end_local_id
+
+    gen_dt = time.time() - gen_t0
+    text = decision.reply_text
+    ctx_len = len(agg_msg.get('context_messages') or [])
+    log('thin_monitor_enqueued target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
+        t.get('name'), turn.end_local_id, ctx_len, gen_dt, decision.intent, decision.risk_level,
+        decision.need_human, decision.reason, text))
+    _record_event(
+        'thin_monitor_enqueued',
+        target=t.get('name'),
+        sender=event_context.get('sender'),
+        payload={
+            'local_id': turn.end_local_id,
+            'intent': decision.intent,
+            'risk_level': decision.risk_level,
+            'reason': decision.reason,
+            'has_reply_text': bool(text),
+        },
+    )
+    if decision.should_reply and text and not args.dry_run:
+        # For thin-monitor the agent_worker sends the final reply.  The monitor
+        # only sends an immediate ack if one was generated (e.g., customer_service mode).
+        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=turn.end_local_id, cfg=cfg,
+                        config_path=config_path, mention_name=event_context.get('mention_name') or event_context.get('sender_display_name') or event_context.get('sender'))
+        log('thin_monitor_ack_sent target=%s local_id=%s ok=%s' % (t.get('name'), turn.end_local_id, ok))
+        _record_event(
+            'send_ok' if ok else 'send_failed',
+            target=t.get('name'),
+            sender=event_context.get('sender'),
+            payload={'local_id': turn.end_local_id, 'thin_monitor': True, 'ack': True},
+        )
+    return turn.end_local_id
 
 
 def _ensure_sender_mention(text, msg, contact_names=None):
@@ -1094,8 +1246,10 @@ def main():
                 new_count += 1
                 lid = int(m.get('local_id') or 0)
                 advance_state = True
-                # Image message: decrypt and attach image_path for vision processing in reply_engine
-                if int(m.get('local_type') or 0) == 3:
+                # Image message: decrypt and attach image_path for vision processing in reply_engine.
+                # Thin-monitor targets do not run local vision/pending-image logic; the agent
+                # handles images via its own multimodal provider or the decode_image MCP tool.
+                if not _thin_monitor_enabled(cfg, t) and int(m.get('local_type') or 0) == 3:
                     try:
                         from image_handler import process_image_message
                         img_path = process_image_message(
@@ -1129,6 +1283,18 @@ def main():
                     log('target_muted target=%s local_id=%s' % (t.get('name'), lid))
                     _record_event('target_muted_skip', target=t.get('name'), sender=sender, payload={'local_id': lid})
                     t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                    continue
+                # Thin-monitor path: delegate trigger/session/decision/reply to the agent.
+                if _thin_monitor_enabled(cfg, t):
+                    new_lid = _handle_thin_monitor_target(
+                        t, m, cfg,
+                        config_path=config_path,
+                        args=args,
+                        contact_names=contact_names,
+                        lid=lid,
+                    )
+                    if advance_state:
+                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), new_lid)
                     continue
                 # --- session-based trigger handling ---
                 _clear_expired_sessions(cfg)
