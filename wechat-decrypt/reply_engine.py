@@ -1754,8 +1754,11 @@ def _reply_engine_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def _agent_mode(config: Dict[str, Any]) -> str:
-    """Return reply_engine.agent_mode, defaulting to 'standard'."""
+def _agent_mode(config: Dict[str, Any], target: Dict[str, Any] | None = None) -> str:
+    """Return reply_engine.agent_mode, with optional target-level override."""
+    target_mode = str((target or {}).get("agent_mode") or "").strip().lower()
+    if target_mode:
+        return target_mode
     return str(_reply_engine_config(config).get("agent_mode") or "standard").lower()
 
 
@@ -2132,7 +2135,7 @@ def generate_reply(message: Dict[str, Any] | str,
                    config: Dict[str, Any] | None = None) -> ReplyDecision:
     config = config or {}
     target = target or {}
-    agent_mode = _agent_mode(config)
+    agent_mode = _agent_mode(config, target)
     leann_cfg = _leann_config(config)
     is_tool_agent = agent_mode == "tool_agent"
     raw_text = message if isinstance(message, str) else (message.get("content") or message.get("str_content") or message.get("message") or message.get("message_content") or "")

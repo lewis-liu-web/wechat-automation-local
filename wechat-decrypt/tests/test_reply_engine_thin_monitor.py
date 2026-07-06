@@ -10,6 +10,7 @@ from reply_engine import (
     _resolve_skill_name,
     _wechat_side_payload,
     _thin_monitor_enabled,
+    _agent_mode,
     generate_reply,
 )
 
@@ -39,6 +40,19 @@ class ThinMonitorHelperTests(unittest.TestCase):
         cfg = {"reply_engine": {"skill_name": "my_default"}}
         target = {}
         self.assertEqual(_resolve_skill_name(cfg, target), "my_default")
+
+    def test_agent_mode_target_overrides_global(self):
+        cfg = {"reply_engine": {"agent_mode": "standard"}}
+        target = {"agent_mode": "tool_agent"}
+        self.assertEqual(_agent_mode(cfg, target), "tool_agent")
+
+    def test_agent_mode_default(self):
+        cfg = {}
+        self.assertEqual(_agent_mode(cfg), "standard")
+
+    def test_agent_mode_global(self):
+        cfg = {"reply_engine": {"agent_mode": "tool_agent"}}
+        self.assertEqual(_agent_mode(cfg), "tool_agent")
 
     def test_thin_monitor_enabled_target_overrides(self):
         cfg = {"reply_engine": {"thin_monitor": True}}
