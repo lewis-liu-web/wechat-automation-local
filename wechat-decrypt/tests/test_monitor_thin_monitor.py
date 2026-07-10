@@ -27,6 +27,30 @@ class ThinMonitorHelperTests(unittest.TestCase):
         self.assertFalse(mon._thin_monitor_enabled(cfg, target))
 
 
+class StartupCursorTests(unittest.TestCase):
+    def test_advance_cursor_on_start_defaults_to_db_max(self):
+        target = {"name": "g", "db": "message_0.db", "table": "Msg_g", "username": "wxid_g", "last_local_id": 10}
+        with mock.patch.object(mon, "fetch_latest_for_target", return_value={"local_id": 20}):
+            runtime_min = mon._advance_startup_cursors([target], {})
+        self.assertEqual(target["last_local_id"], 20)
+        self.assertEqual(runtime_min, {"message_0.db|Msg_g|wxid_g": 20})
+
+    def test_advance_cursor_disabled_keeps_existing_cursor(self):
+        target = {"name": "g", "db": "message_0.db", "table": "Msg_g", "username": "wxid_g", "last_local_id": 10}
+        cfg = {"monitor": {"advance_cursor_on_start": False}}
+        with mock.patch.object(mon, "fetch_latest_for_target", return_value={"local_id": 20}):
+            runtime_min = mon._advance_startup_cursors([target], cfg)
+        self.assertEqual(target["last_local_id"], 10)
+        self.assertEqual(runtime_min, {"message_0.db|Msg_g|wxid_g": 10})
+
+    def test_advance_cursor_never_moves_backward(self):
+        target = {"name": "g", "db": "message_0.db", "table": "Msg_g", "username": "wxid_g", "last_local_id": 30}
+        with mock.patch.object(mon, "fetch_latest_for_target", return_value={"local_id": 20}):
+            runtime_min = mon._advance_startup_cursors([target], {})
+        self.assertEqual(target["last_local_id"], 30)
+        self.assertEqual(runtime_min, {"message_0.db|Msg_g|wxid_g": 30})
+
+
 class ThinMonitorHandleTests(unittest.TestCase):
     def _make_cfg(self, thin_monitor=True):
         return {

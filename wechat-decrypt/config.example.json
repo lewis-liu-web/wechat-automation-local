@@ -3,6 +3,9 @@
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
     "wechat_process": "Weixin.exe",
+    "monitor": {
+        "advance_cursor_on_start": true
+    },
     "reply_engine": {
         "_comment": "agent_mode: 'standard' (default) or 'tool_agent' (opt-in experimental deep-agent tool loop)",
         "thin_monitor": false,
