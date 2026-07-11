@@ -37,6 +37,7 @@ try:
 except Exception:
     _HAS_SENDER = False
 
+from reply_engine import sanitize_reply_text  # noqa: E402
 
 DEFAULT_CONFIG_PATH = ROOT / "wechat_bot_targets.json"
 DEFAULT_STOP_FILE = ROOT / "agent_worker.stop"
@@ -186,11 +187,13 @@ def process_once(*,
     if bridge_patch:
         jobs.merge_payload(int(job["id"]), bridge_patch, db_path=db_path)
     if result.ok and result.reply_text:
-        completed = jobs.complete_job(int(job["id"]), result.reply_text, db_path=db_path)
+        cfg = _load_config(config_path or DEFAULT_CONFIG_PATH) or {}
+        sanitized_text = sanitize_reply_text(result.reply_text, job.get("payload"), cfg)
+        completed = jobs.complete_job(int(job["id"]), sanitized_text, db_path=db_path)
         # M3: Send result back to WeChat if enabled
         send_status = {"sent": False, "reason": "send_disabled"}
         if send_enabled and _HAS_SENDER:
-            send_status = _send_result_back(job, result.reply_text, config_path or DEFAULT_CONFIG_PATH)
+            send_status = _send_result_back(job, sanitized_text, config_path or DEFAULT_CONFIG_PATH)
             if send_status.get("sent"):
                 jobs.mark_sent(int(job["id"]), db_path=db_path)
             else:
@@ -203,7 +206,7 @@ def process_once(*,
             "provider": result.provider,
             "worker_id": result.worker_id or worker_id,
             "latency": round(result.latency, 3),
-            "reply_preview": result.reply_text[:120],
+            "reply_preview": sanitized_text[:120],
             "send_status": send_status,
             "timed_out": timed_out,
         }

@@ -100,12 +100,11 @@ def _build_thin_monitor_aggregated_message(t, m, cfg):
     event_context['sender_username'] = m.get('sender_username') or ''
     event_context['sender_display_name'] = m.get('sender_display_name') or ''
     event_context['mention_name'] = m.get('mention_name') or m.get('sender_display_name') or ''
-    # Thin-monitor does not manage sessions, but reading the entry keeps the
-    # event_context schema compatible with downstream consumers.
-    sess_entry = _active_sessions.get(_session_key(t, m)) or {}
-    event_context['session_active'] = bool(sess_entry)
-    event_context['session_state'] = 'active' if sess_entry else 'idle'
-    event_context['session_turns'] = int(sess_entry.get('turns') or 0)
+    # Thin-monitor does not manage sessions; keep the event_context schema
+    # compatible with downstream consumers while reporting a fixed idle state.
+    event_context['session_active'] = False
+    event_context['session_state'] = 'idle'
+    event_context['session_turns'] = 0
 
     turn = ingest_event(
         event,

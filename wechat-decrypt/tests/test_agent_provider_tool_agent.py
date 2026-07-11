@@ -381,6 +381,110 @@ def test_hermes_provider_uses_default_index_name_when_omitted():
     mock_leann.assert_called_once_with("leann", "allowed", "q", 3, 120)
 
 
+def test_hermes_args_include_skill_and_toolsets_in_order():
+    """CLI args must include -s/--skill before -t/--toolsets when configured."""
+    provider = ap.HermesProvider(
+        cli_path="hermes",
+        profile="p1",
+        model="m1",
+        skill="wechat_auto",
+        toolsets="wechat,leann",
+    )
+    args = provider._args("/tmp/prompt.txt")
+    # Expected order: cli, --profile, chat, -q @file, -Q, --source, --accept-hooks, -m, -s, -t
+    assert args[0] == "hermes"
+    assert ["--profile", "p1"] == args[1:3]
+    assert args[3] == "chat"
+    profile_idx = args.index("--profile")
+    chat_idx = args.index("chat")
+    model_idx = args.index("-m")
+    skill_idx = args.index("-s")
+    toolsets_idx = args.index("-t")
+    assert profile_idx < chat_idx < model_idx < skill_idx < toolsets_idx
+    assert args[skill_idx + 1] == "wechat_auto"
+    assert args[toolsets_idx + 1] == "wechat,leann"
+
+
+def test_hermes_args_omit_skill_when_not_configured():
+    """No -s should appear when skill is absent, preserving legacy command lines."""
+    provider = ap.HermesProvider(cli_path="hermes", toolsets="wechat")
+    args = provider._args()
+    assert "-s" not in args
+    assert "-t" in args
+
+
+def test_provider_from_config_passes_skill_and_toolsets():
+    """Instance config skill/toolsets must reach HermesProvider."""
+    config = {
+        "agent_provider": {
+            "instances": [
+                {
+                    "id": "hermes-1",
+                    "provider": "hermes",
+                    "skill": "wechat_auto",
+                    "toolsets": "wechat,leann",
+                }
+            ]
+        }
+    }
+    provider = ap.provider_from_config(config, instance_id="hermes-1")
+    assert isinstance(provider, ap.HermesProvider)
+    assert provider.skill == "wechat_auto"
+    assert provider.toolsets == "wechat,leann"
+    args = provider._args()
+    assert "-s" in args
+    assert "wechat_auto" in args
+    assert "wechat,leann" in args
+
+
+def test_provider_from_config_legacy_providers_passes_skill_and_toolsets():
+    """Legacy providers.hermes path must also read skill/toolsets."""
+    config = {
+        "agent_provider": {
+            "default": "hermes",
+            "providers": {
+                "hermes": {
+                    "cli_path": "hermes",
+                    "skill": "wechat_auto",
+                    "toolsets": "wechat,leann",
+                }
+            },
+        }
+    }
+    provider = ap.provider_from_config(config)
+    assert isinstance(provider, ap.HermesProvider)
+    assert provider.skill == "wechat_auto"
+    assert provider.toolsets == "wechat,leann"
+    args = provider._args()
+    assert "-s" in args
+    assert "wechat_auto" in args
+    assert "wechat,leann" in args
+
+
+def test_build_prompt_path_hint_mentions_multimodal_and_decode_image_limits():
+    """When image_paths exist without descriptions, the prompt must guide the agent."""
+    job = {
+        "payload": {
+            "prompt": "看看这张图",
+            "clean_text": "看看这张图",
+            "agent_mode": "tool_agent",
+            "image_paths": ["/tmp/img.jpg"],
+            "image_descriptions": [],
+            "available_tools": [{"name": "leann_search", "description": "本地 LEANN 语义搜索工具"}],
+            "knowledge_hits": [],
+        },
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "本地解密路径如下" in prompt
+    assert "/tmp/img.jpg" in prompt
+    assert "多模态 provider" in prompt
+    assert "decode_image" in prompt
+    assert "decode_image(chat_name, local_id)" in prompt
+    assert "decode_image(image_path)" not in prompt
+    assert "不能替代视觉理解" in prompt
+    assert "不要编造图片内容" in prompt
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])

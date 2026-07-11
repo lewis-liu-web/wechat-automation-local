@@ -247,3 +247,52 @@ def test_reconciler_merges_raw_on_successful_completion(monkeypatch):
     merge_payload.assert_any_call(9, {"agent_raw_output": raw_output})
     update_poll_state.assert_called_once_with(9, next_poll_at=pytest.approx(time.time() + 60.0, abs=2.0),
                                               external_status="done")
+
+
+def test_reconciler_truncates_reply_to_payload_max_reply_chars(monkeypatch):
+    """Reconciler must apply payload max_reply_chars to polled replies."""
+    raw_output = {"assistant": {"content": "a" * 100}}
+
+    fake_provider = MagicMock()
+    fake_provider.name = "fake"
+    fake_provider.poll.return_value = AgentResult(
+        True,
+        "done",
+        reply_text="a" * 100,
+        raw=raw_output,
+    )
+    monkeypatch.setattr(control_api, "_build_agent_provider", lambda *a, **k: fake_provider)
+
+    job = {
+        "id": 10,
+        "status": agent_jobs.STATUS_AGENT_RUNNING,
+        "external_provider": "fake",
+        "external_session_id": "sess-10",
+        "external_user_msg_id": 1,
+        "agent_deadline_at": time.time() + 9999,
+        "next_poll_at": 0,
+        "reconcile_attempts": 0,
+        "payload": {"max_reply_chars": 15},
+    }
+    monkeypatch.setattr(agent_jobs, "list_pollable", lambda **k: [job])
+
+    complete_job = MagicMock(return_value=True)
+    fail_job = MagicMock(return_value=True)
+    merge_payload = MagicMock(return_value=True)
+    update_poll_state = MagicMock(return_value=True)
+
+    monkeypatch.setattr(agent_jobs, "complete_job", complete_job)
+    monkeypatch.setattr(agent_jobs, "fail_job", fail_job)
+    monkeypatch.setattr(agent_jobs, "merge_payload", merge_payload)
+    monkeypatch.setattr(agent_jobs, "update_poll_state", update_poll_state)
+    # Keep config empty so payload cap is the only source.
+    monkeypatch.setattr(control_api.reg, "load_config", lambda *a, **k: {})
+
+    result = control_api._async_reconciler_run_once({})
+
+    assert result["ok"] is True
+    assert any(r["job_id"] == 10 and r["action"] == "completed" for r in result["results"])
+    complete_job.assert_called_once()
+    saved_text = complete_job.call_args[0][1]
+    assert len(saved_text) == 15
+    fail_job.assert_not_called()

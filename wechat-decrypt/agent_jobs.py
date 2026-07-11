@@ -465,6 +465,29 @@ def recover_job_result(job_id: int, result_text: str, *, db_path: Optional[Path]
         return cur.rowcount == 1
 
 
+def update_result_text(job_id: int, result_text: str, *, db_path: Optional[Path] = None) -> bool:
+    """Update the result_text of a job without touching status/send_status.
+
+    Used by send paths to ensure the persisted text matches the sanitized text
+    actually sent to WeChat. Allowed statuses include terminal and in-flight
+    send states so a retry or async sender can rewrite the result_text in place.
+    """
+    result_text = sanitize_agent_result_text(result_text)
+    with _WRITE_LOCK, _connect(db_path) as con:
+        cur = con.execute(
+            """
+            UPDATE agent_jobs
+            SET result_text=?
+            WHERE id=? AND status IN (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result_text, int(job_id),
+                STATUS_DONE, STATUS_SENDING, STATUS_SENT, STATUS_FAILED, STATUS_TIMEOUT, STATUS_EXPIRED, STATUS_CANCELLED,
+            ),
+        )
+        return cur.rowcount == 1
+
+
 def fail_job(job_id: int, error: str, *, status: str = STATUS_FAILED,
              db_path: Optional[Path] = None) -> bool:
     if status not in {STATUS_FAILED, STATUS_TIMEOUT, STATUS_CANCELLED}:

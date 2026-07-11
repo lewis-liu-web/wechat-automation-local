@@ -204,3 +204,22 @@ def test_build_prompt_total_kb_budget_stops_at_tail():
     prompt = ap._build_wechat_deep_prompt(job)
     assert prompt.count("### 片段") == 3  # 12000 budget fits three 4000-char hits
     assert "### 片段 4" not in prompt
+
+
+def test_wechat_auto_skill_contract():
+    """wechat_auto skill must state that monitor only provides paths and decode_image is not a vision fallback."""
+    text = load_skill("wechat_auto")
+    assert "WeChat 自动化 Agent" in text
+    assert "decode_image" in text
+    assert "decode_image(chat_name, local_id)" in text
+    assert "decode_image(image_path)" not in text
+    assert "不能替代视觉理解" in text
+    assert "不要编造图片内容" in text
+    assert "Monitor 仅提供图片在本地的解密路径" in text
+    assert "最终回复不超过 600 字（含标点），超出会被系统强制截断" in text
+    assert "明确提到" in text
+    assert "不要编造" in text
+    assert "直接询问用户具体品牌/型号" in text
+    assert "如果命中结果里出现了相关品牌" in text
+    assert "decode_image(image_path)" not in text
+    assert "不要编造图片内容" in text

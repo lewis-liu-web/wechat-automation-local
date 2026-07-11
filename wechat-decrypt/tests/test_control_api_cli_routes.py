@@ -177,3 +177,23 @@ class TestLeannRoutes:
         status, resp = _route("POST", "/kbs/wk/leann/build", body={"force": True})
         assert status == 400
         assert "docs_dir" in resp.get("error", "").lower()
+
+    def test_save_leann_kb_can_replace_docs_dir(self, monkeypatch):
+        td, cfg_path, cand_path = _tmp_config()
+        monkeypatch.setattr(control_api.reg, "CONFIG_PATH", str(cfg_path))
+        docs = Path(td.name) / "docs"
+        docs.mkdir()
+        cfg = reg.load_config(str(cfg_path))
+        cfg["knowledge_bases"] = {"wk": {"type": "leann", "index_name": "work", "enabled": True}}
+        reg.save_json_atomic(str(cfg_path), cfg)
+        status, resp = _route("POST", "/kbs", body={
+            "id": "wk",
+            "type": "leann",
+            "knowledge_base_id": "work",
+            "docs_dir": str(docs),
+            "replace": True,
+        })
+        assert status == 200
+        assert resp.get("ok") is True
+        updated = reg.load_config(str(cfg_path))
+        assert updated["knowledge_bases"]["wk"]["docs_dir"] == str(docs)

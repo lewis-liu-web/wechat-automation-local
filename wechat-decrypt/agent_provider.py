@@ -49,6 +49,36 @@ def _normalize_hermes_profile_id(profile: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(profile or "").strip()).strip("-._")
     return "hermes-%s" % (safe or "default")
 
+DEFAULT_MAX_REPLY_CHARS = 600
+
+
+def _resolve_max_reply_chars(payload: Dict[str, Any] | None, config: Dict[str, Any] | None = None) -> int:
+    """Return the configured max reply length, with safe fallback.
+
+    The value is sourced (in priority order) from:
+      1. ``payload['max_reply_chars']`` - the value attached when reply_engine
+         enqueued the job, so the agent prompt and the monitor-side truncation
+         stay in sync.
+      2. ``config['reply_engine']['max_reply_chars']`` - the runtime config
+         loaded by the worker, useful when the payload key is missing.
+      3. :data:`DEFAULT_MAX_REPLY_CHARS` (600) for any missing/invalid value.
+    """
+    candidates: List[Any] = []
+    if isinstance(payload, dict):
+        candidates.append(payload.get("max_reply_chars"))
+    if isinstance(config, dict):
+        cfg_re = config.get("reply_engine")
+        if isinstance(cfg_re, dict):
+            candidates.append(cfg_re.get("max_reply_chars"))
+    for raw in candidates:
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return DEFAULT_MAX_REPLY_CHARS
+
 
 def parse_hermes_profile_list(output: str) -> List[Dict[str, Any]]:
     """Parse `hermes profile list` table output into provider instance dicts."""
@@ -427,6 +457,7 @@ def _sendable_reply_from_assistant(content: str) -> str:
 def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
     raw_payload = job.get("payload")
     payload: Dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+    max_reply_chars = _resolve_max_reply_chars(payload)
     agent_mode = str(payload.get("agent_mode") or "").lower()
     # Prefer clean_text only in tool_agent mode; for raw_agent/standard keep prompt
     # first so aggregator context and monitor-side retrieval are preserved.
@@ -449,11 +480,17 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
                     parts.append(f"- {path}: {desc}" if path else f"- {desc}")
         if parts:
             image_hint = "\n\n微信侧已调用视觉工具识别图片，结果如下：\n" + "\n".join(parts)
-    if image_paths:
+    if image_paths and not image_descriptions:
+        # Only expose raw local paths when no description is available.  In thin
+        # monitor mode the WeChat side does not pre-describe images; the agent is
+        # expected to use its native multimodal provider or the decode_image MCP
+        # tool to understand the picture.
         path_hint = (
-            "\n\n用户随消息发送了图片，本地解码路径如下：\n"
+            "\n\n用户随消息发送了图片，本地解密路径如下：\n"
             + "\n".join(f"- {p}" for p in image_paths)
-            + "\n如果当前 agent 不能直接读取这些图片文件，不要编造图片内容；请说明需要视觉工具读取图片。"
+            + "\n如果当前 agent 配置有多模态 provider，请直接读取上述图片文件理解内容。"
+            "decode_image(chat_name, local_id) 只用于从历史消息重新解密图片，它会返回本地路径而非图片内容，不能替代视觉理解。"
+            "若无多模态能力且路径不可读，不要编造图片内容，请说明无法判断图片。"
         )
         image_hint = f"{image_hint}{path_hint}"
 
@@ -580,7 +617,7 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
         "3. 如果涉及转账、密钥、密码、数据库、内部路径、授权/承诺/决策，回复需要本人确认。\n"
         "4. 不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序。\n"
         "5. 不确定就说不确定，不要编造事实。\n"
-        "6. 最多 600 字。\n"
+        f"6. 最多 {max_reply_chars} 字。超出部分会被系统强制截断。\n"
         f"{tool_output_rule}"
         f"{mention_rule}\n\n"
         f"用户请求：{prompt}"
@@ -649,6 +686,7 @@ class HermesProvider:
                  hermes_home: str | None = None,
                  profile: str | None = None,
                  model: str | None = None,
+                 skill: str | None = None,
                  toolsets: str | None = None,
                  worker_id: str = "hermes-1",
                  extra_args: Optional[List[str]] = None,
@@ -658,6 +696,7 @@ class HermesProvider:
         self.hermes_home = (str(hermes_home) if hermes_home else None) or os.environ.get("HERMES_HOME")
         self.profile = (str(profile) if profile else None) or os.environ.get("HERMES_PROFILE")
         self.model = (str(model) if model else None) or os.environ.get("HERMES_MODEL")
+        self.skill = (str(skill) if skill else None) or os.environ.get("HERMES_SKILL")
         self.toolsets = (str(toolsets) if toolsets else None) or os.environ.get("HERMES_TOOLSETS")
         self.worker_id = worker_id
         self.name = "hermes"
@@ -691,6 +730,8 @@ class HermesProvider:
         args += ["-Q", "--source", "tool", "--accept-hooks"]
         if self.model:
             args += ["-m", self.model]
+        if self.skill:
+            args += ["-s", self.skill]
         if self.toolsets:
             args += ["-t", self.toolsets]
         args += self.extra_args
@@ -1048,6 +1089,7 @@ def provider_from_config(config: Dict[str, Any] | None = None,
                 hermes_home=cfg_h.get("hermes_home"),
                 profile=cfg_h.get("profile"),
                 model=cfg_h.get("model"),
+                skill=cfg_h.get("skill"),
                 toolsets=cfg_h.get("toolsets"),
                 worker_id=worker_id,
                 extra_args=cfg_h.get("extra_args") or [],
@@ -1066,6 +1108,7 @@ def provider_from_config(config: Dict[str, Any] | None = None,
             hermes_home=cfg_h.get("hermes_home"),
             profile=cfg_h.get("profile"),
             model=cfg_h.get("model"),
+            skill=cfg_h.get("skill"),
             toolsets=cfg_h.get("toolsets"),
             worker_id=str(cfg_h.get("worker_id") or "hermes-1"),
             extra_args=cfg_h.get("extra_args") or [],

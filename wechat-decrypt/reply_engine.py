@@ -277,7 +277,10 @@ def _resolve_image_for_message(message: Dict[str, Any], config: Dict[str, Any]) 
 
 
 DEFAULT_TRIGGERS = []
-MAX_REPLY_CHARS = 300
+DEFAULT_MAX_REPLY_CHARS = 600
+MAX_REPLY_CHARS = DEFAULT_MAX_REPLY_CHARS
+
+_SENTENCE_BOUNDARY_CHARS = ("。", "！", "!", "？", "?", "；", ";", "\n")
 
 HIGH_RISK_PATTERNS = [
     "转账", "付款", "打款", "收款码", "银行卡", "验证码", "密码", "密钥", "token", "api key",
@@ -434,16 +437,59 @@ def _describe_images_for_agent(
     target: Dict[str, Any] | None = None,
     config: Dict[str, Any] | None = None,
 ) -> List[Dict[str, str]]:
+    """Return image descriptions enriched with vision source and failure reason.
+
+    Each entry contains:
+      - path: local image file path
+      - description: recognized text or error marker
+      - vision_source: source that produced the description (e.g. mmx, ocr,
+        metadata) or None on total failure
+      - vision_error: short failure reason when description is an error marker
+    """
     descriptions: List[Dict[str, str]] = []
     if not image_paths:
         return descriptions
     user_prompt = prompt or "请简要描述图片内容，并提取对用户请求有用的信息"
+    sources, hooks, fallback_metadata = _resolve_vision_sources(target, config)
     for p in image_paths[:3]:
-        desc = _call_vision_recognizer(p, user_prompt=user_prompt, target=target, config=config)
-        if desc:
-            descriptions.append({"path": p, "description": desc})
-        else:
-            descriptions.append({"path": p, "description": ""})
+        try:
+            from image_handler import recognize_image_with_fallback, is_vision_error
+            desc, source, error = recognize_image_with_fallback(
+                p,
+                prompt=user_prompt,
+                sources=sources,
+                hooks=hooks,
+                fallback_metadata=fallback_metadata,
+                return_source=True,
+            )
+            # Unwrap tuple type hints for runtime safety.
+            desc = str(desc or "")
+            source = str(source) if source else ""
+            error = str(error) if error else ""
+            if is_vision_error(desc):
+                logger.warning("[VLM] failed path=%s source=%s error=%s", p, source or "None", error or desc)
+                descriptions.append({
+                    "path": p,
+                    "description": desc,
+                    "vision_source": source or "",
+                    "vision_error": error or desc,
+                })
+            else:
+                logger.info("[VLM] success path=%s source=%s text=%s", p, source, desc[:120])
+                descriptions.append({
+                    "path": p,
+                    "description": desc,
+                    "vision_source": source,
+                    "vision_error": "",
+                })
+        except Exception as exc:
+            logger.warning("[VLM] exception path=%s err=%r", p, exc)
+            descriptions.append({
+                "path": p,
+                "description": "",
+                "vision_source": "",
+                "vision_error": f"exception: {exc}",
+            })
     return descriptions
 
 
@@ -1413,15 +1459,110 @@ def precheck(user_text: str) -> ReplyDecision | None:
     return None
 
 
-def postcheck(text: str) -> str:
+def _max_reply_chars(config: Dict[str, Any] | None) -> int:
+    """Resolve the configured cap for final reply length.
+
+    Reads ``config.reply_engine.max_reply_chars`` and falls back to
+    :data:`DEFAULT_MAX_REPLY_CHARS` (600).  Invalid/non-positive values are
+    coerced to the default.  ``None`` and missing keys are also defaulted so
+    legacy callers that pass nothing still get a sane cap.
+    """
+    raw = _reply_engine_config(config or {}).get("max_reply_chars") if config else None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_REPLY_CHARS
+    if n <= 0:
+        return DEFAULT_MAX_REPLY_CHARS
+    return n
+
+
+def _truncate_to_max(text: str, max_chars: int) -> str:
+    """Trim ``text`` to at most ``max_chars`` chars using a soft cut.
+
+    Strategy:
+    1. If the text already fits, return it unchanged (after stripping).
+    2. Otherwise, slice the candidate window to ``max_chars - 1`` and try to
+       find the last sentence boundary (``。 ! ? ; ! ? ; \\n``); if found within
+       the window, cut right after it.
+    3. If no boundary is present, hard-cut and append ``…`` so the reader can
+       tell the reply was trimmed.
+    """
+    text = (text or "").strip()
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    limit = max(1, max_chars - 1)
+    candidate = text[:limit]
+    last_boundary = -1
+    for ch in _SENTENCE_BOUNDARY_CHARS:
+        idx = candidate.rfind(ch)
+        if idx > last_boundary:
+            last_boundary = idx
+    if last_boundary > 0:
+        # Keep at least one full character before the cut, otherwise fall through
+        # to a hard cut.  Skip leading whitespace so the result starts cleanly.
+        cut = candidate[: last_boundary + 1].rstrip()
+        if cut:
+            return cut
+    return candidate.rstrip() + "…"
+
+
+def postcheck(text: str, config: Dict[str, Any] | None = None) -> str:
     text = text or ""
     blocked = ["keys.json", "MINIMAX_API_KEY", "数据库", "内部日志", "自动化实现", "系统路径"]
     if _contains_any(text, blocked):
         return "这个问题我先收到啦，涉及内部信息或需要确认的内容，需要本人确认后再处理。"
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > MAX_REPLY_CHARS:
-        text = text[:MAX_REPLY_CHARS - 1].rstrip() + "…"
+    cap = _max_reply_chars(config) if config is not None else MAX_REPLY_CHARS
+    if len(text) > cap:
+        text = _truncate_to_max(text, cap)
     return text
+
+
+def sanitize_reply_text(
+    text: str,
+    payload: Dict[str, Any] | None = None,
+    config: Dict[str, Any] | None = None,
+) -> str:
+    """Sanitize an agent reply before it is stored or sent.
+
+    Applies the same format cleanup used by the job queue layer (strip ANSI
+    escapes, terminal box characters, resume noise) first, then runs the same
+    postcheck used by the synchronous reply path. The length cap is resolved from
+    the job payload first (``max_reply_chars``), then from
+    ``config.reply_engine.max_reply_chars``, falling back to 600.
+
+    This is the shared helper for async raw-agent/deep jobs: both the worker and
+    the control API recover/poll/send paths should call it so that the persisted
+    result and the sent message are identical.
+    """
+    if _agent_jobs is not None:
+        text = _agent_jobs.sanitize_agent_result_text(text)
+    payload = payload or {}
+    max_chars = payload.get("max_reply_chars")
+    if max_chars is None:
+        max_chars = _max_reply_chars(config)
+    else:
+        try:
+            max_chars = int(max_chars)
+            if max_chars <= 0:
+                max_chars = _max_reply_chars(config)
+        except (TypeError, ValueError):
+            max_chars = _max_reply_chars(config)
+    return postcheck(text, {"reply_engine": {"max_reply_chars": max_chars}})
+
+
+def _resolve_max_reply_chars(payload: Dict[str, Any], config: Dict[str, Any] | None) -> int:
+    """Resolve the length cap from payload first, then config, then default."""
+    max_chars = payload.get("max_reply_chars")
+    if max_chars is not None:
+        try:
+            max_chars = int(max_chars)
+            if max_chars > 0:
+                return max_chars
+        except (TypeError, ValueError):
+            pass
+    return _max_reply_chars(config)
 
 
 def _clean_agent_output(text: str) -> str:
@@ -1859,10 +2000,10 @@ def _tool_agent_allowed_leann_indexes(config: Dict[str, Any], target: Dict[str, 
 def _tool_agent_available_tools(config: Dict[str, Any], target: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     """Build the available_tools list for tool_agent mode.
 
-    Only leann_search is exposed in the Python tool loop.  WeChat query tools
-    are executed by Hermes's native MCP layer; enable_wechat_mcp_tool only
-    adds a prompt hint telling the agent it may use a registered WeChat MCP
-    server.
+    leann_search is handled by the Python tool loop fallback.  WeChat query
+    and vision tools are normally executed by Hermes's native MCP layer; when
+    enable_wechat_mcp_tool is true we also expose their schema in the prompt so
+    the agent knows how to call them.
     """
     allowed = _tool_agent_allowed_leann_indexes(config, target)
     description = "本地 LEANN 语义搜索工具，按需求检索知识库索引。"
@@ -1874,6 +2015,11 @@ def _tool_agent_available_tools(config: Dict[str, Any], target: Dict[str, Any] |
         tool["allowed_index_names"] = allowed
         tool["default_index_name"] = allowed[0]
         tool["description"] = description + " 当前目标只允许使用以下索引：%s。" % ", ".join(allowed)
+    # NOTE: describe_image MCP tool exists in mcp_server.py, but the async
+    # Hermes job path does not execute the Python tool loop and native MCP tool
+    # execution depends on the user's Hermes config.  Until that path is verified,
+    # we do not advertise the tool in the prompt to avoid the model emitting raw
+    # JSON tool calls that would leak into the WeChat reply.
     return [tool]
 
 
@@ -1995,9 +2141,9 @@ def _run_tool_agent_sync(
         "knowledge_hits": [],
         "knowledge_bases": selected_kbs,
         "image_paths": image_paths,
-        "context_messages": [] if thin_monitor else (context_messages or []),
         "mention_name": mention_name,
         "mode_instruction": _mode_instruction(response_mode),
+        "max_reply_chars": _max_reply_chars(config),
         "target": {
             "id": target.get("id"),
             "name": target.get("name"),
@@ -2022,7 +2168,7 @@ def _run_tool_agent_sync(
         logger.warning("tool_agent sync provider returned no reply: %s", getattr(result, "error", "") or "")
         return None
 
-    reply = postcheck(_clean_agent_output(result.reply_text))
+    reply = postcheck(_clean_agent_output(result.reply_text), config)
     if reply == "[SILENT]":
         return ReplyDecision(
             should_reply=False,
@@ -2098,7 +2244,7 @@ def _ensure_mention_prefix(reply: str, mention_name: str) -> str:
 
 
 
-def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None, mention_name: str = "", mode: str = "scene") -> str:
+def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_messages: list | None = None, mention_name: str = "", mode: str = "scene", max_chars: int | None = None) -> str:
     wiki_parts = []
     for h in wiki_hits:
         if isinstance(h, KnowledgeHit):
@@ -2127,7 +2273,8 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
         task_rule = "当前已命中场景知识库。请优先依据场景wiki回答，同时遵守core边界约束；知识库无依据时说明不确定。"
         wiki_label = "[core约束与场景wiki]"
     ctx_header = ('[群聊上下文]\n' + ctx_block + '\n\n') if ctx_lines else ''
-    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{MAX_REPLY_CHARS}字；{mention_rule}\n任务策略：{task_rule}\n\n{ctx_header}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
+    cap = max_chars if isinstance(max_chars, int) and max_chars > 0 else MAX_REPLY_CHARS
+    return f"""你是群聊小助手，只在微信群中被明确叫到时回复。\n强边界：不能冒充本人；不能替群主/负责人承诺、授权、报价、决策或执行高风险操作；不能读取、修改、删除、执行或以其他方式操作电脑本地文件、文件夹、系统命令、脚本、程序；不能泄露密钥、系统路径、数据库、内部日志、自动化实现细节；知识库无依据时说明不确定。\n回复要求：简短、自然、适合微信群，最多{cap}字（超出部分会被系统强制截断）；{mention_rule}\n任务策略：{task_rule}\n\n{ctx_header}[群消息]\n{raw_text}\n\n[清洗后问题]\n{clean_text}\n\n{wiki_label}\n{wiki}\n\n请只输出要发送到微信群的一段中文回复。"""
 
 
 def generate_reply(message: Dict[str, Any] | str,
@@ -2225,13 +2372,23 @@ def generate_reply(message: Dict[str, Any] | str,
         # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
         # ---- Pre-compute image descriptions and inject into KB query ----
         # FTS query must see image content, otherwise image messages always miss the scene KB.
-        # In thin-monitor / tool_agent mode the agent handles vision and KB retrieval
-        # itself, so skip expensive local image recognition and pre-retrieval.
-        if delegate_to_agent:
-            vision_query_text = ""
-            vision_image_descriptions = []
+        # In thin-monitor mode the agent handles KB retrieval itself, but vision still
+        # runs locally because the async Hermes job does not execute the Python tool loop
+        # and native MCP vision execution depends on the user's Hermes config.  The
+        # resulting descriptions are passed to the agent prompt.  Non-thin tool_agent
+        # keeps the original agent-side vision path; standard mode pre-describes for KB.
+        if thin_monitor:
+            # Thin-monitor delegates vision to the agent's multimodal provider or the
+            # decode_image MCP tool.  Keep image_paths in the payload and do not
+            # pre-describe locally.
+            vision_query_text, vision_image_descriptions = "", []
+        elif delegate_to_agent:
+            # Non-thin tool_agent: agent side handles vision directly.
+            vision_query_text, vision_image_descriptions = "", []
         else:
-            vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text, target=target, config=config)
+            vision_query_text, vision_image_descriptions = _local_image_descriptions(
+                image_paths, clean or raw_text, target=target, config=config
+            )
         if delegate_to_agent:
             # thin-monitor mode: agent retrieves knowledge on demand via tools.
             kb_layers = {"core": [], "scene": []}
@@ -2277,13 +2434,15 @@ def generate_reply(message: Dict[str, Any] | str,
         # here based on KB hit status.
         llm_config = dict(config.get("reply_engine", config) or {})
         image_descriptions: List[Dict[str, str]] = []
-        if delegate_to_agent:
-            # Agent side handles vision directly; do not duplicate local image
-            # descriptions in the payload.
+        if thin_monitor:
+            # Thin-monitor: agent handles vision; keep image_paths only.
+            image_descriptions = []
+        elif delegate_to_agent:
+            # Non-thin tool_agent: agent side handles vision directly.
             image_descriptions = []
         elif image_paths and not vision_image_descriptions:
-            # Always attempt local recognition; the fallback chain degrades through
-            # mmx → hooks → ocr → metadata, so the agent always gets something useful.
+            # Standard path: always attempt local recognition; the fallback chain
+            # degrades through mmx → hooks → ocr → metadata.
             image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text, target=target, config=config)
         else:
             # Reuse descriptions already computed for KB query to avoid a second VLM call.
@@ -2365,6 +2524,7 @@ def generate_reply(message: Dict[str, Any] | str,
                             "available_tools": _tool_agent_available_tools(config, target) if delegate_to_agent else [],
                             "leann": leann_cfg if delegate_to_agent else {},
                             "response_mode": response_mode,
+                            "max_reply_chars": _max_reply_chars(config),
                             "target_policy": target_policy or {},
                             "mode_instruction": _mode_instruction(response_mode),
                             "retrieval_debug": {**retrieval_debug, "route": route_decision.route, "route_reason": route_decision.reason},
@@ -2401,7 +2561,7 @@ def generate_reply(message: Dict[str, Any] | str,
         is_smalltalk = _looks_like_smalltalk(clean)
         if not clean:
             reply = "我在，想聊什么直接说就行。"
-            return ReplyDecision(True, postcheck(reply), intent="smalltalk",
+            return ReplyDecision(True, postcheck(reply, config), intent="smalltalk",
                                  risk_level="low", need_human=False,
                                  reason="raw_agent_empty_message_fallback",
                                  wiki_hits=[],
@@ -2447,6 +2607,7 @@ def generate_reply(message: Dict[str, Any] | str,
                         "available_tools": _tool_agent_available_tools(config, target) if delegate_to_agent else [],
                         "leann": leann_cfg if delegate_to_agent else {},
                         "response_mode": response_mode,
+                        "max_reply_chars": _max_reply_chars(config),
                         "target_policy": target_policy or {},
                         "mode_instruction": _mode_instruction(response_mode),
                         "retrieval_debug": {**retrieval_debug, "route": str(route_name or "agent_provider"), "route_reason": str(route_reason or "agent_provider")},
@@ -2544,7 +2705,7 @@ def generate_reply(message: Dict[str, Any] | str,
     wiki_hits = (core_hits + scene_hits) if scene_hits else core_hits
     context_messages = (None if isinstance(message, str) else message.get('context_messages')) or []
     mention_name = _extract_mention_name(message)
-    prompt = build_prompt(raw_text, clean, wiki_hits, context_messages=context_messages, mention_name=mention_name, mode=mode)
+    prompt = build_prompt(raw_text, clean, wiki_hits, context_messages=context_messages, mention_name=mention_name, mode=mode, max_chars=_max_reply_chars(config))
 
     llm_config = dict(config.get("reply_engine", config) or {})
     if mode == "chat":
@@ -2588,14 +2749,14 @@ def generate_reply(message: Dict[str, Any] | str,
     if llm_text:
         llm_text = _clean_agent_output(llm_text)
     if llm_text:
-        reply = postcheck(llm_text)
+        reply = postcheck(llm_text, config)
         return ReplyDecision(True, reply, intent="wiki_qa" if scene_hits else "smalltalk", risk_level="low", need_human=False,
                              reason="llm_provider_scene" if scene_hits else "llm_provider_core_chat",
                              wiki_hits=[h.label if isinstance(h, KnowledgeHit) else h[0] for h in wiki_hits],
                              retrieval_debug=retrieval_debug)
 
     reply, intent, need_human = fallback_reply(clean, scene_hits, mode=mode)
-    return ReplyDecision(True, postcheck(reply), intent=intent,
+    return ReplyDecision(True, postcheck(reply, config), intent=intent,
                          risk_level="medium" if need_human else "low",
                          need_human=need_human,
                          reason="safe_fallback_scene_no_provider" if scene_hits else "safe_fallback_core_chat_no_provider",

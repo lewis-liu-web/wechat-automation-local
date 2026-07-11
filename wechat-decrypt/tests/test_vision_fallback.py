@@ -152,3 +152,64 @@ def test_try_vision_hook_uses_fallback_chain(monkeypatch, tmp_path):
     monkeypatch.setattr(re, "_call_vision_recognizer", fake_recognizer)
     result = re._try_vision_hook(str(img), ["python", "hook.py"], "raw text")
     assert "fallback description" in result
+
+
+def test_recognize_image_with_fallback_return_source_first_success(monkeypatch, tmp_path):
+    img = tmp_path / "test.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 100)
+
+    def fake_mmx(path, prompt):
+        return "mmx description"
+
+    monkeypatch.setattr(ih, "mmx_recognize_image", fake_mmx)
+    desc, source, error = ih.recognize_image_with_fallback(str(img), sources=["mmx", "ocr"], return_source=True)
+    assert desc == "mmx description"
+    assert source == "mmx"
+    assert error is None
+
+
+def test_recognize_image_with_fallback_return_source_second_success(monkeypatch, tmp_path):
+    img = tmp_path / "test.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 100)
+
+    def fake_mmx(path, prompt):
+        return "[VLM Error] mmx failed"
+
+    def fake_ocr(path):
+        return "[OCR 识别结果]\nhello world"
+
+    monkeypatch.setattr(ih, "mmx_recognize_image", fake_mmx)
+    monkeypatch.setattr(ih, "_try_ocr", fake_ocr)
+
+    desc, source, error = ih.recognize_image_with_fallback(str(img), sources=["mmx", "ocr"], return_source=True)
+    assert desc == "[OCR 识别结果]\nhello world"
+    assert source == "ocr"
+    assert error is None
+
+
+def test_recognize_image_with_fallback_return_source_metadata_fallback(monkeypatch, tmp_path):
+    img = tmp_path / "test.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 100)
+
+    monkeypatch.setattr(ih, "mmx_recognize_image", lambda path, prompt: "[VLM Error] failed")
+    monkeypatch.setattr(ih, "_try_ocr", lambda path: None)
+
+    desc, source, error = ih.recognize_image_with_fallback(str(img), sources=["mmx", "ocr"], return_source=True)
+    assert "[图片元数据]" in desc
+    assert source == "metadata"
+    assert error is None
+
+
+def test_recognize_image_with_fallback_return_source_all_fail_no_metadata(monkeypatch, tmp_path):
+    img = tmp_path / "test.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 100)
+
+    monkeypatch.setattr(ih, "mmx_recognize_image", lambda path, prompt: "[VLM Error] failed")
+    monkeypatch.setattr(ih, "_try_ocr", lambda path: None)
+
+    desc, source, error = ih.recognize_image_with_fallback(
+        str(img), sources=["mmx", "ocr"], fallback_metadata=False, return_source=True
+    )
+    assert "[VLM Error]" in desc
+    assert source is None
+    assert error == "all vision sources failed"

@@ -346,7 +346,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return _err("job not found: %d" % job_id)
             if not job.get("result_text"):
                 return _err("job has no result to send")
-            send_result = agent_worker._send_result_back(job, job["result_text"], ROOT / "wechat_bot_targets.json")
+            reply_text = agent_worker.sanitize_reply_text(
+                job["result_text"], job.get("payload"), reg.load_config()
+            )
+            if reply_text != job["result_text"]:
+                agent_jobs.update_result_text(job_id, reply_text)
+            send_result = agent_worker._send_result_back(job, reply_text, ROOT / "wechat_bot_targets.json")
             if send_result.get("sent"):
                 agent_jobs.mark_sent(job_id)
                 return _ok(action="sent", job_id=job_id, send_result=send_result)
@@ -375,13 +380,16 @@ class ControlHandler(BaseHTTPRequestHandler):
             bridge_patch = {key: raw.get(key) for key in ("bridge_session_id", "bridge_user_msg_id") if raw.get(key)}
             if bridge_patch:
                 agent_jobs.merge_payload(job_id, bridge_patch)
-            stored = agent_jobs.recover_job_result(job_id, result.reply_text)
+            reply_text = agent_worker.sanitize_reply_text(
+                result.reply_text, job.get("payload"), reg.load_config()
+            )
+            stored = agent_jobs.recover_job_result(job_id, reply_text)
             if not stored:
                 return _ok(action="recover_store_failed", job_id=job_id, result=result.to_dict())
             recovered = agent_jobs.get_job(job_id)
             send_result = None
             if body.get("send") is True and recovered:
-                send_result = agent_worker._send_result_back(recovered, result.reply_text, ROOT / "wechat_bot_targets.json")
+                send_result = agent_worker._send_result_back(recovered, reply_text, ROOT / "wechat_bot_targets.json")
                 if send_result.get("sent"):
                     agent_jobs.mark_sent(job_id)
                 else:
@@ -470,6 +478,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                         description=str(body.get("description") or ""),
                         replace=bool(body.get("replace")),
                         source=str(body.get("source") or "local_folder"),
+                        config_path=reg.CONFIG_PATH,
                     )
                 else:
                     out = reg.add_knowledge_base(
@@ -486,6 +495,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                         replace=bool(body.get("replace")),
                         source=body.get("source"),
                         docs_dir=body.get("docs_dir"),
+                        config_path=reg.CONFIG_PATH,
                     )
                 return _ok(action="saved", knowledge_base=out)
             except Exception as e:
@@ -948,7 +958,9 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
                                        provider=ext_provider, worker_id="reconciler")
 
         if poll_result.ok and poll_result.reply_text:
-            reply_text = agent_jobs.sanitize_agent_result_text(poll_result.reply_text)
+            reply_text = agent_worker.sanitize_reply_text(
+                poll_result.reply_text, job.get("payload"), reg.load_config()
+            )
             raw = getattr(poll_result, "raw", None) or None
             if raw:
                 agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
@@ -1018,9 +1030,15 @@ def _async_sender_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             continue
         # Increment send_attempts
         agent_jobs.increment_send_attempts(job_id)
+        # Sanitize and ensure the persisted text matches what is actually sent
+        reply_text = agent_worker.sanitize_reply_text(
+            job.get("result_text") or "", job.get("payload"), reg.load_config()
+        )
+        if reply_text != job.get("result_text"):
+            agent_jobs.update_result_text(job_id, reply_text)
         # Send
         send_result = agent_worker._send_result_back(
-            job, job.get("result_text") or "",
+            job, reply_text,
             ROOT / "wechat_bot_targets.json",
         )
         if send_result.get("sent"):
@@ -1033,7 +1051,7 @@ def _async_sender_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             )
             results.append({"job_id": job_id, "action": "send_failed",
                             "reason": send_result.get("reason")})
-    
+
     return {"ok": True, "action": "sent", "sent": len(results),
             "results": results, "duration": round(time.time() - t0, 3)}
 

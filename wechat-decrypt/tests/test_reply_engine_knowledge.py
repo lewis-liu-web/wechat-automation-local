@@ -491,5 +491,81 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.assertEqual(tool['allowed_index_names'], ['idx_a'])
         self.assertEqual(tool['default_index_name'], 'idx_a')
 
+    def test_thin_monitor_delegates_vision_to_agent(self):
+        """Thin-monitor must not pre-describe images; vision is delegated to the agent."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'mode': 'raw_agent', 'agent_mode': 'tool_agent', 'thin_monitor': True},
+        }
+        img = Path(td.name) / 'img.jpg'
+        img.write_bytes(b'fake')
+        message = {
+            'content': '[图片]',
+            'local_id': 1,
+            'local_type': 3,
+            'image_path': str(img),
+        }
+        with mock.patch('reply_engine._local_image_descriptions') as mock_desc, \
+             mock.patch('reply_engine._agent_jobs.enqueue_job') as mock_enqueue:
+            d = generate_reply(message, {'knowledge_bases': ['scene.a'], 'mode': 'customer_service'}, cfg)
+
+        self.assertTrue(d.should_reply)
+        self.assertIn('正在处理', d.reply_text)
+        mock_desc.assert_not_called()
+        mock_enqueue.assert_called_once()
+        payload = mock_enqueue.call_args.kwargs['payload']
+        self.assertEqual(payload['image_paths'], [str(img)])
+        self.assertEqual(payload['image_descriptions'], [])
+
+    def test_tool_agent_non_thin_keeps_agent_side_vision(self):
+        """Non-thin tool_agent should not pre-describe images; vision is delegated."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'mode': 'raw_agent', 'agent_mode': 'tool_agent'},
+        }
+        img = Path(td.name) / 'img.jpg'
+        img.write_bytes(b'fake')
+        message = {
+            'content': '[图片]',
+            'local_id': 1,
+            'local_type': 3,
+            'image_path': str(img),
+        }
+        with mock.patch('reply_engine._local_image_descriptions') as mock_desc, \
+             mock.patch('reply_engine._agent_jobs.enqueue_job') as mock_enqueue:
+            d = generate_reply(message, {'knowledge_bases': ['scene.a'], 'mode': 'customer_service'}, cfg)
+
+        self.assertTrue(d.should_reply)
+        mock_desc.assert_not_called()
+        mock_enqueue.assert_called_once()
+        payload = mock_enqueue.call_args.kwargs['payload']
+        self.assertEqual(payload['image_paths'], [str(img)])
+        self.assertEqual(payload['image_descriptions'], [])
+
+    def test_describe_images_for_agent_records_source_and_error(self):
+        """_describe_images_for_agent must include vision_source and vision_error."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        img = Path(td.name) / 'img.jpg'
+        img.write_bytes(b'fake')
+        from reply_engine import _describe_images_for_agent
+        with mock.patch('image_handler.recognize_image_with_fallback', return_value=('a cat', 'mmx', None)):
+            descs = _describe_images_for_agent([str(img)], 'describe', target={}, config={})
+        self.assertEqual(len(descs), 1)
+        self.assertEqual(descs[0]['description'], 'a cat')
+        self.assertEqual(descs[0]['vision_source'], 'mmx')
+        self.assertEqual(descs[0]['vision_error'], '')
+
+        with mock.patch('image_handler.recognize_image_with_fallback', return_value=('[VLM Error] all vision sources failed', None, 'all failed')):
+            descs = _describe_images_for_agent([str(img)], 'describe', target={}, config={})
+        self.assertEqual(descs[0]['vision_source'], '')
+        self.assertEqual(descs[0]['vision_error'], 'all failed')
+
 if __name__ == '__main__':
     unittest.main()

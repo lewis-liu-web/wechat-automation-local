@@ -699,6 +699,23 @@ class TestLeannBuild(unittest.TestCase):
                 reg.build_leann_kb("wk", config_path=str(cfg_path))
             self.assertIn("docs_dir", str(ctx.exception).lower())
 
+    def test_replace_leann_kb_can_add_docs_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / "docs"
+            docs.mkdir()
+            cfg_path = Path(tmp) / "cfg.json"
+            cfg_path.write_text(json.dumps({"knowledge_bases": {"wk": {"type": "leann", "index_name": "work", "enabled": True}}}))
+            reg.add_knowledge_base(
+                "wk",
+                kb_type="leann",
+                knowledge_base_id="work",
+                docs_dir=str(docs),
+                replace=True,
+                config_path=str(cfg_path),
+            )
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(cfg["knowledge_bases"]["wk"]["docs_dir"], str(docs))
+
     def test_build_leann_kb_rejects_non_leann(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = Path(tmp) / "cfg.json"

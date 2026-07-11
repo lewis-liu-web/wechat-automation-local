@@ -798,7 +798,8 @@ def recognize_image_with_fallback(
     sources: list[str] | None = None,
     hooks: dict[str, list[str] | str] | None = None,
     fallback_metadata: bool = True,
-) -> str:
+    return_source: bool = False,
+) -> str | tuple[str, str | None, str | None]:
     """Recognize an image using a configurable chain of vision sources.
 
     Args:
@@ -811,11 +812,18 @@ def recognize_image_with_fallback(
             If None/empty, defaults to ["mmx"].
         hooks: Mapping from hook name to command (list or string).
         fallback_metadata: If True and all sources fail, return file metadata.
+        return_source: If True, return a tuple (description, source, error).
+            ``source`` is the name of the source that produced the description,
+            or "metadata" for the metadata fallback, or None on total failure.
+            ``error`` is a short failure reason when description is an error marker.
 
     Returns:
-        Image description text, or metadata fallback, or an error marker.
+        Image description text (default), or (text, source, error) when
+        ``return_source`` is True.
     """
     if not os.path.isfile(image_path):
+        if return_source:
+            return "[VLM Error] image not found", None, "image not found"
         return "[VLM Error] image not found"
 
     sources = list(sources) if sources else ["mmx"]
@@ -826,12 +834,20 @@ def recognize_image_with_fallback(
         try:
             result = _try_source(image_path, source, prompt, hooks)
             if result:
+                if return_source:
+                    return result, source, None
                 return result
         except Exception as e:
             last_error = f"{source} exception: {e}"
             continue
 
     if fallback_metadata:
-        return _image_metadata_description(image_path)
+        desc = _image_metadata_description(image_path)
+        if return_source:
+            return desc, "metadata", None
+        return desc
 
-    return f"[VLM Error] all vision sources failed{(' (' + last_error + ')') if last_error else ''}"
+    error = f"[VLM Error] all vision sources failed{(' (' + last_error + ')') if last_error else ''}"
+    if return_source:
+        return error, None, last_error or "all vision sources failed"
+    return error
