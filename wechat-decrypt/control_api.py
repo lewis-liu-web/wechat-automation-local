@@ -393,18 +393,27 @@ class ControlHandler(BaseHTTPRequestHandler):
             if not callable(recover):
                 return _err("provider does not support result recovery")
             result: Any = recover(job, timeout=float(body.get("timeout") or 15))
-            if not result.ok or not result.reply_text:
-                return _ok(action="recover_failed", job_id=job_id, result=result.to_dict())
-            raw = result.raw or {}
-            bridge_patch = {key: raw.get(key) for key in ("bridge_session_id", "bridge_user_msg_id") if raw.get(key)}
+            safe_result, original_raw = _safe_recover_result_snapshot(result)
+            if safe_result is None:
+                return _ok(action="recover_failed", job_id=job_id,
+                           result={"error": "invalid recover result shape"})
+            if not safe_result.ok or not safe_result.reply_text:
+                return _ok(action="recover_failed", job_id=job_id,
+                           result={"ok": safe_result.ok,
+                                   "status": safe_result.status,
+                                   "has_reply": bool(safe_result.reply_text)})
+            bridge_patch = agent_jobs._safe_bridge_patch(original_raw)
             if bridge_patch:
                 agent_jobs.merge_payload(job_id, bridge_patch)
             reply_text = agent_worker.sanitize_reply_text(
-                result.reply_text, job.get("payload"), reg.load_config()
+                safe_result.reply_text, job.get("payload"), reg.load_config()
             )
             stored = agent_jobs.recover_job_result(job_id, reply_text)
             if not stored:
-                return _ok(action="recover_store_failed", job_id=job_id, result=result.to_dict())
+                return _ok(action="recover_store_failed", job_id=job_id,
+                           result={"ok": safe_result.ok,
+                                   "status": safe_result.status,
+                                   "has_reply": bool(safe_result.reply_text)})
             recovered = agent_jobs.get_job(job_id)
             send_result = None
             if body.get("send") is True and recovered:
@@ -414,7 +423,11 @@ class ControlHandler(BaseHTTPRequestHandler):
                 else:
                     agent_jobs.mark_send_failed(job_id, send_result.get("reason", "recover send failed"))
                 recovered = agent_jobs.get_job(job_id)
-            return _ok(action="recovered", job_id=job_id, result=result.to_dict(), send_result=send_result, job=recovered)
+            return _ok(action="recovered", job_id=job_id,
+                       result={"ok": safe_result.ok,
+                               "status": safe_result.status,
+                               "has_reply": bool(safe_result.reply_text)},
+                       send_result=send_result, job=recovered)
         if method == "GET" and path == "/agent/worker/status":
             return _ok(**_agent_worker_status())
         if method == "GET" and path == "/agent/instances":
@@ -1344,6 +1357,21 @@ def _reliable_quarantine_turn_job(job_id: Any, body: Dict[str, Any]) -> Dict[str
 # M5 async flow: dispatcher / reconciler / sender
 # ---------------------------------------------------------------------------
 
+# Fixed safe markers for provider-returned errors in the dispatcher.
+# The exception path explicitly uses "submit exception" so that raw exception
+# text is never persisted or returned.  A failed submit returns the same
+# marker regardless of the underlying provider error.
+_SAFE_SUBMIT_ERROR = "submit failed"
+_SAFE_SUBMIT_EXCEPTION = "submit exception"
+_SAFE_PROVIDER_UNAVAILABLE = "provider unavailable"
+
+# Fixed safe markers for provider-returned poll errors in the reconciler.
+# The exception path explicitly uses "poll exception" so that raw exception
+# text is never trusted or echoed.
+_SAFE_POLL_ERROR = "poll result failed"
+_SAFE_POLL_EXPIRED = "poll expired"
+
+
 def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
     """Dispatcher: claim queued jobs and submit them to external agent.
     
@@ -1358,12 +1386,15 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
     per_group = int(body.get("per_group_concurrency") or 1)
     
     provider_name_for_health = instance_provider or None
-    provider = _build_agent_provider(provider_name_for_health, instance_id=instance_id)
-    health_dict = _cached_provider_health("dispatch:%s:%s" % (instance_id or "default", getattr(provider, "name", instance_provider or "")), provider, ttl=20.0)
+    try:
+        provider = _build_agent_provider(provider_name_for_health, instance_id=instance_id)
+        health_dict = _cached_provider_health("dispatch:%s:%s" % (instance_id or "default", getattr(provider, "name", instance_provider or "")), provider, ttl=20.0)
+    except Exception:
+        health_dict = {"ok": False, "ready": False}
     if not bool(health_dict.get("ok")) or not bool(health_dict.get("ready")):
         return {"ok": True, "action": "provider_unavailable", "instance_id": instance_id,
-                "provider": getattr(provider, "name", instance_provider or ""),
-                "error": health_dict.get("error") or "provider not ready", "duration": round(time.time() - t0, 3)}
+                "provider": provider_name_for_health or "",
+                "error": _SAFE_PROVIDER_UNAVAILABLE, "duration": round(time.time() - t0, 3)}
 
     job = agent_jobs.claim_dispatchable(
         worker_id=worker_id,
@@ -1377,7 +1408,15 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
     
     provider_name = str(job.get("provider") or "").strip().lower() or (instance_provider or None)
     if provider_name and provider_name != str(getattr(provider, "name", "")).lower():
-        provider = _build_agent_provider(provider_name, instance_id=instance_id)
+        try:
+            provider = _build_agent_provider(provider_name, instance_id=instance_id)
+        except Exception:
+            transitioned = agent_jobs.fail_job(int(job["id"]), _SAFE_PROVIDER_UNAVAILABLE,
+                                                status=agent_jobs.STATUS_FAILED)
+            if not transitioned:
+                agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_PROVIDER_UNAVAILABLE)
+            return {"ok": False, "action": "submit_failed", "job_id": job["id"],
+                    "error": _SAFE_PROVIDER_UNAVAILABLE, "duration": round(time.time() - t0, 3)}
     if instance_id:
         agent_jobs.merge_payload(int(job["id"]), {"agent_instance_id": str(instance_id)})
     
@@ -1414,26 +1453,97 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "action": "persistence_failed", "job_id": job["id"],
                 "duration": round(time.time() - t0, 3)}
 
-    submit_result = provider.submit(job, timeout=submit_timeout)
-    if not submit_result.ok:
-        agent_jobs.fail_job(
+    try:
+        submit_result = provider.submit(job, timeout=submit_timeout)
+    except Exception:
+        transitioned = agent_jobs.fail_job(
             int(job["id"]),
-            submit_result.error or "submit failed",
+            _SAFE_SUBMIT_EXCEPTION,
             status=agent_jobs.STATUS_FAILED,
         )
+        if not transitioned:
+            agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_SUBMIT_EXCEPTION)
         return {"ok": False, "action": "submit_failed", "job_id": job["id"],
-                "error": submit_result.error, "duration": round(time.time() - t0, 3)}
+                "error": _SAFE_SUBMIT_EXCEPTION, "duration": round(time.time() - t0, 3)}
 
-    raw = submit_result.raw or {}
-    session_id = str(raw.get("bridge_session_id") or "")
-    user_msg_id = int(raw.get("bridge_user_msg_id") or 0)
-    if not session_id:
-        agent_jobs.fail_job(int(job["id"]), "submit returned no session id",
+    # Stage 2 Phase A: validate the submit result is a usable AgentResult shape
+    # before dereferencing .ok or .raw.  A malformed dataclass or wrong-type
+    # raw field could raise or leak provider content, so treat it the same as a
+    # submit rejection: fail the job, release the dispatch lock, and return a
+    # fixed safe marker with no raw text.
+    try:
+        is_agent_result = isinstance(submit_result, AgentResult)
+        submit_ok = submit_result.ok if is_agent_result else None
+        raw = submit_result.raw if is_agent_result else None
+    except Exception:
+        is_agent_result = False
+        submit_ok = None
+        raw = None
+
+    if (
+        not is_agent_result
+        or type(submit_ok) is not bool
+        or type(raw) is not dict
+    ):
+        transitioned = agent_jobs.fail_job(
+            int(job["id"]),
+            _SAFE_SUBMIT_ERROR,
+            status=agent_jobs.STATUS_FAILED,
+        )
+        if not transitioned:
+            agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_SUBMIT_ERROR)
+        return {"ok": False, "action": "submit_failed", "job_id": job["id"],
+                "error": _SAFE_SUBMIT_ERROR, "duration": round(time.time() - t0, 3)}
+
+    if not submit_ok:
+        transitioned = agent_jobs.fail_job(
+            int(job["id"]),
+            _SAFE_SUBMIT_ERROR,
+            status=agent_jobs.STATUS_FAILED,
+        )
+        if not transitioned:
+            agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_SUBMIT_ERROR)
+        return {"ok": False, "action": "submit_failed", "job_id": job["id"],
+                "error": _SAFE_SUBMIT_ERROR, "duration": round(time.time() - t0, 3)}
+
+    bridge_patch = agent_jobs._safe_bridge_patch(raw)
+
+    if type(raw) is not dict:
+        transitioned = agent_jobs.fail_job(
+            int(job["id"]),
+            _SAFE_SUBMIT_ERROR,
+            status=agent_jobs.STATUS_FAILED,
+        )
+        if not transitioned:
+            agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_SUBMIT_ERROR)
+        return {"ok": False, "action": "submit_failed", "job_id": job["id"],
+                "error": _SAFE_SUBMIT_ERROR, "duration": round(time.time() - t0, 3)}
+
+    if "bridge_session_id" not in raw:
+        transitioned = agent_jobs.fail_job(int(job["id"]), "submit returned no session id",
                            status=agent_jobs.STATUS_FAILED)
+        if not transitioned:
+            agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_SUBMIT_ERROR)
         return {"ok": False, "action": "no_session", "job_id": job["id"],
-                "duration": round(time.time() - t0, 3)}
+                "error": _SAFE_SUBMIT_ERROR, "duration": round(time.time() - t0, 3)}
 
-    
+    if (
+        "bridge_session_id" not in bridge_patch
+        or "bridge_user_msg_id" not in bridge_patch
+        or bridge_patch["bridge_user_msg_id"] == 0
+    ):
+        transitioned = agent_jobs.fail_job(
+            int(job["id"]),
+            _SAFE_SUBMIT_ERROR,
+            status=agent_jobs.STATUS_FAILED,
+        )
+        if not transitioned:
+            agent_jobs.release_dispatching(int(job["id"]), reason=_SAFE_SUBMIT_ERROR)
+        return {"ok": False, "action": "submit_failed", "job_id": job["id"],
+                "error": _SAFE_SUBMIT_ERROR, "duration": round(time.time() - t0, 3)}
+
+    session_id = bridge_patch["bridge_session_id"]
+    user_msg_id = bridge_patch["bridge_user_msg_id"]
     ok = agent_jobs.mark_submitted(
         int(job["id"]),
         external_provider=provider.name,
@@ -1462,9 +1572,109 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             "duration": round(time.time() - t0, 3)}
 
 
+# Fixed safe markers for provider-returned poll errors in the reconciler.
+# The exception path explicitly uses "poll exception" so that raw exception
+# text is never trusted or echoed.
+_SAFE_POLL_ERROR = "poll result failed"
+_SAFE_POLL_EXPIRED = "poll expired"
+
+
+def _safe_poll_result_snapshot(poll_result: Any) -> Optional[Tuple[AgentResult, Any]]:
+    """Validate scalar fields and return safe scalars plus the original raw.
+
+    Reads every field the reconciler dereferences (``ok``, ``status``,
+    ``reply_text``, ``error``, ``latency``, ``provider``, ``worker_id``) inside a
+    single exception guard, exact-type-checks each captured value, and returns
+    the original ``raw`` so the caller can apply ``_safe_bridge_patch`` to it.
+    A provider-controlled dict subclass is accepted here; the canonical exact
+    ``type(raw) is dict`` policy is enforced later by ``_safe_bridge_patch``.
+
+    Returns ``None`` when the result is not a valid AgentResult shape, so the
+    caller can use the standard ``if snapshot is None`` guard.
+    """
+    if not isinstance(poll_result, AgentResult):
+        return None
+
+    try:
+        ok = poll_result.ok
+        status = poll_result.status
+        reply_text = getattr(poll_result, "reply_text", "")
+        error = getattr(poll_result, "error", "")
+        latency = getattr(poll_result, "latency", 0.0)
+        provider = getattr(poll_result, "provider", "")
+        worker_id = getattr(poll_result, "worker_id", "")
+    except Exception:
+        return None
+
+    if type(ok) is not bool:
+        return None
+    if type(status) is not str:
+        return None
+    if type(reply_text) is not str:
+        return None
+    if type(error) is not str and error is not None:
+        return None
+    if type(latency) not in (int, float):
+        return None
+    if type(provider) is not str:
+        return None
+    if type(worker_id) is not str:
+        return None
+
+    try:
+        raw = getattr(poll_result, "raw", None)
+    except Exception:
+        raw = None
+
+    return AgentResult(
+        ok=ok,
+        status=status,
+        reply_text=reply_text,
+        error=error if error is not None else "",
+        latency=float(latency),
+        provider=provider,
+        worker_id=worker_id,
+        raw=None,
+    ), raw
+
+
+def _safe_recover_result_snapshot(recover_result: Any) -> Tuple[Optional[AgentResult], Any]:
+    """Validate scalar fields and return safe scalars plus the original raw.
+
+    ``raw`` is read in a separate exception guard so a raising ``raw`` accessor
+    does not fail a recovery that otherwise has valid scalar fields.  The
+    caller passes the returned ``raw`` to ``_safe_bridge_patch``; that helper
+    safely returns ``{}`` for any non-exact dict or invalid bridge value.
+    """
+    if not isinstance(recover_result, AgentResult):
+        return None, None
+
+    try:
+        ok = recover_result.ok
+        status = recover_result.status
+        reply_text = getattr(recover_result, "reply_text", "")
+    except Exception:
+        return None, None
+
+    if type(ok) is not bool or type(status) is not str or type(reply_text) is not str:
+        return None, None
+
+    try:
+        raw = getattr(recover_result, "raw", None)
+    except Exception:
+        raw = None
+
+    return AgentResult(
+        ok=ok,
+        status=status,
+        reply_text=reply_text,
+        raw=None,
+    ), raw
+
+
 def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
     """Reconciler: poll submitted/agent_running jobs for completion.
-    
+
     Transitions: submitted/agent_running -> done/failed/expired
     Returns the first batch of results to avoid blocking too long.
     """
@@ -1490,41 +1700,143 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             results.append({"job_id": job_id, "action": "expired"})
             continue
 
-        # Build provider from job's external_provider
+        # Build provider from job's external_provider.  A construction failure must not
+        # escape to the HTTP handler; transition the job to failed with a fixed safe
+        # marker and never leak the underlying exception text.
         ext_provider = str(job.get("external_provider") or "hermes")
         payload = job.get("payload") or {}
         instance_id = payload.get("agent_instance_id") if isinstance(payload, dict) else None
-        provider = _build_agent_provider(ext_provider, instance_id=str(instance_id) if instance_id else None)
+        try:
+            provider = _build_agent_provider(
+                ext_provider, instance_id=str(instance_id) if instance_id else None
+            )
+        except Exception:
+            transitioned = agent_jobs.fail_job(
+                job_id, _SAFE_PROVIDER_UNAVAILABLE, status=agent_jobs.STATUS_FAILED
+            )
+            if not transitioned:
+                agent_jobs.release_dispatching(job_id, reason=_SAFE_PROVIDER_UNAVAILABLE)
+            results.append(
+                {"job_id": job_id, "action": "failed", "error": _SAFE_PROVIDER_UNAVAILABLE}
+            )
+            continue
 
-        # Poll with exception guard
+        # Poll with exception guard. Never persist/return raw exception text.
+        caught_poll_exception = False
         try:
             poll_result = provider.poll(session_id, user_msg_id, timeout=10)
-        except Exception as e:
-            poll_result = AgentResult(False, "failed", error="poll exception: %r" % (e,),
+        except Exception:
+            caught_poll_exception = True
+            poll_result = AgentResult(False, "failed", error="poll exception",
                                        provider=ext_provider, worker_id="reconciler")
 
-        raw = getattr(poll_result, "raw", None) or None
-        agent_result = raw.get("agent_result") if isinstance(raw, dict) else None
+        # Validate the returned poll result before any attribute use. Malformed
+        # objects, raising property getters, or wrong-typed fields must not
+        # escape to the HTTP handler.
+        maybe_snapshot = _safe_poll_result_snapshot(poll_result)
+        if maybe_snapshot is None:
+            agent_jobs.fail_job(job_id, _SAFE_POLL_ERROR, status=agent_jobs.STATUS_FAILED)
+            results.append({"job_id": job_id, "action": "failed", "error": _SAFE_POLL_ERROR})
+            continue
+        snapshot, original_raw = maybe_snapshot
 
-        # Stage 2 strict AgentResult contract branch
-        if poll_result.ok is True and isinstance(agent_result, dict):
-            if raw:
-                agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
-            action = agent_result.get("action")
-            if action == "reply" and poll_result.status == "done":
-                reply_text = agent_jobs.sanitize_agent_result_text(
-                    agent_result.get("reply_text") or poll_result.reply_text or ""
+        # Use only the validated snapshot from now on; raw is captured separately
+        # so provider-controlled mappings can be read for the contract while
+        # bridge metadata is independently rejected by the exact-dict policy.
+        poll_result = snapshot
+
+        if caught_poll_exception:
+            poll_error_marker = "poll exception"
+            poll_expired_marker = "poll exception"
+        else:
+            poll_error_marker = _SAFE_POLL_ERROR
+            poll_expired_marker = _SAFE_POLL_EXPIRED
+
+        contract_raw: Dict[str, Any] = {}
+        if isinstance(original_raw, dict):
+            try:
+                contract_raw = {k: original_raw[k] for k in original_raw}
+            except Exception:
+                contract_raw = {}
+        agent_result = contract_raw.get("agent_result") if type(contract_raw) is dict else None
+
+        # Stage 2 Phase A: strict AgentResult contract is authoritative for jobs that requested it.
+        strict_contract = bool(payload.get("reliable_result_contract"))
+        if strict_contract:
+            # If the provider produced an agent_result, it must parse successfully.
+            contract = None
+            if agent_result is not None:
+                try:
+                    contract = reliable_pipeline.parse_agent_result(agent_result)
+                except Exception:
+                    agent_jobs.fail_job(job_id, "malformed agent_result contract",
+                                        status=agent_jobs.STATUS_FAILED)
+                    results.append({"job_id": job_id, "action": "failed",
+                                    "reason": "malformed agent_result contract"})
+                    continue
+
+            # Provider not ready yet: keep polling with backoff, do not fail.
+            if poll_result.ok is not True:
+                if deadline and now + 30.0 > deadline:
+                    agent_jobs.mark_expired(job_id, reason=poll_expired_marker)
+                    results.append({"job_id": job_id, "action": "expired", "error": poll_expired_marker})
+                else:
+                    backoff = min(60.0, 5.0 * (2 ** min(attempts, 3)))
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + backoff,
+                                                external_status="error")
+                    results.append({"job_id": job_id, "action": "poll_error",
+                                    "error": poll_error_marker})
+                continue
+
+            # Still running: keep polling.
+            if poll_result.status == "running":
+                if job.get("status") == agent_jobs.STATUS_SUBMITTED:
+                    agent_jobs.mark_agent_running(job_id, next_poll_at=now + 10.0)
+                else:
+                    # Backoff: 10s, 20s, 40s, max 60s
+                    backoff = min(60.0, 10.0 * (2 ** min(attempts, 3)))
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + backoff,
+                                                external_status="running")
+                results.append({"job_id": job_id, "action": "still_running"})
+                continue
+
+            # Terminal success: contract is authoritative; legacy reply_text fallback is rejected.
+            if not reliable_worker._provider_status_terminal_success(poll_result.status):
+                if deadline and now + 30.0 > deadline:
+                    agent_jobs.mark_expired(job_id, reason=poll_expired_marker)
+                    results.append({"job_id": job_id, "action": "expired", "error": poll_expired_marker})
+                else:
+                    backoff = min(60.0, 5.0 * (2 ** min(attempts, 3)))
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + backoff,
+                                                external_status="error")
+                    results.append({"job_id": job_id, "action": "poll_error",
+                                    "error": poll_error_marker})
+                continue
+
+            if contract is None:
+                agent_jobs.fail_job(job_id, "terminal success missing agent_result contract",
+                                    status=agent_jobs.STATUS_FAILED)
+                results.append({"job_id": job_id, "action": "failed",
+                                "reason": "terminal success missing agent_result contract"})
+                continue
+
+            # Apply the validated contract; any terminal success status may carry it.
+            if contract.action == "reply":
+                reply_text = agent_worker.sanitize_reply_text(
+                    contract.reply_text, payload, reg.load_config()
                 )
                 if not reply_text:
                     agent_jobs.fail_job(job_id, "empty reply_text in strict reply contract",
                                         status=agent_jobs.STATUS_FAILED)
-                    agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
-                                                external_status="failed")
                     results.append({"job_id": job_id, "action": "failed",
                                     "reason": "empty reply_text in strict reply contract"})
                 else:
                     ok = agent_jobs.complete_job(job_id, reply_text)
                     if ok:
+                        # Persist only safe bridge metadata on terminal success.
+                        bridge_patch = agent_jobs._safe_bridge_patch(original_raw)
+                        if bridge_patch:
+                            agent_jobs.merge_payload(job_id, bridge_patch)
                         agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
                                                     external_status="done")
                         results.append({"job_id": job_id, "action": "completed",
@@ -1532,25 +1844,47 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
                     else:
                         results.append({"job_id": job_id, "action": "complete_failed"})
                 continue
-            elif action in ("silent", "escalate") and poll_result.status in ("silent", "escalated"):
-                ok = agent_jobs.complete_job(job_id, "")
+            elif contract.action == "silent":
+                ok = agent_jobs.complete_job_silent(job_id, reason="silent")
                 if ok:
-                    agent_jobs.mark_send_skipped(job_id, reason=action)
+                    # Persist only safe bridge metadata on terminal success.
+                    bridge_patch = agent_jobs._safe_bridge_patch(original_raw)
+                    if bridge_patch:
+                        agent_jobs.merge_payload(job_id, bridge_patch)
                     agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
-                                                external_status=action)
-                    results.append({"job_id": job_id, "action": action})
+                                                external_status="silent")
+                    results.append({"job_id": job_id, "action": "silent"})
                 else:
                     results.append({"job_id": job_id, "action": "complete_failed"})
                 continue
-            # Mismatched action/status in strict contract falls through to legacy/error handling.
+            elif contract.action == "escalate":
+                ok = agent_jobs.complete_job_silent(job_id, reason="escalate")
+                if ok:
+                    # Persist only safe bridge metadata on terminal success.
+                    bridge_patch = agent_jobs._safe_bridge_patch(original_raw)
+                    if bridge_patch:
+                        agent_jobs.merge_payload(job_id, bridge_patch)
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
+                                                external_status="escalate")
+                    results.append({"job_id": job_id, "action": "escalate"})
+                else:
+                    results.append({"job_id": job_id, "action": "complete_failed"})
+                continue
+            else:
+                # Defensive: parse_agent_result should only return known actions.
+                agent_jobs.fail_job(job_id, "unknown agent_result action",
+                                    status=agent_jobs.STATUS_FAILED)
+                results.append({"job_id": job_id, "action": "failed",
+                                "reason": "unknown agent_result action"})
+                continue
 
+        # Legacy path for jobs that did not request the strict contract.
+        # Snapshot carries raw=None so we never persist provider-controlled raw
+        # output here; this is intentional and prevents raw secret leaks.
         if poll_result.ok and poll_result.reply_text:
             reply_text = agent_worker.sanitize_reply_text(
-                poll_result.reply_text, job.get("payload"), reg.load_config()
+                poll_result.reply_text, payload, reg.load_config()
             )
-            raw = getattr(poll_result, "raw", None) or None
-            if raw:
-                agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
             if not reply_text:
                 agent_jobs.fail_job(job_id, "empty after sanitize",
                                     status=agent_jobs.STATUS_FAILED)
@@ -1577,19 +1911,17 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
                                             external_status="running")
             results.append({"job_id": job_id, "action": "still_running"})
         else:
-            if raw:
-                agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
             if deadline and now + 30.0 > deadline:
-                agent_jobs.mark_expired(job_id, reason=str(poll_result.error or "poll failed"))
+                agent_jobs.mark_expired(job_id, reason=poll_expired_marker)
                 results.append({"job_id": job_id, "action": "expired",
-                                "error": poll_result.error})
+                                "error": poll_expired_marker})
             else:
                 # Backoff: 5s, 10s, 20s, max 60s
                 backoff = min(60.0, 5.0 * (2 ** min(attempts, 3)))
                 agent_jobs.update_poll_state(job_id, next_poll_at=now + backoff,
                                             external_status="error")
                 results.append({"job_id": job_id, "action": "poll_error",
-                                "error": poll_result.error})
+                                "error": poll_error_marker})
 
     return {"ok": True, "action": "polled", "polled": len(results),
             "results": results, "duration": round(time.time() - t0, 3)}

@@ -44,12 +44,6 @@ DEFAULT_RETRY_BASE_SECONDS = 5.0
 RELIABLE_RESULT_CONTRACT_FLAG = "reliable_result_contract"
 TEST_TARGET_ONLY_NAME = "bot群聊测试"
 TARGET_NOT_CONFIGURED_REASON = "target not configured"
-# Provider names that the worker treats as test-only; the reply_text
-# JSON-contract fallback is enabled only for these (or when the caller
-# explicitly opts in via ``config['reliable_pipeline']
-# ['test_provider_compat']``).  Production providers such as ``hermes``
-# must always deliver the contract through ``raw['agent_result']``.
-TEST_PROVIDER_NAMES = frozenset({"echo", "mock", "test"})
 # Statuses that represent a successful terminal run.  Only when the
 # provider reports one of these (in addition to ``ok=True`` and a valid
 # ``AgentResult``) may the worker apply the contract.  Anything else
@@ -287,34 +281,6 @@ def _resolve_test_target_only(config: Optional[Dict[str, Any]]) -> bool:
     return bool(_safe_get(section, "test_target_only", False))
 
 
-def _resolve_test_provider_compat(config: Optional[Dict[str, Any]],
-                                  provider: Any = None) -> bool:
-    """Decide whether the ``reply_text`` JSON-contract fallback is allowed.
-
-    The fallback exists only for test/development providers.  Production
-    providers (``hermes`` and any other name not in ``TEST_PROVIDER_NAMES``)
-    must deliver the contract through ``raw['agent_result']``; a JSON
-    document in display text is never trusted, because that channel was
-    not designed to carry the strict versioned ``AgentResult`` and a
-    misbehaving model could otherwise route a contract through display
-    text and bypass the intended channel.
-
-    The fallback is enabled when ANY of:
-      * the caller's config sets ``reliable_pipeline.test_provider_compat=True``;
-      * the provider exposes a ``name`` attribute in ``TEST_PROVIDER_NAMES``.
-
-    The caller is responsible for passing the right config; this helper
-    does not consult any on-disk state.
-    """
-    section = _safe_get(config or {}, "reliable_pipeline", {}) or {}
-    if _safe_get(section, "test_provider_compat", False):
-        return True
-    name = getattr(provider, "name", None)
-    if isinstance(name, str) and name.strip().lower() in TEST_PROVIDER_NAMES:
-        return True
-    return False
-
-
 def _resolve_max_send_attempts(config: Optional[Dict[str, Any]], default: int = DEFAULT_MAX_SEND_ATTEMPTS) -> int:
     section = _safe_get(config or {}, "reliable_pipeline", {}) or {}
     raw = _safe_get(section, "max_send_attempts", default)
@@ -438,34 +404,21 @@ def _looks_like_agent_result(value: Any) -> bool:
     return True
 
 
-def _resolve_contract_payload(result: Any, *, allow_reply_text_fallback: bool) -> Optional[Any]:
+def _resolve_contract_payload(result: Any) -> Optional[Any]:
     """Return the raw contract value embedded in a provider result, if any.
 
-    Production providers must deliver the contract through
-    ``result.raw['agent_result']``.  A test/development provider
-    (provider name in ``TEST_PROVIDER_NAMES`` or
-    ``config['reliable_pipeline']['test_provider_compat']=True``) is
-    allowed to put a complete JSON contract string into
-    ``result.reply_text``; that fallback is disabled for any other
-    provider so display text cannot route a contract through the wrong
-    channel.
+    The worker only accepts the strict wire contract carried inside
+    ``result.raw['agent_result']``.  Display text (``result.reply_text``)
+    is never trusted as a contract channel, even for test providers or
+    legacy callers, so a misbehaving model cannot route a contract
+    through the wrong channel.
     """
     raw = getattr(result, "raw", None)
     if isinstance(raw, dict):
         candidate = raw.get("agent_result")
         if candidate is not None:
             return candidate
-    if not allow_reply_text_fallback:
-        return None
-    reply_text = getattr(result, "reply_text", None)
-    if reply_text is None:
-        return None
-    if not isinstance(reply_text, str):
-        return None
-    text = reply_text.strip()
-    if not text:
-        return None
-    return text
+    return None
 
 
 def _validate_contract(value: Any) -> Optional[pipeline.AgentResultContract]:
@@ -557,7 +510,6 @@ def process_once(
     lease_seconds: float = DEFAULT_LEASE_SECONDS,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
     timeout: Optional[float] = None,
-    test_provider_compat: Optional[bool] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Claim one durable turn job, run the provider, and apply its contract.
@@ -576,14 +528,6 @@ def process_once(
     boxes, ANSI, JSON-looking tool output, ``AgentResult`` violations,
     or any exception) fails the durable job without creating an outbox
     so a leaked provider stdout can never reach the sender.
-
-    The ``test_provider_compat`` argument (or the equivalent
-    ``config['reliable_pipeline']['test_provider_compat']`` flag, or a
-    provider whose ``name`` is in ``TEST_PROVIDER_NAMES``) enables the
-    ``reply_text`` JSON-contract fallback for test/development runs.
-    Production providers must deliver the contract through
-    ``raw['agent_result']``; display text is never trusted as a
-    contract channel for any other provider.
     """
     if not callable(final_filter):
         raise FinalFilterRequired("process_once requires a callable final_filter")
@@ -649,7 +593,7 @@ def process_once(
         result = effective_provider.run(provider_job, timeout=timeout)
     except Exception as exc:  # provider raised; transition job to failed
         logger.warning("provider run raised for job=%s: %s", job_id, exc)
-        pipeline.fail_job(job_id=job_id, error="provider raised: %r" % (exc,),
+        pipeline.fail_job(job_id=job_id, error="provider run failed",
                           retryable=False, db_path=db, now=ts)
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
@@ -670,9 +614,9 @@ def process_once(
         # ``error``, ``timeout``, ``cancelled``, ``no_reply``, ...) is
         # a non-retryable failure.  The provider did not produce a
         # usable document; ``fail_job`` without retry keeps the lease
-        # free and the job in a terminal state.
-        reason = "provider reported failure: %s" % (getattr(result, "error", "") or provider_status or "ok=false")
-        pipeline.fail_job(job_id=job_id, error=reason[:500],
+        # free and the job in a terminal state.  Never echo the provider's
+        # error attribute; it may contain filesystem paths or secrets.
+        pipeline.fail_job(job_id=job_id, error="provider result failed",
                           retryable=False, db_path=db, now=ts)
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
@@ -693,28 +637,18 @@ def process_once(
         )
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
-    # Resolve the test-provider compat opt-in.  An explicit
-    # ``test_provider_compat`` argument wins; otherwise the gate falls
-    # back to the config flag / provider name test.
-    if test_provider_compat is None:
-        allow_fallback = _resolve_test_provider_compat(config, effective_provider)
-    else:
-        allow_fallback = bool(test_provider_compat)
-
-    contract_value = _resolve_contract_payload(result, allow_reply_text_fallback=allow_fallback)
+    contract_value = _resolve_contract_payload(result)
     contract = _validate_contract(contract_value)
     if contract is None:
         # Provider produced something that is not the strict wire contract;
         # plain text, box frames, ANSI, JSON-looking tool output, etc. all
-        # land here.  No outbox may be created from this state.
-        snippet = ""
-        try:
-            snippet = (getattr(result, "reply_text", "") or "")[:120]
-        except Exception:
-            snippet = ""
+        # land here.  No outbox may be created from this state.  The
+        # persisted/returned reason is a fixed safe marker — never provider
+        # body text such as reply_text or raw stdout, which could contain
+        # user content or secrets.
         pipeline.fail_job(
             job_id=job_id,
-            error="provider result is not an AgentResult contract: %s" % snippet,
+            error="invalid agent result contract",
             retryable=False,
             db_path=db,
             now=ts,
@@ -878,7 +812,6 @@ __all__ = [
     "RELIABLE_RESULT_CONTRACT_FLAG",
     "TEST_TARGET_ONLY_NAME",
     "TARGET_NOT_CONFIGURED_REASON",
-    "TEST_PROVIDER_NAMES",
     "ReliableWorkerError",
     "FinalFilterRequired",
     "TestModeTargetRejected",

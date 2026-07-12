@@ -55,6 +55,30 @@ VALID_STATUSES = {
     STATUS_CANCELLED,
 }
 
+
+def _safe_bridge_patch(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract and normalize only bridge metadata that may be persisted.
+
+    Accepts only base ``str`` for ``bridge_session_id`` (non-empty) and base
+    ``int`` (non-bool) for ``bridge_user_msg_id`` so provider-controlled raw
+    dicts cannot inject arbitrary objects or coerce types on terminal success.
+
+    ``type(raw) is dict`` is intentional: ``isinstance`` would accept a
+    provider-controlled dict subclass whose ``get``/``__getitem__`` could
+    raise or execute side effects.  Plain dicts are safe to inspect.
+    """
+    if type(raw) is not dict:
+        return {}
+    bridge_patch: Dict[str, Any] = {}
+    session_id = raw.get("bridge_session_id")
+    if type(session_id) is str and session_id:
+        bridge_patch["bridge_session_id"] = session_id
+    user_msg_id = raw.get("bridge_user_msg_id")
+    if type(user_msg_id) is int:
+        bridge_patch["bridge_user_msg_id"] = user_msg_id
+    return bridge_patch
+
+
 _WRITE_LOCK = threading.Lock()
 
 
@@ -430,10 +454,31 @@ def complete_job(job_id: int, result_text: str, *, db_path: Optional[Path] = Non
         return cur.rowcount == 1
 
 
+def complete_job_silent(job_id: int, *, reason: str = "no_reply_action", db_path: Optional[Path] = None) -> bool:
+    """Atomically complete a job that chose not to reply (silent/escalate).
+
+    Sets status=sent and send_status=skipped in a single UPDATE so the async
+    sender never sees a done/pending window. Guarded on the active in-flight
+    states (running/submitted/agent_running). Returns True when the row was
+    transitioned.
+    """
+    with _WRITE_LOCK, _connect(db_path) as con:
+        cur = con.execute(
+            """
+            UPDATE agent_jobs
+            SET status=?, result_text=?, send_status=?, error=?, finished_at=?, sent_at=?
+            WHERE id=? AND status IN (?, ?, ?)
+            """,
+            (STATUS_SENT, "", SEND_SKIPPED, str(reason or "")[:500], _now(), _now(),
+             int(job_id), STATUS_RUNNING, STATUS_SUBMITTED, STATUS_AGENT_RUNNING),
+        )
+        return cur.rowcount == 1
+
 def merge_payload(job_id: int, patch: Dict[str, Any], *, db_path: Optional[Path] = None) -> bool:
     """Merge metadata into a job payload without disturbing user/task fields."""
     if not isinstance(patch, dict) or not patch:
         return False
+
     with _WRITE_LOCK, _connect(db_path) as con:
         row = con.execute("SELECT payload_json FROM agent_jobs WHERE id=?", (int(job_id),)).fetchone()
         if not row:
@@ -531,27 +576,6 @@ def mark_send_failed(job_id: int, error: str, *, db_path: Optional[Path] = None)
         cur = con.execute(
             "UPDATE agent_jobs SET status=?, send_status=?, error=?, finished_at=COALESCE(finished_at, ?) WHERE id=?",
             (STATUS_FAILED, SEND_FAILED, str(error or "")[:500], _now(), int(job_id)),
-        )
-        return cur.rowcount == 1
-
-
-def mark_send_skipped(job_id: int, *, reason: str = "no_reply_action", db_path: Optional[Path] = None) -> bool:
-    """Mark a successfully completed job whose agent decided not to reply as terminal.
-
-    Applies to strict silent/escalate actions: no actual message is sent, but the
-    job should not be retried or displayed as pending send. Caller must ensure the
-    job was already completed (status=done) before invoking this helper.
-    """
-    with _WRITE_LOCK, _connect(db_path) as con:
-        cur = con.execute(
-            """
-            UPDATE agent_jobs
-            SET status=?, send_status=?, sent_at=?, error=COALESCE(error, ?), finished_at=COALESCE(finished_at, ?)
-            WHERE id=? AND status=?
-            """,
-            (
-                STATUS_SENT, SEND_SKIPPED, _now(), str(reason or "")[:500], _now(), int(job_id), STATUS_DONE,
-            ),
         )
         return cur.rowcount == 1
 

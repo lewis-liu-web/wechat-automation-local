@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -26,6 +27,7 @@ except Exception:
 import agent_jobs as jobs  # noqa: E402
 from agent_provider import (  # noqa: E402
     AgentProvider,
+    AgentResult,
     EchoAgentProvider,
     HermesProvider,
     provider_from_config,
@@ -38,10 +40,76 @@ except Exception:
     _HAS_SENDER = False
 
 from reply_engine import sanitize_reply_text  # noqa: E402
+from reliable_pipeline import parse_agent_result  # noqa: E402
+import reliable_worker  # noqa: E402
 
 DEFAULT_CONFIG_PATH = ROOT / "wechat_bot_targets.json"
 DEFAULT_STOP_FILE = ROOT / "agent_worker.stop"
 DEFAULT_STATE_FILE = ROOT / "temp" / "agent_worker_state.json"
+
+# Stage 2 Phase A: fixed safe marker used when a provider returns a result that
+# is not a valid AgentResult shape.  Never echo the underlying object.
+_SAFE_AGENT_RESULT_SHAPE = "invalid agent result shape"
+
+
+def _safe_agent_result_snapshot(value: Any) -> Tuple[Optional[AgentResult], Any]:
+    """Validate scalar fields and return safe scalars plus the original raw.
+
+    Reads every subsequently used field once inside a single exception guard.
+    ``raw`` is captured separately so a raising or provider-controlled raw
+    accessor cannot make an otherwise valid result fail.  The caller passes the
+    returned ``raw`` to ``_safe_bridge_patch`` and uses it for contract parsing.
+    """
+    try:
+        ok = value.ok
+        status = value.status
+        provider = value.provider
+        worker_id = value.worker_id
+        latency = value.latency
+        reply_text = getattr(value, "reply_text", "")
+        error = getattr(value, "error", "")
+    except Exception:
+        return None, None
+
+    if type(ok) is not bool:
+        return None, None
+    if type(status) is not str:
+        return None, None
+    if type(provider) is not str:
+        return None, None
+    if type(worker_id) is not str:
+        return None, None
+    if type(latency) not in (int, float):
+        return None, None
+    if type(reply_text) is not str:
+        if reply_text is None:
+            reply_text = ""
+        else:
+            return None, None
+    if type(error) is not str:
+        if error is None:
+            error = ""
+        else:
+            return None, None
+
+    try:
+        raw = getattr(value, "raw", None)
+    except Exception:
+        raw = None
+
+    return AgentResult(
+        ok=ok,
+        status=status,
+        provider=provider,
+        worker_id=worker_id,
+        latency=float(latency),
+        raw=None,
+        reply_text=reply_text,
+        error=error,
+    ), raw
+
+
+_WRITE_LOCK = threading.Lock()
 
 
 def _write_state(path: Optional[Path], payload: Dict[str, Any]) -> None:
@@ -187,46 +255,142 @@ def process_once(*,
     if not isinstance(job.get("payload"), dict):
         job["payload"] = {}
     job["payload"]["reliable_result_contract"] = True
-
-    result = provider.run(job, timeout=timeout_seconds)
-    raw = result.raw or {}
-    bridge_patch = {key: raw.get(key) for key in ("bridge_session_id", "bridge_user_msg_id") if raw.get(key)}
-    if bridge_patch:
-        jobs.merge_payload(int(job["id"]), bridge_patch, db_path=db_path)
-    contract_action = raw.get("agent_result", {}).get("action") if isinstance(raw.get("agent_result"), dict) else None
-    is_no_reply_action = contract_action in ("silent", "escalate")
-    if result.ok and (result.reply_text or is_no_reply_action):
-        # Main feature: sanitize the reply text on every send path and honor ``max_reply_chars``.
-        cfg = _load_config(config_path or DEFAULT_CONFIG_PATH) or {}
-        sanitized_text = sanitize_reply_text(result.reply_text, job.get("payload"), cfg)
-        completed = jobs.complete_job(int(job["id"]), sanitized_text, db_path=db_path)
-        # M3: Send result back to WeChat if enabled
-        send_status = {"sent": False, "reason": "send_disabled"}
-        skipped = False
-        if send_enabled and _HAS_SENDER and result.reply_text and not is_no_reply_action:
-            send_status = _send_result_back(job, sanitized_text, config_path or DEFAULT_CONFIG_PATH)
-            if send_status.get("sent"):
-                jobs.mark_sent(int(job["id"]), db_path=db_path)
-            else:
-                jobs.mark_send_failed(int(job["id"]), send_status.get("reason", "send failed"), db_path=db_path)
-        elif is_no_reply_action and completed:
-            skipped = jobs.mark_send_skipped(int(job["id"]), reason=contract_action, db_path=db_path)
-            send_status = {"sent": False, "reason": contract_action}
+    job_id = int(job["id"])
+    if not jobs.merge_payload(job_id, {"reliable_result_contract": True}, db_path=db_path):
+        persistence_error = "failed to persist strict contract flag"
+        failed = jobs.fail_job(job_id, persistence_error,
+                               status=jobs.STATUS_FAILED, db_path=db_path)
         return {
-            "ok": completed and (skipped if is_no_reply_action else True),
-            "action": "silent" if contract_action == "silent" else ("escalated" if contract_action == "escalate" else "completed"),
+            "ok": failed,
+            "action": "persistence_failed",
             "job_id": job["id"],
             "job_key": job["job_key"],
-            "provider": result.provider,
-            "worker_id": result.worker_id or worker_id,
-            "latency": round(result.latency, 3),
-            "reply_preview": sanitized_text[:120],
-            "send_status": send_status,
+            "provider": provider_name,
+            "worker_id": worker_id,
+            "latency": 0.0,
+            "error": persistence_error,
             "timed_out": timed_out,
         }
 
+    try:
+        result, original_raw = _safe_agent_result_snapshot(provider.run(job, timeout=timeout_seconds))
+    except Exception:
+        _safe_provider_error = "provider run failed"
+        failed = jobs.fail_job(int(job["id"]), _safe_provider_error,
+                               status=jobs.STATUS_FAILED, db_path=db_path)
+        return {
+            "ok": failed,
+            "action": jobs.STATUS_FAILED,
+            "job_id": job["id"],
+            "job_key": job["job_key"],
+            "provider": provider_name,
+            "worker_id": worker_id,
+            "latency": 0.0,
+            "error": _safe_provider_error,
+            "timed_out": timed_out,
+        }
+
+    if result is None:
+        failed = jobs.fail_job(int(job["id"]), _SAFE_AGENT_RESULT_SHAPE,
+                               status=jobs.STATUS_FAILED, db_path=db_path)
+        return {
+            "ok": failed,
+            "action": jobs.STATUS_FAILED,
+            "job_id": job["id"],
+            "job_key": job["job_key"],
+            "provider": provider_name,
+            "worker_id": worker_id,
+            "latency": 0.0,
+            "error": _SAFE_AGENT_RESULT_SHAPE,
+            "timed_out": timed_out,
+        }
+
+    bridge_patch = jobs._safe_bridge_patch(original_raw)
+    if bridge_patch:
+        jobs.merge_payload(int(job["id"]), bridge_patch, db_path=db_path)
+
+    # Stage 2 Phase A: strict AgentResult contract is the only source of truth.
+    # Display text, legacy reply_text, and malformed raw['agent_result'] are rejected.
+    contract = None
+    contract_raw: Dict[str, Any] = {}
+    if isinstance(original_raw, dict):
+        try:
+            contract_raw = {k: original_raw[k] for k in original_raw}
+        except Exception:
+            contract_raw = {}
+    agent_result = contract_raw.get("agent_result") if type(contract_raw) is dict else None
+    if agent_result is not None:
+        try:
+            contract = parse_agent_result(agent_result)
+        except Exception:
+            contract = None
+
+    if result.ok is True and reliable_worker._provider_status_terminal_success(result.status) and contract is not None:
+        cfg = _load_config(config_path or DEFAULT_CONFIG_PATH) or {}
+        if contract.action == "reply":
+            sanitized_text = sanitize_reply_text(contract.reply_text, job.get("payload"), cfg)
+            if not sanitized_text:
+                failed = jobs.fail_job(int(job["id"]), "empty reply_text after sanitize",
+                                       status=jobs.STATUS_FAILED, db_path=db_path)
+                return {
+                    "ok": failed,
+                    "action": jobs.STATUS_FAILED,
+                    "job_id": job["id"],
+                    "job_key": job["job_key"],
+                    "provider": result.provider,
+                    "worker_id": result.worker_id or worker_id,
+                    "latency": round(result.latency, 3),
+                    "error": "empty reply_text after sanitize",
+                    "timed_out": timed_out,
+                }
+            completed = jobs.complete_job(int(job["id"]), sanitized_text, db_path=db_path)
+            send_status = {"sent": False, "reason": "send_disabled"}
+            if send_enabled and _HAS_SENDER and sanitized_text:
+                send_status = _send_result_back(job, sanitized_text, config_path or DEFAULT_CONFIG_PATH)
+                if send_status.get("sent"):
+                    jobs.mark_sent(int(job["id"]), db_path=db_path)
+                else:
+                    jobs.mark_send_failed(int(job["id"]), send_status.get("reason", "send failed"), db_path=db_path)
+            return {
+                "ok": completed,
+                "action": "completed",
+                "job_id": job["id"],
+                "job_key": job["job_key"],
+                "provider": result.provider,
+                "worker_id": result.worker_id or worker_id,
+                "latency": round(result.latency, 3),
+                "reply_preview": sanitized_text[:120],
+                "send_status": send_status,
+                "timed_out": timed_out,
+            }
+        else:  # silent or escalate
+            completed = jobs.complete_job_silent(int(job["id"]), reason=contract.action, db_path=db_path)
+            return {
+                "ok": completed,
+                "action": "silent" if contract.action == "silent" else "escalated",
+                "job_id": job["id"],
+                "job_key": job["job_key"],
+                "provider": result.provider,
+                "worker_id": result.worker_id or worker_id,
+                "latency": round(result.latency, 3),
+                "reply_preview": "",
+                "send_status": {"sent": False, "reason": contract.action},
+                "timed_out": timed_out,
+            }
+
     status = jobs.STATUS_TIMEOUT if result.status == "timeout" else jobs.STATUS_FAILED
-    failed = jobs.fail_job(int(job["id"]), result.error or result.status or "provider failed",
+    # Stage 2 Phase A: never echo provider-returned error text in the returned
+    # dict or in the persisted job failure reason; it may contain paths/secrets.
+    if result.status == "timeout":
+        reason = "provider result timed out"
+        safe_error = "provider result timed out"
+    elif result.ok is True and reliable_worker._provider_status_terminal_success(result.status) and contract is None:
+        reason = "invalid or missing AgentResult contract"
+        safe_error = "invalid agent result contract"
+    else:
+        reason = "provider result failed"
+        safe_error = "provider result failed"
+    failed = jobs.fail_job(int(job["id"]), reason,
                            status=status, db_path=db_path)
     return {
         "ok": failed,
@@ -236,7 +400,7 @@ def process_once(*,
         "provider": result.provider or provider_name,
         "worker_id": result.worker_id or worker_id,
         "latency": round(result.latency, 3),
-        "error": result.error,
+        "error": safe_error,
         "timed_out": timed_out,
     }
 

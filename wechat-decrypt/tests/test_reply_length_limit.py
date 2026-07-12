@@ -337,7 +337,13 @@ def test_agent_worker_process_once_sanitizes_reply_before_complete_and_send(monk
         status = "done"
         error = None
         latency = 0.1
-        raw = {}
+        raw = {"agent_result": {
+            "schema_version": 1,
+            "action": "reply",
+            "reply_text": long_reply,
+            "reason_code": "answered",
+            "risk_level": "low",
+        }}
     class _Provider:
         def run(self, job, timeout=None):
             return _Result()
@@ -411,7 +417,13 @@ def test_agent_worker_process_once_preserves_full_text_when_cap_is_high(monkeypa
         status = "done"
         error = None
         latency = 0.1
-        raw = {}
+        raw = {"agent_result": {
+            "schema_version": 1,
+            "action": "reply",
+            "reply_text": long_reply,
+            "reason_code": "answered",
+            "risk_level": "low",
+        }}
     class _Provider:
         def run(self, job, timeout=None):
             return _Result()

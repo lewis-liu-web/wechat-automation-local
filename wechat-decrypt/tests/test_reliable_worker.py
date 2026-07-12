@@ -4,7 +4,7 @@ These tests are entirely mock-driven: no real provider, no real WeChat
 sender, no real target registry side effects.  They drive the worker
 through ``reliable_pipeline`` against a temp SQLite database and assert
 on the durable effects (job status, outbox rows, retry/dead-letter,
-test-mode gate, hard target precondition, test-provider compat gate).
+test-mode gate, hard target precondition, strict contract parsing).
 """
 import sys
 import tempfile
@@ -240,12 +240,14 @@ def test_process_once_provider_ok_false_fails_job_with_no_outbox():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "pipeline.sqlite"
         _seed_turn(db)
-        provider = FakeProvider(result=_agent_result(ok=False, status="error", error="boom"))
+        provider = FakeProvider(result=_agent_result(ok=False, status="error", error="/secret/path: SECRET_TOKEN"))
         out = worker.process_once(provider, "worker", {},
                                   final_filter=_pass_filter, db_path=db, now=10.0)
         assert out["status"] == "failed"
         assert out["outbox"] is None
         assert out["job"]["status"] == pipeline.JOB_FAILED
+        assert "SECRET_TOKEN" not in (out["job"]["error"] or "")
+        assert "/secret/path" not in (out["job"]["error"] or "")
         assert pipeline.counts(db_path=db).get("send_outbox", {}) == {}
 
 
@@ -298,12 +300,15 @@ def test_process_once_provider_exception_fails_job_and_releases_lease():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "pipeline.sqlite"
         _seed_turn(db)
-        provider = FakeProvider(raises=RuntimeError("kaboom"))
+        provider = FakeProvider(raises=RuntimeError("/secret/path: SECRET_TOKEN leaked"))
         out = worker.process_once(provider, "worker", {},
                                   final_filter=_pass_filter, db_path=db, now=10.0)
         assert out["status"] == "failed"
         assert out["outbox"] is None
         assert out["job"]["status"] == pipeline.JOB_FAILED
+        assert "SECRET_TOKEN" not in (out["job"]["error"] or "")
+        assert "/secret/path" not in (out["job"]["error"] or "")
+        assert out["job"]["error"] == "provider run failed"
         # The lease must be released so a new worker can re-claim.
         with pipeline._connect(db) as con:  # type: ignore[attr-defined]
             row = con.execute("SELECT lease_owner FROM turn_jobs").fetchone()
@@ -335,6 +340,30 @@ def test_process_once_non_agent_result_wrong_types_fails_job():
         assert out["status"] == "failed"
         assert out["outbox"] is None
         assert out["job"]["status"] == pipeline.JOB_FAILED
+
+
+def test_process_once_invalid_contract_does_not_leak_provider_reply_text():
+    """A malformed provider body with a secret must not appear in the failure."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        secret = "C:/private/path SECRET_TOKEN"
+        bad = SimpleNamespace(ok=True, status="done", reply_text=secret, raw=None)
+        provider = FakeProvider(result=bad)
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert out["outbox"] is None
+        assert out["job"]["status"] == pipeline.JOB_FAILED
+        assert secret not in str(out)
+        # Persisted error must be the fixed safe marker, never the secret.
+        with pipeline._connect(db) as con:  # type: ignore[attr-defined]
+            row = con.execute("SELECT * FROM turn_jobs WHERE id=?", (int(out["job"]["id"]),)).fetchone()
+        item = pipeline._row(row)
+        assert item is not None
+        assert secret not in (item.get("error") or "")
+        assert secret not in (item.get("result_json") or "")
+        assert "invalid agent result contract" in (item.get("error") or "")
 
 
 def test_process_once_factory_receives_bound_instance_id():
@@ -486,62 +515,78 @@ def test_process_once_ok_true_with_completed_status_and_valid_contract_succeeds(
         assert out["outbox"]["status"] == pipeline.OUTBOX_PENDING
 
 
-# --- test_provider_compat: reply_text JSON fallback is gated ----------------
+# --- reply_text JSON contract fallback is always rejected ---------------
 
-def test_process_once_test_provider_compat_accepts_contract_in_reply_text():
-    """When the provider is in the test set (name='echo'), the worker
-    accepts a complete JSON contract string in ``reply_text`` as a
-    compatibility channel.
+def test_process_once_test_provider_name_ignores_reply_text_and_accepts_raw_agent_result():
+    """A provider whose name used to trigger the reply_text fallback (e.g.
+    ``name='echo'``) must now be treated like any production provider:
+    a JSON contract in ``reply_text`` is rejected, but a proper contract
+    in ``raw['agent_result']`` is still accepted.
     """
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "pipeline.sqlite"
         _seed_turn(db)
         contract_text = '{"schema_version": 1, "action": "reply", "reply_text": "compat reply", "reason_code": "x", "risk_level": "low"}'
-        provider = FakeProvider(
+
+        # 1. JSON in reply_text with no raw contract is rejected.
+        provider_no_raw = FakeProvider(
             result=_agent_result(ok=True, status="done", reply_text=contract_text, raw=None),
             name="echo",
         )
-        out = worker.process_once(provider, "worker", {},
+        out = worker.process_once(provider_no_raw, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert out["outbox"] is None
+        assert out["job"]["status"] == pipeline.JOB_FAILED
+
+        # 2. Proper raw['agent_result'] contract is accepted regardless of provider name.
+        _seed_turn(db, last_local_id=2)  # create a fresh job
+        contract = _contract_dict("reply", "raw contract reply", "ok", "low")
+        provider_raw = FakeProvider(
+            result=_agent_result(ok=True, status="done", reply_text="unused",
+                                 raw={"agent_result": contract}),
+            name="echo",
+        )
+        out = worker.process_once(provider_raw, "worker", {},
                                   final_filter=_pass_filter, db_path=db, now=10.0)
         assert out["status"] == "applied"
-        assert out["outbox"]["reply_text"] == "compat reply"
+        assert out["outbox"]["reply_text"] == "raw contract reply"
 
 
-def test_process_once_test_provider_compat_via_config_flag():
-    """Setting ``config['reliable_pipeline']['test_provider_compat']=True``
-    enables the fallback even when the provider name is not in the
-    test set.
+def test_process_once_test_provider_config_flag_ignores_reply_text_and_accepts_raw_agent_result():
+    """A legacy ``config['reliable_pipeline']['test_provider_compat']=True``
+    flag must be ignored: reply_text JSON is always rejected, but a proper
+    ``raw['agent_result']`` contract still succeeds.
     """
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "pipeline.sqlite"
         _seed_turn(db)
         contract_text = '{"schema_version": 1, "action": "reply", "reply_text": "via cfg", "reason_code": "x", "risk_level": "low"}'
-        provider = FakeProvider(
+        cfg = {"reliable_pipeline": {"test_provider_compat": True}}
+
+        # 1. JSON in reply_text with no raw contract is rejected.
+        provider_no_raw = FakeProvider(
             result=_agent_result(ok=True, status="done", reply_text=contract_text, raw=None),
             name="hermes",
         )
-        cfg = {"reliable_pipeline": {"test_provider_compat": True}}
-        out = worker.process_once(provider, "worker", cfg,
+        out = worker.process_once(provider_no_raw, "worker", cfg,
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert out["outbox"] is None
+        assert out["job"]["status"] == pipeline.JOB_FAILED
+
+        # 2. Proper raw['agent_result'] contract is accepted regardless of the flag.
+        _seed_turn(db, last_local_id=2)  # create a fresh job
+        contract = _contract_dict("reply", "raw contract reply", "ok", "low")
+        provider_raw = FakeProvider(
+            result=_agent_result(ok=True, status="done", reply_text="unused",
+                                 raw={"agent_result": contract}),
+            name="hermes",
+        )
+        out = worker.process_once(provider_raw, "worker", cfg,
                                   final_filter=_pass_filter, db_path=db, now=10.0)
         assert out["status"] == "applied"
-        assert out["outbox"]["reply_text"] == "via cfg"
-
-
-def test_process_once_test_provider_compat_via_explicit_kwarg():
-    """The explicit ``test_provider_compat`` argument wins over the gate."""
-    with tempfile.TemporaryDirectory() as tmp:
-        db = Path(tmp) / "pipeline.sqlite"
-        _seed_turn(db)
-        contract_text = '{"schema_version": 1, "action": "reply", "reply_text": "explicit", "reason_code": "x", "risk_level": "low"}'
-        provider = FakeProvider(
-            result=_agent_result(ok=True, status="done", reply_text=contract_text, raw=None),
-            name="hermes",
-        )
-        out = worker.process_once(provider, "worker", {},
-                                  final_filter=_pass_filter, db_path=db,
-                                  test_provider_compat=True, now=10.0)
-        assert out["status"] == "applied"
-        assert out["outbox"]["reply_text"] == "explicit"
+        assert out["outbox"]["reply_text"] == "raw contract reply"
 
 
 def test_process_once_production_provider_rejects_contract_in_reply_text():
@@ -570,8 +615,8 @@ def test_process_once_production_provider_rejects_contract_in_reply_text():
 
 
 def test_process_once_unknown_provider_name_rejects_contract_in_reply_text():
-    """A provider whose name is not in ``TEST_PROVIDER_NAMES`` and not
-    set via the config flag must also reject display-text contracts.
+    """Arbitrary provider names must also reject display-text contracts;
+    the contract must travel through ``raw['agent_result']``.
     """
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "pipeline.sqlite"
@@ -601,9 +646,7 @@ def test_process_once_provider_without_name_attribute_rejects_reply_text():
             result=_agent_result(ok=True, status="done",
                                 reply_text=contract_text, raw=None),
         )
-        # Defang the name so the gate doesn't accidentally match the
-        # test set; default FakeProvider.name is "mock" which IS in the
-        # test set, so rename to something neutral.
+        # Defang the default FakeProvider name so the test is neutral.
         provider.name = "production-ish"
         out = worker.process_once(provider, "worker", {},
                                   final_filter=_pass_filter, db_path=db, now=10.0)

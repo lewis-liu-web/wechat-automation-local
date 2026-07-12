@@ -221,7 +221,7 @@ class TestWorkerRunOnceRoute:
             "id": 7, "turn_id": 3, "target_id": "wxid_t", "group_key": "wxid_t",
             "status": "done", "attempts": 1, "deadline_at": 456.0,
             "created_at": 1.0, "started_at": 2.0, "finished_at": 3.0,
-            "error": "provider result is not an AgentResult contract: secret",
+            "error": "invalid agent result contract",
             "payload_json": '{"prompt": "user text"}',
             "result_json": '{"reply_text": "agent reply"}',
             "lease_owner": "worker-1", "job_key": "k",
