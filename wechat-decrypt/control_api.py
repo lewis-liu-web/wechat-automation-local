@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -44,6 +45,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
+
+logger = logging.getLogger(__name__)
 
 try:
     sys.path.insert(0, str(ROOT))
@@ -88,10 +91,22 @@ _ASYNC_LOOP_STATE: Dict[str, Any] = {
 }
 _PROVIDER_HEALTH_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
+_RELIABLE_SCHEDULER_LOCK = threading.RLock()
+_RELIABLE_SCHEDULER_STOP = threading.Event()
+_RELIABLE_SCHEDULER_THREAD: threading.Thread | None = None
+_RELIABLE_SCHEDULER_DEFAULT_INTERVAL = 2.0
+_RELIABLE_SCHEDULER_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "stopped_at": None,
+    "iterations": 0,
+    "last_error": "",
+    "last_worker": None,
+    "last_sender": None,
+    "interval": _RELIABLE_SCHEDULER_DEFAULT_INTERVAL,
+    "config": {},
+}
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def _json(obj: Any, status: int = 200) -> Tuple[bytes, int, str]:
     return (json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"),
@@ -446,13 +461,21 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(health=provider.health().to_dict())
 
 
-        # ---- Stage 1 reliable pipeline (run-once + status) ----
+        # ---- Stage 1 reliable pipeline (run-once + status + scheduler) ----
         if method == "GET" and path == "/reliable-pipeline/status":
             return _ok(**_reliable_pipeline_status())
         if method == "POST" and path == "/reliable-pipeline/worker/run-once":
             return _ok(**_reliable_worker_run_once(body))
         if method == "POST" and path == "/reliable-pipeline/sender/run-once":
             return _ok(**_reliable_sender_run_once(body))
+        if method == "GET" and path == "/reliable-pipeline/scheduler/status":
+            return _ok(**_reliable_scheduler_status())
+        if method == "POST" and path == "/reliable-pipeline/scheduler/start":
+            return _ok(**_reliable_scheduler_start(body))
+        if method == "POST" and path == "/reliable-pipeline/scheduler/stop":
+            return _ok(**_reliable_scheduler_stop())
+        if method == "POST" and (m := _match(path, "/reliable-pipeline/turn-jobs/{id}/quarantine")):
+            return _ok(**_reliable_quarantine_turn_job(m[0], body))
         # ---- M5 async: dispatcher / reconciler / sender ----
         if method == "POST" and path == "/agent/dispatcher/run-once":
             return _ok(**_async_dispatcher_run_once(body))
@@ -1097,6 +1120,225 @@ def _err_reliable(msg: str, **extra: Any) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"action": "error", "ok": False, "error": msg}
     payload.update(extra)
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 reliable pipeline scheduler
+# ---------------------------------------------------------------------------
+
+def _reliable_result_is_error(result: Any) -> bool:
+    """Return True when a run-once helper reports a handled error dict."""
+    return isinstance(result, dict) and result.get("ok") is False and result.get("action") == "error"
+
+
+def _resolve_scheduler_interval(config: Optional[Dict[str, Any]]) -> float:
+    """Read scheduler interval from config with a small documented default."""
+    section = _reliable_pipeline_section(config)
+    try:
+        return max(0.2, float(section.get("scheduler_interval_seconds") or _RELIABLE_SCHEDULER_DEFAULT_INTERVAL))
+    except (TypeError, ValueError):
+        return _RELIABLE_SCHEDULER_DEFAULT_INTERVAL
+
+
+def _reliable_scheduler_tick() -> None:
+    """Run one worker-then-sender iteration and record the outcome.
+
+    Worker and sender are isolated: an unexpected exception in the worker
+    never prevents the sender from draining previously ready outbox rows,
+    and an exception in the sender never masks the worker result.  Exceptions
+    are logged at the source; the public state carries only fixed safe markers
+    and action summaries so no exception repr or helper-provided error text can
+    leak through the status route.  Handled error dicts are logged as warnings
+    without interpolating their text so user content is never written to logs.
+    """
+    worker_result: Any = None
+    sender_result: Any = None
+    worker_error = ""
+    sender_error = ""
+
+    try:
+        worker_result = _reliable_worker_run_once({})
+    except Exception:
+        logger.exception("Reliable scheduler worker iteration failed")
+        worker_error = "worker iteration error"
+
+    # Always run the sender so previously ready outbox rows can drain even when
+    # the worker iteration raises or reports an error.
+    try:
+        sender_result = _reliable_sender_run_once({})
+    except Exception:
+        logger.exception("Reliable scheduler sender iteration failed")
+        sender_error = "sender iteration error"
+
+    # If a helper returned a handled error dict, use a fixed safe marker in the
+    # public state and log only a fixed safe warning (do not interpolate text).
+    if _reliable_result_is_error(worker_result):
+        logger.warning("Reliable scheduler worker returned a handled error")
+        worker_error = "worker returned error"
+    if _reliable_result_is_error(sender_result):
+        logger.warning("Reliable scheduler sender returned a handled error")
+        sender_error = "sender returned error"
+    error = worker_error or sender_error or ""
+    with _RELIABLE_SCHEDULER_LOCK:
+        _RELIABLE_SCHEDULER_STATE["last_worker"] = _scheduler_action_summary(worker_result)
+        _RELIABLE_SCHEDULER_STATE["last_sender"] = _scheduler_action_summary(sender_result)
+        _RELIABLE_SCHEDULER_STATE["iterations"] = int(_RELIABLE_SCHEDULER_STATE.get("iterations") or 0) + 1
+        _RELIABLE_SCHEDULER_STATE["last_error"] = error
+
+
+def _scheduler_action_summary(result: Any) -> Dict[str, Any]:
+    """Return a safe action summary, omitting any helper error text."""
+    if not isinstance(result, dict):
+        return {"action": "unknown"}
+    return {"action": result.get("action") or "unknown"}
+
+
+def _reliable_scheduler_main(config: Dict[str, Any]) -> None:
+    """Background loop: one tick per interval until stopped."""
+    interval = float(config.get("interval") or _RELIABLE_SCHEDULER_DEFAULT_INTERVAL)
+    with _RELIABLE_SCHEDULER_LOCK:
+        _RELIABLE_SCHEDULER_STATE["interval"] = interval
+    while not _RELIABLE_SCHEDULER_STOP.is_set():
+        try:
+            _reliable_scheduler_tick()
+        except Exception:
+            # Defensive: tick catches per-step errors, so this should be rare.
+            logger.exception("Reliable scheduler tick failed")
+            with _RELIABLE_SCHEDULER_LOCK:
+                _RELIABLE_SCHEDULER_STATE["last_error"] = "scheduler tick error"
+        _RELIABLE_SCHEDULER_STOP.wait(max(0.2, interval))
+    with _RELIABLE_SCHEDULER_LOCK:
+        _RELIABLE_SCHEDULER_STATE["running"] = False
+        _RELIABLE_SCHEDULER_STATE["stopped_at"] = time.time()
+
+
+def _reliable_scheduler_status() -> Dict[str, Any]:
+    """Return scheduler state: running, interval, iterations, last action/error."""
+    with _RELIABLE_SCHEDULER_LOCK:
+        state = dict(_RELIABLE_SCHEDULER_STATE)
+    thread = _RELIABLE_SCHEDULER_THREAD
+    state["running"] = bool(thread and thread.is_alive() and not _RELIABLE_SCHEDULER_STOP.is_set())
+    state["thread_alive"] = bool(thread and thread.is_alive())
+    return state
+
+
+def _reliable_scheduler_start(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Start the dedicated reliable-pipeline scheduler thread.
+
+    Idempotent: duplicate starts return ``already_running``.  Gated by
+    ``config['reliable_pipeline']['enabled']`` so the scheduler cannot be
+    manually started against a disabled pipeline.
+    """
+    global _RELIABLE_SCHEDULER_THREAD
+    try:
+        cfg = reg.load_config()
+    except Exception:
+        logger.exception("Reliable scheduler start failed to read config")
+        return _err_reliable("scheduler start failed; see control_api log")
+    if not _reliable_pipeline_enabled(cfg):
+        return {
+            "action": "disabled",
+            "enabled": False,
+            "reason": "config.reliable_pipeline.enabled is not true",
+        }
+    try:
+        with _RELIABLE_SCHEDULER_LOCK:
+            if _RELIABLE_SCHEDULER_THREAD and _RELIABLE_SCHEDULER_THREAD.is_alive():
+                return {"action": "already_running", **_reliable_scheduler_status()}
+            interval = _resolve_scheduler_interval(cfg)
+            config = {"interval": interval}
+            _RELIABLE_SCHEDULER_STOP.clear()
+            _RELIABLE_SCHEDULER_STATE.update({
+                "running": True,
+                "started_at": time.time(),
+                "stopped_at": None,
+                "iterations": 0,
+                "last_error": "",
+                "last_worker": None,
+                "last_sender": None,
+                "interval": interval,
+                "config": config,
+            })
+            _RELIABLE_SCHEDULER_THREAD = threading.Thread(
+                target=_reliable_scheduler_main,
+                args=(config,),
+                name="wechat-reliable-scheduler",
+                daemon=True,
+            )
+            _RELIABLE_SCHEDULER_THREAD.start()
+        return {"action": "started", **_reliable_scheduler_status()}
+    except Exception:
+        logger.exception("Reliable scheduler start failed")
+        return _err_reliable("scheduler start failed; see control_api log")
+
+
+def _reliable_scheduler_stop() -> Dict[str, Any]:
+    """Signal the scheduler to stop and wait for the thread to finish."""
+    try:
+        _RELIABLE_SCHEDULER_STOP.set()
+        thread = _RELIABLE_SCHEDULER_THREAD
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        with _RELIABLE_SCHEDULER_LOCK:
+            _RELIABLE_SCHEDULER_STATE["running"] = False
+            _RELIABLE_SCHEDULER_STATE["stopped_at"] = time.time()
+        return {"action": "stopped" if not (thread and thread.is_alive()) else "stop_requested", **_reliable_scheduler_status()}
+    except Exception:
+        logger.exception("Reliable scheduler stop failed")
+        return _err_reliable("scheduler stop failed; see control_api log")
+
+
+def _reliable_scheduler_auto_start() -> Optional[Dict[str, Any]]:
+    """Auto-start the scheduler when the reliable pipeline is enabled.
+
+    Called once during control_api startup; failures are swallowed so a
+    config problem does not prevent the rest of the control plane from serving.
+    """
+    try:
+        cfg = reg.load_config()
+    except Exception:
+        return None
+    if not _reliable_pipeline_enabled(cfg):
+        return None
+    return _reliable_scheduler_start({})
+
+
+def _reliable_quarantine_turn_job(job_id: Any, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Move a queued/running reliable turn job to a terminal failed state.
+
+    Uses ``reliable_pipeline.fail_job(..., retryable=False)`` so the job can
+    never re-enter dispatch and no send_outbox row is created.  The action is
+    explicit and non-retryable.  Unlike worker/sender run-once, this endpoint is
+    intentionally available even when the reliable pipeline is globally disabled
+    so legacy queued jobs can be safely quarantined before enabling the pipeline.
+    """
+    try:
+        cfg = reg.load_config()
+        job_id = int(job_id)
+        if job_id <= 0:
+            return _err_reliable("job_id must be a positive integer")
+        db_path = reliable_worker._resolve_db_path(cfg, None)
+        reason = str(body.get("reason") or "quarantined by control-api").strip()
+        if not reason:
+            reason = "quarantined by control-api"
+        quarantined = reliable_pipeline.fail_job(
+            job_id=job_id,
+            error=reason,
+            retryable=False,
+            db_path=db_path,
+        )
+    except (TypeError, ValueError):
+        return _err_reliable("job_id must be a positive integer")
+    except Exception:
+        logger.exception("Reliable quarantine failed")
+        return _err_reliable("quarantine failed; see control_api log")
+    return {
+        "action": "quarantined" if quarantined else "not_quarantined",
+        "job_id": job_id,
+        "retryable": False,
+        "quarantined": bool(quarantined),
+    }
+
 
 # ---------------------------------------------------------------------------
 # M5 async flow: dispatcher / reconciler / sender
@@ -1764,6 +2006,12 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), ControlHandler)
     try:
+        auto = _reliable_scheduler_auto_start()
+        if auto:
+            print("control_api: reliable scheduler auto-started: %s" % auto.get("action"), flush=True)
+    except Exception:
+        pass
+    try:
         print("control_api: http://%s:%s (pid=%s)" % (args.host, args.port, os.getpid()), flush=True)
     except Exception:
         pass
@@ -1772,6 +2020,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        _reliable_scheduler_stop()
         server.server_close()
     return 0
 
