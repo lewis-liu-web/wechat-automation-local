@@ -17,17 +17,22 @@
 | 运行时服务 | **运行中** | runtime 已同步/部署，`control_api` 在 `CD-only` 目录运行；scheduler 运行时自动启动；source hash/cursor 校验通过 |
 | Scheduler 代码 | **已提交** | commit `6943d30`: `Add reliable pipeline scheduler controls`；`wechat-decrypt/control_api.py` 与 `wechat-decrypt/tests/test_control_api_reliable_scheduler.py` 已纳入 reliable scheduler status/start/stop、runtime auto-start、`reliable_pipeline.enabled=True` 时自动启动、不可重试 quarantine endpoint |
 | 全量测试 | **未直接验证** | 历史上的 `tests/test_wechat_auto_cli_bridge.py` 收集失败问题**未在本次验证中复测/解决**；不能断言全 suite 已恢复健康 |
-| 文档/ADR | **已完成** | 本计划已更新 stale 状态；codebase-memory ADR `Reliable WeChat Pipeline Refactor` 已用候选文档 + 当前事实重建 |
-| codebase-memory | **已刷新** | `wechat-decrypt` 索引已重新建立（`E-projects-GA-projects-wechat-automation-local-wechat-decrypt`，status: ready） |
+| Stage 2 Phase A<br>Consumer-side contract convergence (foreground agent_worker, strict async reconciler jobs, reliable_worker) | **已提交** commit `88ee131 Unify strict AgentResult consumers`；未部署，未运行 E2E | 206 条聚焦测试通过；相关生产模块编译通过；已提交，尚未部署，未运行 E2E |
+| Stage 2 Phase B<br>Hermes provider default/always strict + legacy extractor retirement | **未开始** | 待定（TBD） |
+| Full suite health | **未复测/解决** | 历史测试收集问题：`test_wechat_auto_cli_bridge.py` 缺少 `wechat_auto` 导致的收集失败未在本次验证中复测/解决 |
 
 ### 1.1 今日状态摘要
 
 - **P1 完成**：Stage 1 durable transport + strict AgentResult contract 已通过 merge commit `0d0da5e` 进入 main。
 - **Scheduler 已提交**：dedicated reliable scheduler status/start/stop、runtime auto-start、quarantine endpoint 已提交为 commit `6943d30` (`Add reliable pipeline scheduler controls`)；16 条 scheduler 测试通过并部署到 runtime。
 - **E2E 通过**：最新 foreground E2E（local_id `930`）产生可见回复；quarantine 路径验证 job `3` 未产生发送。
+- **Stage 2 状态**：
+  - **Phase A consumer-side contract convergence**：已提交为 commit `88ee131 Unify strict AgentResult consumers`；strict 消费者仅接受可解析的 `raw.agent_result`，reliable_worker 的 reply_text/test-provider fallback 已移除；provider errors/exceptions/malformed result objects/raw diagnostics 在触及路径中按 fixed-safe-marker 处理；dispatcher build/submit/poll 失败路径恢复锁；silent/escalate 使用原子 sent/skipped 转换。聚焦测试 206 条通过；相关生产模块编译通过。**未部署，未运行 E2E。**
+  - **Phase B Hermes strict-default + legacy extractor retirement**：未开始。
+  - **Stage 2 整体未完成**，不可标记为已部署或已 E2E。
 - **遗留事项**：
-  - 完成本文档与 ADR 的状态刷新；
-  - 不处理 Stage 2/3/4 设计范围之外的功能变更。
+  - 完成 Stage 2 Phase B；
+  - 不处理 Stage 3/4 设计范围之外的功能变更。
 
 ---
 
@@ -112,6 +117,22 @@
 ### 3.3 Stage 2：Unified Hermes Worker Protocol
 
 > 与原版一致，但明确把“Hermes 产出契约”的责任从 Stage 1 移到 Stage 2，避免重叠。
+> **Stage 2 整体未完成。** 当前 Phase A（consumer-side 收敛）已提交为 commit `88ee131 Unify strict AgentResult consumers`；未部署、未运行 E2E。Phase B（Hermes strict-default + legacy extractor 退役）未开始。
+
+#### Stage 2 分解
+
+- **Phase A：Consumer-side contract convergence**（已提交 commit `88ee131`）
+  - 统一 foreground `agent_worker`、strict async reconciler jobs、`reliable_worker` 对 strict `AgentResult` 的消费。
+  - strict 消费者只接受可解析的 `raw.agent_result`；从 `reliable_worker` 中移除 reply_text / test-provider fallback 路径。
+  - provider errors / exceptions / malformed result objects / raw diagnostics 在触及路径中按 fixed-safe-marker 处理。
+  - dispatcher build/submit/poll 失败路径恢复锁；`silent`/`escalate` 使用原子 sent/skipped 状态转换。
+  - 验证：206 条聚焦测试通过；相关生产模块编译通过。
+  - **限制：未部署，未运行 E2E。**
+
+- **Phase B：Hermes provider default/always strict + legacy extractor retirement**（未开始）
+  - 将 Hermes provider 设为默认/始终 strict，不再依赖宽松模式。
+  - 退役剩余 production 路径上的 legacy extractor（`_extract_hermes_reply`、`_extract_tool_call`、stdout/box/line-JSON 等）。
+  - **Stage 2 整体在 Phase B 完成前不可标记为完成或已部署。**
 
 #### Goal
 消除同步/异步 Hermes 执行的分歧，用统一结构化 worker 协议替换显示文本解析。
@@ -223,20 +244,22 @@
 1. [x] **P1 合回 main 前置项** — 已完成（merge commit `0d0da5e`）。全 suite 收集健康度未在本次会话中复测。
 2. [x] **worktree → main 合并** + 同步到 `CD-only` + 服务重启 + E2E 回归 — 已完成；E2E local_id `930` 通过，quarantine job `3` 验证失败且未发件。
 3. [x] **提交 scheduler 代码** — 已完成，commit `6943d30`: `Add reliable pipeline scheduler controls`。
-4. [ ] **Stage 2**：统一 Hermes runner/strict contract 产出。
-5. [ ] **Stage 3**：提取 `knowledge_retrieval.py`，迁移 KB/回复决策到 Hermes，删除旧 `generate_reply` 路径。
-6. [ ] **Stage 4**：shadow → canary → 全量切换 → 删除 legacy。
+4. [x] **Stage 2 Phase A**：consumer-side strict AgentResult 收敛 — 已提交为 commit `88ee131 Unify strict AgentResult consumers`；聚焦测试 206 条通过；相关生产模块编译通过；未部署，未运行 E2E。
+5. [ ] **Stage 2 Phase B**：Hermes provider default/always strict + 剩余 legacy extractor 退役 — 未开始。
+6. [ ] **Stage 3**：提取 `knowledge_retrieval.py`，迁移 KB/回复决策到 Hermes，删除旧 `generate_reply` 路径。
+7. [ ] **Stage 4**：shadow → canary → 全量切换 → 删除 legacy。
 
 ---
 
 ## 5. 风险与注意事项
 
-1. **双路径风险**：当前 monitor 同时存在 legacy 路径与 reliable path。Stage 3 必须显式移除 legacy 调用点（`wechat_bot_monitor.py:1675-1707`、`1801-1803`）中已启用目标对旧 `generate_reply` 的调用，但保留 per-target gate 作为未启用目标的迁移开关；Stage 4 在全部切换后再删除该 gate。
-2. **KB 工具依赖**：删除 `reply_engine.py` 前，必须先迁移 `tools/search_knowledge_mcp_server.py` 的依赖到 `knowledge_retrieval.py`。
-3. **测试基线**：主仓与 worktree 的 `test_hermes_result_contract.py` 分裂问题已通过 merge commit `0d0da5e` 解决；后续全 suite 健康度需单独复测。
-4. **全量测试未复测**：历史上 `test_wechat_auto_cli_bridge.py` 导致的收集失败问题**未在本次会话中复测**，不能作为已恢复断言；后续需作为仓库健康项验证。
-5. **Scheduler 已提交**：scheduler 实现已提交为 commit `6943d30`，相关测试通过并部署到 runtime。
-6. **安全边界不外移**：Stage 3 只迁移“解释、检索、决策/编写”，target 授权、确定性安全拦截、预算、发送确认仍留在本地。
+1. **Stage 2 状态风险**：Stage 2 Phase A 已提交为 commit `88ee131 Unify strict AgentResult consumers`，**未部署、未运行 E2E**；Phase B 尚未开始。任何文档、报告或运行时状态都不可将 Stage 2 标记为完成、已部署或已验证端到端。
+2. **双路径风险**：当前 monitor 同时存在 legacy 路径与 reliable path。Stage 3 必须显式移除 legacy 调用点（`wechat_bot_monitor.py:1675-1707`、`1801-1803`）中已启用目标对旧 `generate_reply` 的调用，但保留 per-target gate 作为未启用目标的迁移开关；Stage 4 在全部切换后再删除该 gate。
+3. **KB 工具依赖**：删除 `reply_engine.py` 前，必须先迁移 `tools/search_knowledge_mcp_server.py` 的依赖到 `knowledge_retrieval.py`。
+4. **测试基线**：主仓与 worktree 的 `test_hermes_result_contract.py` 分裂问题已通过 merge commit `0d0da5e` 解决；后续全 suite 健康度需单独复测。
+5. **全量测试未复测**：历史上 `test_wechat_auto_cli_bridge.py` 导致的收集失败问题**未在本次会话中复测**，不能作为已恢复断言；后续需作为仓库健康项验证。
+6. **Scheduler 已提交**：scheduler 实现已提交为 commit `6943d30`，相关测试通过并部署到 runtime。
+7. **安全边界不外移**：Stage 3 只迁移“解释、检索、决策/编写”，target 授权、确定性安全拦截、预算、发送确认仍留在本地。
 
 ---
 
@@ -248,7 +271,9 @@
 | P1.2 | 同步契约测试到主仓 | **已完成** | merge commit `0d0da5e` 带入权威 `test_hermes_result_contract.py` |
 | P1.3 | worktree → main 合并 | **已完成** | merge commit `0d0da5e`；E2E local_id `930` 通过 |
 | Stage 1 | Durable transport + 管道侧契约消费 | **已完成** | 75 条聚焦测试 + 16 条 scheduler 测试通过 + E2E 通过 |
-| Stage 2 | Hermes 统一契约产出 | 未开始 | 同步/异步等价、严格契约测试 |
+| Stage 2 Phase A | Consumer-side strict AgentResult 收敛 | **已提交** commit `88ee131`；未部署，未运行 E2E | 206 条聚焦测试通过；相关生产模块编译通过；未部署，未 E2E |
+| Stage 2 Phase B | Hermes provider strict-default + legacy extractor 退役 | **未开始** | 无 production path 调用 legacy extractor；`HermesProvider` 默认 strict |
+| Stage 2 整体 | 统一 Hermes runner/strict contract 产出 | **未完成** | Phase A + Phase B 全部完成并提交/部署 |
 | Stage 3 | KB/决策迁移到 Hermes | 未开始 | 旧 `generate_reply` 删除、KB 工具独立 |
 | Stage 4 | Shadow/切换/legacy 删除 | 未开始 | 全目标新 pipeline、零重复发送 |
 
