@@ -15,7 +15,7 @@
 | Stage 1 核心测试 | **通过** | pipeline/worker/contract 聚焦测试 75 条通过；scheduler 专项测试 16 条通过 |
 | E2E 端到端 | **通过** | local_id `930` 完成：job done action=reply → outbox 发送 → 可见回复；旧 E2E job `3` 被 deliberate quarantine，失败且未发件 |
 | 运行时服务 | **运行中** | runtime 已同步/部署，`control_api` 在 `CD-only` 目录运行；scheduler 运行时自动启动；source hash/cursor 校验通过 |
-| Scheduler 代码 | **未提交** | `wechat-decrypt/control_api.py` 与 `wechat-decrypt/tests/test_control_api_reliable_scheduler.py` 当前为未提交修改，新增 reliable scheduler status/start/stop、runtime auto-start、`reliable_pipeline.enabled=True` 时自动启动、不可重试 quarantine endpoint |
+| Scheduler 代码 | **已提交** | commit `6943d30`: `Add reliable pipeline scheduler controls`；`wechat-decrypt/control_api.py` 与 `wechat-decrypt/tests/test_control_api_reliable_scheduler.py` 已纳入 reliable scheduler status/start/stop、runtime auto-start、`reliable_pipeline.enabled=True` 时自动启动、不可重试 quarantine endpoint |
 | 全量测试 | **未直接验证** | 历史上的 `tests/test_wechat_auto_cli_bridge.py` 收集失败问题**未在本次验证中复测/解决**；不能断言全 suite 已恢复健康 |
 | 文档/ADR | **已完成** | 本计划已更新 stale 状态；codebase-memory ADR `Reliable WeChat Pipeline Refactor` 已用候选文档 + 当前事实重建 |
 | codebase-memory | **已刷新** | `wechat-decrypt` 索引已重新建立（`E-projects-GA-projects-wechat-automation-local-wechat-decrypt`，status: ready） |
@@ -23,11 +23,10 @@
 ### 1.1 今日状态摘要
 
 - **P1 完成**：Stage 1 durable transport + strict AgentResult contract 已通过 merge commit `0d0da5e` 进入 main。
-- **Scheduler 未提交**： dedicated reliable scheduler status/start/stop、runtime auto-start、quarantine endpoint 已验证通过并部署到 runtime，但代码尚未 commit。
+- **Scheduler 已提交**：dedicated reliable scheduler status/start/stop、runtime auto-start、quarantine endpoint 已提交为 commit `6943d30` (`Add reliable pipeline scheduler controls`)；16 条 scheduler 测试通过并部署到 runtime。
 - **E2E 通过**：最新 foreground E2E（local_id `930`）产生可见回复；quarantine 路径验证 job `3` 未产生发送。
 - **遗留事项**：
   - 完成本文档与 ADR 的状态刷新；
-  - 提交 scheduler 代码与测试（用户授权后执行，不在本次文档任务范围内）；
   - 不处理 Stage 2/3/4 设计范围之外的功能变更。
 
 ---
@@ -223,7 +222,7 @@
 
 1. [x] **P1 合回 main 前置项** — 已完成（merge commit `0d0da5e`）。全 suite 收集健康度未在本次会话中复测。
 2. [x] **worktree → main 合并** + 同步到 `CD-only` + 服务重启 + E2E 回归 — 已完成；E2E local_id `930` 通过，quarantine job `3` 验证失败且未发件。
-3. [ ] **提交 scheduler 代码** — `wechat-decrypt/control_api.py` 与 `wechat-decrypt/tests/test_control_api_reliable_scheduler.py` 当前未提交；待用户授权后 commit（不在本次文档任务范围内）。
+3. [x] **提交 scheduler 代码** — 已完成，commit `6943d30`: `Add reliable pipeline scheduler controls`。
 4. [ ] **Stage 2**：统一 Hermes runner/strict contract 产出。
 5. [ ] **Stage 3**：提取 `knowledge_retrieval.py`，迁移 KB/回复决策到 Hermes，删除旧 `generate_reply` 路径。
 6. [ ] **Stage 4**：shadow → canary → 全量切换 → 删除 legacy。
@@ -236,7 +235,7 @@
 2. **KB 工具依赖**：删除 `reply_engine.py` 前，必须先迁移 `tools/search_knowledge_mcp_server.py` 的依赖到 `knowledge_retrieval.py`。
 3. **测试基线**：主仓与 worktree 的 `test_hermes_result_contract.py` 分裂问题已通过 merge commit `0d0da5e` 解决；后续全 suite 健康度需单独复测。
 4. **全量测试未复测**：历史上 `test_wechat_auto_cli_bridge.py` 导致的收集失败问题**未在本次会话中复测**，不能作为已恢复断言；后续需作为仓库健康项验证。
-5. **Scheduler 未提交**：scheduler 实现已通过测试并部署到 runtime，但代码未 commit；后续提交前需重新跑相关测试并确认运行时状态。
+5. **Scheduler 已提交**：scheduler 实现已提交为 commit `6943d30`，相关测试通过并部署到 runtime。
 6. **安全边界不外移**：Stage 3 只迁移“解释、检索、决策/编写”，target 授权、确定性安全拦截、预算、发送确认仍留在本地。
 
 ---
