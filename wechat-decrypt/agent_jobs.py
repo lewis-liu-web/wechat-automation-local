@@ -473,11 +473,12 @@ def fail_job(job_id: int, error: str, *, status: str = STATUS_FAILED,
         cur = con.execute(
             """
             UPDATE agent_jobs
-            SET status=?, error=?, finished_at=?, next_poll_at=NULL
-            WHERE id=? AND status IN (?, ?, ?, ?)
+            SET status=?, error=?, finished_at=?, next_poll_at=NULL,
+                dispatch_owner=NULL, dispatch_locked_until=NULL
+            WHERE id=? AND status IN (?, ?, ?, ?, ?)
             """,
             (status, str(error or "")[:500], _now(), int(job_id),
-             STATUS_QUEUED, STATUS_RUNNING, STATUS_SUBMITTED, STATUS_AGENT_RUNNING),
+             STATUS_QUEUED, STATUS_RUNNING, STATUS_SUBMITTED, STATUS_AGENT_RUNNING, STATUS_DISPATCHING),
         )
         return cur.rowcount == 1
 
@@ -507,6 +508,27 @@ def mark_send_failed(job_id: int, error: str, *, db_path: Optional[Path] = None)
         cur = con.execute(
             "UPDATE agent_jobs SET status=?, send_status=?, error=?, finished_at=COALESCE(finished_at, ?) WHERE id=?",
             (STATUS_FAILED, SEND_FAILED, str(error or "")[:500], _now(), int(job_id)),
+        )
+        return cur.rowcount == 1
+
+
+def mark_send_skipped(job_id: int, *, reason: str = "no_reply_action", db_path: Optional[Path] = None) -> bool:
+    """Mark a successfully completed job whose agent decided not to reply as terminal.
+
+    Applies to strict silent/escalate actions: no actual message is sent, but the
+    job should not be retried or displayed as pending send. Caller must ensure the
+    job was already completed (status=done) before invoking this helper.
+    """
+    with _WRITE_LOCK, _connect(db_path) as con:
+        cur = con.execute(
+            """
+            UPDATE agent_jobs
+            SET status=?, send_status=?, sent_at=?, error=COALESCE(error, ?), finished_at=COALESCE(finished_at, ?)
+            WHERE id=? AND status=?
+            """,
+            (
+                STATUS_SENT, SEND_SKIPPED, _now(), str(reason or "")[:500], _now(), int(job_id), STATUS_DONE,
+            ),
         )
         return cur.rowcount == 1
 
@@ -636,6 +658,50 @@ def claim_dispatchable(*, worker_id: str, provider: str | None = None,
             return None
         row = con.execute("SELECT * FROM agent_jobs WHERE id=?", (selected["id"],)).fetchone()
     return _row_to_dict(row)
+
+
+def release_dispatching(job_id: int, *, reason: str = "dispatch lock released", db_path: Optional[Path] = None) -> bool:
+    """Return a dispatching job to the queued state without marking it failed.
+
+    Use this when a transient pre-submit failure (e.g. persistence write) should
+    not permanently fail the job; it will be re-dispatched on the next cycle.
+    """
+    with _WRITE_LOCK, _connect(db_path) as con:
+        cur = con.execute(
+            """
+            UPDATE agent_jobs
+            SET status=?, error=?, dispatch_owner=NULL, dispatch_locked_until=NULL, finished_at=NULL
+            WHERE id=? AND status=?
+            """,
+            (STATUS_QUEUED, str(reason or "")[:500], int(job_id), STATUS_DISPATCHING),
+        )
+        return cur.rowcount == 1
+
+
+def mark_submission_failed(job_id: int, *, external_provider: str, external_session_id: str,
+                           external_user_msg_id: int | None = None, error: str = "mark_submitted failed",
+                           db_path: Optional[Path] = None) -> bool:
+    """Record a submitted external job whose DB state could not be updated.
+
+    Moves the job to failed while preserving the external session info so the
+    result can be audited or manually recovered. Does NOT allow re-dispatch.
+    """
+    with _WRITE_LOCK, _connect(db_path) as con:
+        cur = con.execute(
+            """
+            UPDATE agent_jobs
+            SET status=?, error=?, finished_at=?,
+                external_provider=?, external_session_id=?, external_user_msg_id=?,
+                dispatch_owner=NULL, dispatch_locked_until=NULL
+            WHERE id=? AND status=?
+            """,
+            (
+                STATUS_FAILED, str(error or "")[:500], _now(),
+                str(external_provider or "")[:200], str(external_session_id or "")[:500],
+                int(external_user_msg_id or 0), int(job_id), STATUS_DISPATCHING,
+            ),
+        )
+        return cur.rowcount == 1
 
 
 def mark_submitted(job_id: int, *, external_provider: str, external_session_id: str,

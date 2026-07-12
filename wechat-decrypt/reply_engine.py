@@ -1198,7 +1198,7 @@ def _retrieve_hook_kb(query: str, spec: Dict[str, Any], limit: int) -> List[Know
 
 def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any],
                                limit: int = 6, core_limit: int | None = None,
-                               scene_limit: int | None = None) -> Dict[str, List[KnowledgeHit]]:
+                               scene_limit: int | None = None, skip_core: bool = False) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
     core_hits: List[KnowledgeHit] = []
     scene_hits: List[KnowledgeHit] = []
@@ -1208,10 +1208,11 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
     scene_limit = int(scene_limit if scene_limit is not None else cfg_re.get("scene_limit", max(0, limit - core_limit)))
 
     # First principle: core rules/boundaries always apply for every target.
-    core_docs = load_wiki(root / "core")
-    core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=core_limit)
-    for rel, body in core_ranked:
-        core_hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
+    if not skip_core:
+        core_docs = load_wiki(root / "core")
+        core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=core_limit)
+        for rel, body in core_ranked:
+            core_hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
 
     selected = target.get("knowledge_bases")
     if selected is None:
@@ -1778,7 +1779,8 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
 
 def generate_reply(message: Dict[str, Any] | str,
                    target: Dict[str, Any] | None = None,
-                   config: Dict[str, Any] | None = None) -> ReplyDecision:
+                   config: Dict[str, Any] | None = None,
+                   config_path: str | None = None) -> ReplyDecision:
     config = config or {}
     target = target or {}
     raw_text = message if isinstance(message, str) else (message.get("content") or message.get("str_content") or message.get("message") or message.get("message_content") or "")
@@ -1852,65 +1854,40 @@ def generate_reply(message: Dict[str, Any] | str,
         selected_kbs = resolve_target_kb_ids(config, target)
         target_policy = (None if isinstance(message, str) else message.get("target_policy")) or {}
         response_mode = _normalize_response_mode((target_policy or {}).get("mode") or target.get("mode") or "group_assistant")
-        # KB retrieval debug for raw_agent mode: log query, hits, and selected KBs.
-        # ---- Pre-compute image descriptions and inject into KB query ----
-        # FTS query must see image content, otherwise image messages always miss the scene KB.
+        # Vision-only enrichment: describe images so the agent can see them.
         vision_query_text, vision_image_descriptions = _local_image_descriptions(image_paths, clean or raw_text)
-        kb_query_text = clean or raw_text
-        if vision_query_text:
-            kb_query_text = "%s\n\n[图片识别结果]\n%s" % (kb_query_text, vision_query_text)
-        query = _clean_query_for_fts(kb_query_text)
-        kb_layers = retrieve_knowledge_layers(query, config, target)
-        import logging
-        logging.getLogger("reply_engine").warning(
-            "[KB_DEBUG_RAW] raw=%r clean=%r kb_query=%r query=%r core=%d scene=%d kbs=%r target=%s",
-            raw_text, clean, kb_query_text, query,
-            len(kb_layers.get("core") or []),
-            len(kb_layers.get("scene") or []),
-            selected_kbs,
-            target.get("username"),
-        )
-        raw_kb_hits = (kb_layers.get("core") or []) + (kb_layers.get("scene") or [])
-        try:
-            payload_knowledge_hits = _knowledge_hits_to_payload(raw_kb_hits)
-        except Exception as exc:
-            logging.getLogger("reply_engine").exception("[KB_DEBUG_RAW] payload formatter crashed: %r", exc)
-            payload_knowledge_hits = []
-        scene_hits = kb_layers.get("scene") or []
-        core_hits = kb_layers.get("core") or []
-        retrieval_debug = {
-            "mode": "raw_agent",
-            "selected_kbs": selected_kbs,
-            "core_hit_count": len(core_hits),
-            "scene_hit_count": len(scene_hits),
-        }
-        logging.getLogger("reply_engine").warning(
-            "[KB_DEBUG_RAW] enqueue hits count=%d target=%s",
-            len(payload_knowledge_hits), target.get("username"),
-        )
-        if response_mode == "customer_service" and not scene_hits:
-            return ReplyDecision(
-                True,
-                postcheck("我需要先查到相关资料才能准确回复。请补充具体产品或业务名称，或稍等负责人确认。"),
-                intent="kb_clarification",
-                risk_level="low",
-                need_human=True,
-                reason="customer_service_no_kb_hit",
-                wiki_hits=[],
-                retrieval_debug=retrieval_debug,
-            )
-        llm_config = dict(config.get("reply_engine", config) or {})
-        caps = get_capabilities() if get_capabilities else None
-        has_local_vision = bool(caps.local_vision_mmx) if caps else False
+        retrieval_debug = {"mode": "raw_agent", "selected_kbs": selected_kbs}
+        if response_mode == "customer_service":
+            # Keep the no-hit clarification behavior for customer-service mode.
+            # The actual KB text is not passed to the agent; the model retrieves via MCP tool.
+            kb_query_text = clean or raw_text
+            if vision_query_text:
+                kb_query_text = "%s\n\n[图片识别结果]\n%s" % (kb_query_text, vision_query_text)
+            query = _clean_query_for_fts(kb_query_text)
+            kb_layers = retrieve_knowledge_layers(query, config, target)
+            scene_hits = kb_layers.get("scene") or []
+            retrieval_debug["core_hit_count"] = len(kb_layers.get("core") or [])
+            retrieval_debug["scene_hit_count"] = len(scene_hits)
+            if not scene_hits:
+                return ReplyDecision(
+                    True,
+                    postcheck("我需要先查到相关资料才能准确回复。请补充具体产品或业务名称，或稍等负责人确认。"),
+                    intent="kb_clarification",
+                    risk_level="low",
+                    need_human=True,
+                    reason="customer_service_no_kb_hit",
+                    wiki_hits=[],
+                    retrieval_debug=retrieval_debug,
+                )
         image_descriptions: List[Dict[str, str]] = []
         if image_paths and not vision_image_descriptions:
+            caps = get_capabilities() if get_capabilities else None
+            has_local_vision = bool(caps.local_vision_mmx) if caps else False
             if has_local_vision:
                 image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text)
             else:
-                # No vision capability – mark as missing so agent_provider can degrade gracefully
                 image_descriptions = [{"path": p, "description": "[当前环境未配置视觉识别能力]"} for p in image_paths]
         else:
-            # Reuse descriptions already computed for KB query to avoid a second VLM call.
             image_descriptions = vision_image_descriptions
         prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode)
         # Inject readable aggregator context before the [用户消息] block
@@ -1982,8 +1959,8 @@ def generate_reply(message: Dict[str, Any] | str,
                             "clean_text": clean,
                             "raw_text": raw_text,
                             "skill_name": "wechat_task",
-                            "knowledge_hits": payload_knowledge_hits,
-                            "knowledge_bases": selected_kbs,
+                            "_allowed_kb_ids": selected_kbs,
+                            "_config_path": config_path,
                             "reply_mode": "raw_agent",
                             "response_mode": response_mode,
                             "target_policy": target_policy or {},
