@@ -63,6 +63,10 @@ from agent_provider import (  # noqa: E402
 )
 import manage_targets as mt  # noqa: E402
 import target_registry as reg  # noqa: E402
+import reliable_pipeline  # noqa: E402
+import reliable_worker  # noqa: E402
+import reply_engine  # noqa: E402
+from wechat_bot_monitor import wait_sent_confirmation  # noqa: E402
 
 DEFAULT_PORT = 18590
 DEFAULT_HOST = "127.0.0.1"
@@ -441,6 +445,14 @@ class ControlHandler(BaseHTTPRequestHandler):
             provider = _build_agent_provider(provider_name, instance_id=instance_id)
             return _ok(health=provider.health().to_dict())
 
+
+        # ---- Stage 1 reliable pipeline (run-once + status) ----
+        if method == "GET" and path == "/reliable-pipeline/status":
+            return _ok(**_reliable_pipeline_status())
+        if method == "POST" and path == "/reliable-pipeline/worker/run-once":
+            return _ok(**_reliable_worker_run_once(body))
+        if method == "POST" and path == "/reliable-pipeline/sender/run-once":
+            return _ok(**_reliable_sender_run_once(body))
         # ---- M5 async: dispatcher / reconciler / sender ----
         if method == "POST" and path == "/agent/dispatcher/run-once":
             return _ok(**_async_dispatcher_run_once(body))
@@ -816,6 +828,276 @@ def _agent_pool_status() -> Dict[str, Any]:
     return {"running": bool(loop.get("running")), "loop": loop, "instances": rows}
 
 
+
+# ---------------------------------------------------------------------------
+# Stage 1 reliable pipeline: helpers + sanitizers + run-once / status
+# ---------------------------------------------------------------------------
+
+
+
+# Strict scalar whitelist per row kind. We keep ONLY:
+#   * opaque identifiers (``id``, ``turn_id``, ``job_id``, ``target_id``,
+#     ``group_key``)
+#   * status enum values
+#   * numeric counters / lease timestamps
+#   * creation / sent / deadline / next_attempt timestamps
+# We deliberately drop every string that could carry content:
+#   * ``payload_json`` / ``result_json`` (raw contract bodies)
+#   * ``reply_text`` / ``mention_name`` (send-side content)
+#   * ``error`` (the worker embeds reply snippets here, see
+#     ``reliable_worker.process_once`` failure paths)
+#   * ``reason`` / ``attempted`` / ``exception`` (sender diagnostic
+#     strings that may echo user content or exception reprs)
+#   * ``outbox_key`` / ``job_key`` / ``lease_owner`` (low-information
+#     identifiers that are unnecessary for operational status)
+# This satisfies the no-body-leak guarantee even when the underlying
+# schemas add fields or the worker starts embedding extra diagnostics.
+_RELIABLE_JOB_FIELDS: Tuple[str, ...] = (
+    "id", "turn_id", "target_id", "group_key",
+    "status",
+    "attempts",
+    "deadline_at",
+    "created_at", "started_at", "finished_at",
+)
+_RELIABLE_OUTBOX_FIELDS: Tuple[str, ...] = (
+    "id", "job_id", "target_id", "group_key",
+    "before_local_id",
+    "status",
+    "attempts", "max_attempts", "next_attempt_at",
+    "created_at", "sent_at", "dead_at",
+)
+_RELIABLE_DEAD_LETTER_FIELDS: Tuple[str, ...] = (
+    "id", "job_id", "target_id", "group_key",
+    "status",
+    "attempts", "max_attempts",
+    "created_at", "dead_at", "next_attempt_at",
+)
+_RELIABLE_PROCESSED_FIELDS: Tuple[str, ...] = (
+    "outbox_id", "target_id", "ok",
+)
+_RELIABLE_SKIPPED_FIELDS: Tuple[str, ...] = (
+    "outbox_id", "target_id",
+)
+
+
+def _reliable_pipeline_section(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the ``config['reliable_pipeline']`` section, or ``{}``."""
+    if not isinstance(config, dict):
+        return {}
+    section = config.get("reliable_pipeline")
+    return section if isinstance(section, dict) else {}
+
+
+def _reliable_pipeline_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """``True`` only when ``config.reliable_pipeline.enabled`` is literally ``True``.
+
+    Default ``False`` — the reliable pipeline must be opted in
+    explicitly.  Truthy non-``True`` values (``1``, ``"yes"``,
+    ``"true"``, etc.) do NOT enable it: this keeps a misconfigured
+    string from accidentally opening worker/sender run-once against the
+    production WeChat pipeline.
+    """
+    return _reliable_pipeline_section(config).get("enabled") is True
+
+
+def _project_row(row: Any, fields: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    """Whitelist-projection: keep only ``fields`` from ``row`` (dict or sqlite3.Row)."""
+    if row is None:
+        return None
+    out: Dict[str, Any] = {}
+    for key in fields:
+        if not isinstance(row, dict) and not hasattr(row, "keys"):
+            break
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            continue
+        out[key] = value
+    return out
+
+
+def _sanitize_process_once_result(result: Any) -> Dict[str, Any]:
+    """Strip body content from a ``process_once`` result before returning."""
+    if not isinstance(result, dict):
+        return {"status": "unknown", "job": None, "outbox": None}
+    sanitized: Dict[str, Any] = {"status": result.get("status")}
+    if "job" in result:
+        sanitized["job"] = _project_row(result.get("job"), _RELIABLE_JOB_FIELDS)
+    if "outbox" in result:
+        sanitized["outbox"] = _project_row(result.get("outbox"), _RELIABLE_OUTBOX_FIELDS)
+    return sanitized
+
+
+def _sanitize_send_outcome(outcome: Any, fields: Tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    if not isinstance(outcome, dict):
+        return None
+    row = outcome.get("row")
+    projected_row = _project_row(row, _RELIABLE_OUTBOX_FIELDS)
+    out: Dict[str, Any] = {}
+    for key in fields:
+        if key in outcome:
+            out[key] = outcome.get(key)
+    if projected_row is not None:
+        out["row"] = projected_row
+    return out
+
+
+def _sanitize_send_once_result(result: Any) -> Dict[str, Any]:
+    """Strip body content from a ``send_once`` result before returning."""
+    if not isinstance(result, dict):
+        return {"status": "unknown", "processed": [], "skipped": []}
+    processed_raw = result.get("processed") or []
+    skipped_raw = result.get("skipped") or []
+    return {
+        "status": result.get("status"),
+        "processed": [
+            _sanitize_send_outcome(item, _RELIABLE_PROCESSED_FIELDS)
+            for item in processed_raw if isinstance(item, dict)
+        ],
+        "skipped": [
+            _sanitize_send_outcome(item, _RELIABLE_SKIPPED_FIELDS)
+            for item in skipped_raw if isinstance(item, dict)
+        ],
+    }
+
+
+def _sanitize_dead_letter(row: Any) -> Optional[Dict[str, Any]]:
+    """Project a dead-letter row down to scalar metadata only."""
+    return _project_row(row, _RELIABLE_DEAD_LETTER_FIELDS)
+
+
+def _reliable_worker_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Process one durable turn job through ``reliable_worker.process_once``.
+
+    The reliable pipeline must be explicitly enabled via
+    ``config['reliable_pipeline']['enabled']``; otherwise this returns
+    ``{"action": "disabled"}`` without invoking the worker.
+
+    The deterministic safety filter is always
+    ``reply_engine.postcheck`` — there is no body knob that can bypass it.
+    The provider is resolved by ``process_once`` using the immutable
+    ``provider_factory`` built from this config; the legacy ``provider`` is a
+    fallback when the target binding is missing or the factory fails.
+    ``test_target_only`` lives in the same config and is therefore
+    unspoofable by the HTTP body.
+    """
+    cfg = reg.load_config()
+    if not _reliable_pipeline_enabled(cfg):
+        return {
+            "action": "disabled",
+            "enabled": False,
+            "reason": "config.reliable_pipeline.enabled is not true",
+        }
+    owner = str(body.get("owner") or reliable_worker.DEFAULT_REPLY_OWNER).strip() or reliable_worker.DEFAULT_REPLY_OWNER
+    timeout_raw = body.get("timeout")
+    timeout: Optional[float]
+    try:
+        timeout = float(timeout_raw) if timeout_raw is not None else None
+    except (TypeError, ValueError):
+        return _err_reliable("timeout must be a number")
+    provider = _build_agent_provider()
+    def _provider_factory(instance_id=None):
+        return provider_from_config(cfg, instance_id=instance_id)
+    try:
+        result = reliable_worker.process_once(
+            provider=provider,
+            owner=owner,
+            config=cfg,
+            provider_factory=_provider_factory,
+            final_filter=reply_engine.postcheck,
+            timeout=timeout,
+        )
+    except reliable_worker.FinalFilterRequired:
+        # Programming error: control_api always passes reply_engine.postcheck.
+        # We never echo the exception message because FinalFilterRequired
+        # formats include the runtime stack frame, which could leak paths.
+        return _err_reliable("final_filter is required")
+    except Exception:
+        # Worker / provider raised.  We deliberately do not include the
+        # exception repr in the response: provider exceptions frequently
+        # embed filesystem paths and outbound URLs that should never
+        # leave the control plane.
+        return _err_reliable("worker raised; see control_api log")
+    return {"action": "processed", **_sanitize_process_once_result(result)}
+
+
+def _reliable_sender_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Claim and dispatch one batch of sendable outbox rows.
+
+    Requires ``config['reliable_pipeline']['enabled']``. The
+    ``test_target_only`` gate is enforced inside ``send_once`` itself;
+    the body cannot override it because it is read from the same config
+    the worker reads.
+    """
+    cfg = reg.load_config()
+    if not _reliable_pipeline_enabled(cfg):
+        return {
+            "action": "disabled",
+            "enabled": False,
+            "reason": "config.reliable_pipeline.enabled is not true",
+        }
+    owner = str(body.get("owner") or reliable_worker.DEFAULT_SEND_OWNER).strip() or reliable_worker.DEFAULT_SEND_OWNER
+    limit_raw = body.get("limit")
+    try:
+        limit = int(limit_raw) if limit_raw is not None else reliable_worker.DEFAULT_SEND_LIMIT
+    except (TypeError, ValueError):
+        return _err_reliable("limit must be an integer", status=400)
+    try:
+        result = reliable_worker.send_once(
+            owner=owner,
+            config=cfg,
+            limit=max(1, int(limit)),
+            confirm=lambda target, before_local_id, text, timeout: wait_sent_confirmation(
+                target, before_local_id, text, config_path=reg.CONFIG_PATH, timeout=timeout,
+            ),
+        )
+    except Exception:
+        # See _reliable_worker_run_once: do not echo the exception repr.
+        return _err_reliable("sender raised; see control_api log", status=500)
+    return {"action": "processed", **_sanitize_send_once_result(result)}
+
+
+def _reliable_pipeline_status() -> Dict[str, Any]:
+    """Return ``enabled``, scalar ``counts``, and sanitized dead-letter summaries.
+
+    Never echoes reply text, payload JSON, result JSON, error strings,
+    DB path values, or any exception repr: the only caller-visible
+    scalar set is the whitelist in ``_RELIABLE_DEAD_LETTER_FIELDS``.
+    When the database is unreachable the response carries a fixed
+    ``db_status: "unavailable"`` marker and empty ``counts`` /
+    ``dead_letters`` — no exception text or filesystem path is ever
+    returned, so the status surface cannot leak either diagnostics
+    or absolute filesystem locations.
+    """
+    cfg = reg.load_config()
+    section = _reliable_pipeline_section(cfg)
+    db_path = reliable_worker._resolve_db_path(cfg, None)
+    try:
+        counts = reliable_pipeline.counts(db_path=db_path)
+        raw_dl = reliable_pipeline.list_dead_letters(limit=50, db_path=db_path)
+    except Exception:
+        return {
+            "enabled": bool(section.get("enabled")),
+            "test_target_only": bool(section.get("test_target_only")),
+            "db_status": "unavailable",
+            "counts": {},
+            "dead_letters": [],
+        }
+    dead_letters = [item for item in (_sanitize_dead_letter(row) for row in raw_dl) if item]
+    return {
+        "enabled": bool(section.get("enabled")),
+        "test_target_only": bool(section.get("test_target_only")),
+        "db_status": "ok",
+        "counts": counts,
+        "dead_letters": dead_letters,
+    }
+
+
+def _err_reliable(msg: str, **extra: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"action": "error", "ok": False, "error": msg}
+    payload.update(extra)
+    return payload
+
 # ---------------------------------------------------------------------------
 # M5 async flow: dispatcher / reconciler / sender
 # ---------------------------------------------------------------------------
@@ -877,6 +1159,19 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         submit_timeout = 30.0
     agent_deadline_at = time.time() + deadline_seconds
 
+    # Stage 2: force strict AgentResult contract for every dispatcher-submitted job.
+    # Persist the flag before submit so retries/restarts keep the strict contract.
+    if not isinstance(job.get("payload"), dict):
+        job["payload"] = {}
+    job["payload"]["reliable_result_contract"] = True
+    if not agent_jobs.merge_payload(int(job["id"]), {"reliable_result_contract": True}):
+        agent_jobs.release_dispatching(
+            int(job["id"]),
+            reason="failed to persist strict contract flag",
+        )
+        return {"ok": False, "action": "persistence_failed", "job_id": job["id"],
+                "duration": round(time.time() - t0, 3)}
+
     submit_result = provider.submit(job, timeout=submit_timeout)
     if not submit_result.ok:
         agent_jobs.fail_job(
@@ -906,7 +1201,16 @@ def _async_dispatcher_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         next_poll_at=time.time() + 5.0,  # first poll in 5s
     )
     if not ok:
+        agent_jobs.mark_submission_failed(
+            int(job["id"]),
+            external_provider=provider.name,
+            external_session_id=session_id,
+            external_user_msg_id=user_msg_id,
+            error="mark_submitted failed after provider submit",
+        )
         return {"ok": False, "action": "mark_submitted_failed", "job_id": job["id"],
+                "external_session_id": session_id,
+                "external_user_msg_id": user_msg_id,
                 "duration": round(time.time() - t0, 3)}
     
     return {"ok": True, "action": "submitted", "job_id": job["id"],
@@ -957,6 +1261,47 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             poll_result = AgentResult(False, "failed", error="poll exception: %r" % (e,),
                                        provider=ext_provider, worker_id="reconciler")
 
+        raw = getattr(poll_result, "raw", None) or None
+        agent_result = raw.get("agent_result") if isinstance(raw, dict) else None
+
+        # Stage 2 strict AgentResult contract branch
+        if poll_result.ok is True and isinstance(agent_result, dict):
+            if raw:
+                agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
+            action = agent_result.get("action")
+            if action == "reply" and poll_result.status == "done":
+                reply_text = agent_jobs.sanitize_agent_result_text(
+                    agent_result.get("reply_text") or poll_result.reply_text or ""
+                )
+                if not reply_text:
+                    agent_jobs.fail_job(job_id, "empty reply_text in strict reply contract",
+                                        status=agent_jobs.STATUS_FAILED)
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
+                                                external_status="failed")
+                    results.append({"job_id": job_id, "action": "failed",
+                                    "reason": "empty reply_text in strict reply contract"})
+                else:
+                    ok = agent_jobs.complete_job(job_id, reply_text)
+                    if ok:
+                        agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
+                                                    external_status="done")
+                        results.append({"job_id": job_id, "action": "completed",
+                                        "reply_preview": reply_text[:80]})
+                    else:
+                        results.append({"job_id": job_id, "action": "complete_failed"})
+                continue
+            elif action in ("silent", "escalate") and poll_result.status in ("silent", "escalated"):
+                ok = agent_jobs.complete_job(job_id, "")
+                if ok:
+                    agent_jobs.mark_send_skipped(job_id, reason=action)
+                    agent_jobs.update_poll_state(job_id, next_poll_at=now + 60.0,
+                                                external_status=action)
+                    results.append({"job_id": job_id, "action": action})
+                else:
+                    results.append({"job_id": job_id, "action": "complete_failed"})
+                continue
+            # Mismatched action/status in strict contract falls through to legacy/error handling.
+
         if poll_result.ok and poll_result.reply_text:
             reply_text = agent_worker.sanitize_reply_text(
                 poll_result.reply_text, job.get("payload"), reg.load_config()
@@ -990,7 +1335,6 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
                                             external_status="running")
             results.append({"job_id": job_id, "action": "still_running"})
         else:
-            raw = getattr(poll_result, "raw", None) or None
             if raw:
                 agent_jobs.merge_payload(job_id, {"agent_raw_output": raw})
             if deadline and now + 30.0 > deadline:
@@ -1004,9 +1348,10 @@ def _async_reconciler_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
                                             external_status="error")
                 results.append({"job_id": job_id, "action": "poll_error",
                                 "error": poll_result.error})
-    
+
     return {"ok": True, "action": "polled", "polled": len(results),
             "results": results, "duration": round(time.time() - t0, 3)}
+
 
 
 def _async_sender_run_once(body: Dict[str, Any]) -> Dict[str, Any]:

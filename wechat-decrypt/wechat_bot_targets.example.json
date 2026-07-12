@@ -43,6 +43,9 @@
       "knowledge_bases": [
         "scene.bot_testing"
       ],
+      "reliable_pipeline_target": false,
+      "dedicated_agent_instance_id": "",
+      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding.",
       "_knowledge_bases_comment": "Each target can bind at most ONE knowledge-base alias (local or online). Remove the second alias if you want online retrieval."
     },
     {
@@ -81,7 +84,10 @@
       },
       "knowledge_bases": [
         "scene.chongqing_mobile_work"
-      ]
+      ],
+      "reliable_pipeline_target": false,
+      "dedicated_agent_instance_id": "",
+      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding."
     }
   ],
   "wiki_dir": "./wiki",

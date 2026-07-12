@@ -1362,7 +1362,7 @@ def _retrieve_leann_kb(query: str, spec: Dict[str, Any], per_limit: int, config:
 
 def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[str, Any],
                                limit: int = 6, core_limit: int | None = None,
-                               scene_limit: int | None = None) -> Dict[str, List[KnowledgeHit]]:
+                               scene_limit: int | None = None, skip_core: bool = False) -> Dict[str, List[KnowledgeHit]]:
     root = _kb_root(config)
     core_hits: List[KnowledgeHit] = []
     scene_hits: List[KnowledgeHit] = []
@@ -1372,10 +1372,11 @@ def retrieve_knowledge_layers(query: str, config: Dict[str, Any], target: Dict[s
     scene_limit = int(scene_limit if scene_limit is not None else cfg_re.get("scene_limit", max(0, limit - core_limit)))
 
     # First principle: core rules/boundaries always apply for every target.
-    core_docs = load_wiki(root / "core")
-    core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=core_limit)
-    for rel, body in core_ranked:
-        core_hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
+    if not skip_core:
+        core_docs = load_wiki(root / "core")
+        core_ranked = _rank_wiki_docs(query, [(f"core/{rel}", body) for rel, body in core_docs], limit=core_limit)
+        for rel, body in core_ranked:
+            core_hits.append(KnowledgeHit("local", "core", "first_principles", rel, body, _score_doc(query, rel, body) or 1))
 
     selected = target.get("knowledge_bases")
     if selected is None:
@@ -2279,7 +2280,8 @@ def build_prompt(raw_text: str, clean_text: str, wiki_hits: List[Any], context_m
 
 def generate_reply(message: Dict[str, Any] | str,
                    target: Dict[str, Any] | None = None,
-                   config: Dict[str, Any] | None = None) -> ReplyDecision:
+                   config: Dict[str, Any] | None = None,
+                   config_path: str | None = None) -> ReplyDecision:
     config = config or {}
     target = target or {}
     agent_mode = _agent_mode(config, target)
@@ -2389,6 +2391,7 @@ def generate_reply(message: Dict[str, Any] | str,
             vision_query_text, vision_image_descriptions = _local_image_descriptions(
                 image_paths, clean or raw_text, target=target, config=config
             )
+        retrieval_debug = {"mode": "raw_agent", "selected_kbs": selected_kbs}
         if delegate_to_agent:
             # thin-monitor mode: agent retrieves knowledge on demand via tools.
             kb_layers = {"core": [], "scene": []}
@@ -2445,7 +2448,6 @@ def generate_reply(message: Dict[str, Any] | str,
             # degrades through mmx → hooks → ocr → metadata.
             image_descriptions = _describe_images_for_agent(image_paths, clean or raw_text, target=target, config=config)
         else:
-            # Reuse descriptions already computed for KB query to avoid a second VLM call.
             image_descriptions = vision_image_descriptions
         prompt = _build_raw_agent_prompt(clean or raw_text, mention_name, response_mode, knowledge_hits=payload_knowledge_hits)
         # Inject readable aggregator context before the [用户消息] block
@@ -2519,6 +2521,9 @@ def generate_reply(message: Dict[str, Any] | str,
                             "skill_name": effective_skill_name,
                             "knowledge_hits": payload_knowledge_hits,
                             "knowledge_bases": selected_kbs,
+                            # Strict-pipeline hints consumed by ``_prepare_model_job``.
+                            "_allowed_kb_ids": selected_kbs,
+                            "_config_path": config_path,
                             "reply_mode": "raw_agent",
                             "agent_mode": effective_agent_mode,
                             "available_tools": _tool_agent_available_tools(config, target) if delegate_to_agent else [],

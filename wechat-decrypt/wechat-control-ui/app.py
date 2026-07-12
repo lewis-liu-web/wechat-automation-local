@@ -1556,6 +1556,14 @@ def _page_knowledge():
                             st.json(dres)
 
 
+def _job_status_for_display(job):
+    """Return a status key for display, treating send-skipped as a distinct state."""
+    status = str(job.get("status") or "")
+    if status == "sent" and job.get("send_status") == "skipped":
+        return "skipped"
+    return status
+
+
 def _job_status_label(value):
     return {
         "queued": "排队中",
@@ -1566,6 +1574,7 @@ def _job_status_label(value):
         "done": "处理完成",
         "sending": "准备发送",
         "sent": "已发送",
+        "skipped": "已跳过发送",
         "failed": "处理失败",
         "timeout": "处理超时",
         "expired": "等待过期",
@@ -1607,6 +1616,8 @@ def _job_summary(job):
         return "处理超时，建议重试或检查处理服务"
     if status == "failed":
         return "处理失败：%s" % ((job.get("error") or "未知原因")[:80])
+    if status == "sent" and job.get("send_status") == "skipped":
+        return "Agent 已处理，无需回复"
     return (job.get("result_text") or job.get("error") or "")[:100]
 
 
@@ -1853,7 +1864,7 @@ def _page_agent_jobs():
                 st.success("测试任务已创建。下一步：如果后台处理服务已运行，任务会自动开始；也可以用下方“立即处理一次”。")
                 st.table([{
                     "任务编号": job.get("id"),
-                    "当前状态": _job_status_label(job.get("status")),
+                    "当前状态": _job_status_label(_job_status_for_display(job)),
                     "测试分组": job.get("group_key"),
                     "处理方式": _provider_label(job.get("provider")),
                 }])
@@ -1924,7 +1935,7 @@ def _page_agent_jobs():
             external_session = j.get("external_session_id") or (payload.get("agent_instance_id") if isinstance(payload, dict) else "") or "—"
             table.append({
                 "任务编号": j.get("id"),
-                "当前状态": _job_status_label(j.get("status")),
+                "当前状态": _job_status_label(_job_status_for_display(j)),
                 "群/联系人": j.get("target_name") or j.get("group_key"),
                 "任务内容": (payload.get("prompt") or payload.get("clean_text") or "")[:40],
                 "创建时间": created_str,

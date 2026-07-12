@@ -181,26 +181,40 @@ def process_once(*,
     if not job:
         return {"ok": True, "action": "idle", "timed_out": timed_out}
 
+    # Stage 2: force strict AgentResult contract for every legacy-path job.
+    # This makes the consumer layer the migration point; producers keep
+    # working until the legacy branch is removed.
+    if not isinstance(job.get("payload"), dict):
+        job["payload"] = {}
+    job["payload"]["reliable_result_contract"] = True
+
     result = provider.run(job, timeout=timeout_seconds)
     raw = result.raw or {}
     bridge_patch = {key: raw.get(key) for key in ("bridge_session_id", "bridge_user_msg_id") if raw.get(key)}
     if bridge_patch:
         jobs.merge_payload(int(job["id"]), bridge_patch, db_path=db_path)
-    if result.ok and result.reply_text:
+    contract_action = raw.get("agent_result", {}).get("action") if isinstance(raw.get("agent_result"), dict) else None
+    is_no_reply_action = contract_action in ("silent", "escalate")
+    if result.ok and (result.reply_text or is_no_reply_action):
+        # Main feature: sanitize the reply text on every send path and honor ``max_reply_chars``.
         cfg = _load_config(config_path or DEFAULT_CONFIG_PATH) or {}
         sanitized_text = sanitize_reply_text(result.reply_text, job.get("payload"), cfg)
         completed = jobs.complete_job(int(job["id"]), sanitized_text, db_path=db_path)
         # M3: Send result back to WeChat if enabled
         send_status = {"sent": False, "reason": "send_disabled"}
-        if send_enabled and _HAS_SENDER:
+        skipped = False
+        if send_enabled and _HAS_SENDER and result.reply_text and not is_no_reply_action:
             send_status = _send_result_back(job, sanitized_text, config_path or DEFAULT_CONFIG_PATH)
             if send_status.get("sent"):
                 jobs.mark_sent(int(job["id"]), db_path=db_path)
             else:
                 jobs.mark_send_failed(int(job["id"]), send_status.get("reason", "send failed"), db_path=db_path)
+        elif is_no_reply_action and completed:
+            skipped = jobs.mark_send_skipped(int(job["id"]), reason=contract_action, db_path=db_path)
+            send_status = {"sent": False, "reason": contract_action}
         return {
-            "ok": completed,
-            "action": "completed",
+            "ok": completed and (skipped if is_no_reply_action else True),
+            "action": "silent" if contract_action == "silent" else ("escalated" if contract_action == "escalate" else "completed"),
             "job_id": job["id"],
             "job_key": job["job_key"],
             "provider": result.provider,
