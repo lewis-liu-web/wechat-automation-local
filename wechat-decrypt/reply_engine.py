@@ -2118,11 +2118,10 @@ def _run_tool_agent_sync(
 ) -> ReplyDecision | None:
     """Route a tool_agent request through the deep-agent provider synchronously.
 
-    The synchronous build_prompt()/call_llm_provider() path does not inject tool
-    instructions or run the tool loop, so agent_mode='tool_agent' must be handled
-    by an AgentProvider (HermesProvider) that does both. If the provider is
-    unavailable or returns no reply, return None so the caller can fall back to
-    standard retrieval.
+    Stage 2 Phase B: the provider job is always strict and carries target-scoped
+    KB authorization via ``_allowed_kb_ids``. The provider returns a whole-stdout
+    AgentResult; reply, silent, and escalate actions are mapped explicitly to
+    ReplyDecision without falling back to display text.
     """
     from agent_provider import provider_from_config
 
@@ -2141,10 +2140,12 @@ def _run_tool_agent_sync(
         "leann": leann_cfg,
         "knowledge_hits": [],
         "knowledge_bases": selected_kbs,
+        "_allowed_kb_ids": selected_kbs,
         "image_paths": image_paths,
         "mention_name": mention_name,
         "mode_instruction": _mode_instruction(response_mode),
         "max_reply_chars": _max_reply_chars(config),
+        "reliable_result_contract": True,
         "target": {
             "id": target.get("id"),
             "name": target.get("name"),
@@ -2165,12 +2166,20 @@ def _run_tool_agent_sync(
         logger.warning("tool_agent sync provider failed: %r; falling back to standard retrieval", exc)
         return None
 
-    if not result.ok or not result.reply_text:
+    if not result or not result.ok:
         logger.warning("tool_agent sync provider returned no reply: %s", getattr(result, "error", "") or "")
         return None
 
-    reply = postcheck(_clean_agent_output(result.reply_text), config)
-    if reply == "[SILENT]":
+    raw = getattr(result, "raw", None)
+    if type(raw) is not dict:
+        return None
+    agent_result = raw.get("agent_result")
+    if type(agent_result) is not dict:
+        return None
+    status = getattr(result, "status", "")
+    action = str(agent_result.get("action") or "").lower()
+
+    if action == "silent":
         return ReplyDecision(
             should_reply=False,
             reply_text="",
@@ -2181,6 +2190,26 @@ def _run_tool_agent_sync(
             wiki_hits=[],
             retrieval_debug={"agent_mode": "tool_agent", "route": "tool_agent_sync"},
         )
+    if action == "escalate":
+        return ReplyDecision(
+            should_reply=False,
+            reply_text="",
+            intent="tool_agent_escalate",
+            risk_level=str(agent_result.get("risk_level") or "high"),
+            need_human=True,
+            reason="tool_agent_provider_escalate",
+            wiki_hits=[],
+            retrieval_debug={"agent_mode": "tool_agent", "route": "tool_agent_sync"},
+        )
+    if action != "reply":
+        return None
+
+    reply_text = str(agent_result.get("reply_text") or "").strip()
+    if not reply_text:
+        return None
+    reply = sanitize_reply_text(reply_text, payload, config)
+    if not reply:
+        return None
     return ReplyDecision(
         True,
         reply,

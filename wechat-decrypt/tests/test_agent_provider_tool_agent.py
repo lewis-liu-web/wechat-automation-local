@@ -1,7 +1,9 @@
-"""Tests for agent_provider tool_agent / leann_search POC."""
+"""Tests for strict Hermes provider prompts and AgentResult handling."""
 
 import json
 import sys
+import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -55,200 +57,125 @@ def test_build_prompt_keeps_standard_mode_unchanged():
     assert "leann_search" not in prompt
 
 
-def test_extract_tool_call_parses_leann_search_json():
-    text = (
-        "我需要查一下资料。\n"
-        '{"tool": "leann_search", "index_name": "product_kb", "query": "工作号真实号", "top_k": 3}\n'
-        "根据结果回复。"
-    )
-    call = ap._extract_tool_call(text)
-    assert call is not None
-    assert call["tool"] == "leann_search"
-    assert call["index_name"] == "product_kb"
-    assert call["query"] == "工作号真实号"
-    assert call["top_k"] == 3
 
 
-def test_extract_tool_call_ignores_non_tool_json():
-    text = '{"reply": "hello"}'
-    assert ap._extract_tool_call(text) is None
-
-
-def test_extract_tool_call_ignores_wechat_query_history_json():
-    """wechat_query_history must not be executed by the Python tool loop."""
-    text = '{"tool": "wechat_query_history", "chat_name": "群名", "keyword": "会议", "limit": 10}'
-    assert ap._extract_tool_call(text) is None
-
-
-def test_run_leann_search_calls_subprocess_with_correct_args():
-    fake_stdout = json.dumps([{"title": "工作号真实号", "content": "号码认证产品"}])
-    with mock.patch("agent_provider.subprocess.run") as mock_run:
-        mock_run.return_value = mock.Mock(
-            returncode=0,
-            stdout=fake_stdout,
-            stderr="",
-        )
-        result = ap._run_leann_search("leann", "product_kb", "工作号真实号", 5, 30)
-
-    mock_run.assert_called_once()
-    args, kwargs = mock_run.call_args
-    cmd = kwargs.get("args") or args[0]
-    assert cmd[:4] == ["leann", "search", "product_kb", "工作号真实号"]
-    assert "--top-k" in cmd
-    assert "5" in cmd
-    assert "--json" in cmd
-    assert "--non-interactive" in cmd
-    assert kwargs["env"].get("HF_ENDPOINT") == "https://hf-mirror.com"
-    assert result == fake_stdout
-
-
-def test_run_leann_search_sets_create_no_window():
-    with mock.patch("agent_provider.subprocess.run") as mock_run:
-        mock_run.return_value = mock.Mock(returncode=0, stdout="[]", stderr="")
-        ap._run_leann_search("leann", "x", "q", 3, 10)
-    args, kwargs = mock_run.call_args
-    assert kwargs.get("creationflags") == ap._NO_WINDOW_FLAGS
-
-
-def test_run_leann_search_returns_failure_marker_on_empty_output():
-    with mock.patch("agent_provider.subprocess.run") as mock_run:
-        mock_run.return_value = mock.Mock(returncode=0, stdout="   ", stderr="")
-        result = ap._run_leann_search("leann", "product_kb", "q", 3, 10)
-    assert result == "(LEANN search failed)"
-
-
-def test_run_leann_search_returns_failure_marker_on_nonzero_rc():
-    with mock.patch("agent_provider.subprocess.run") as mock_run:
-        mock_run.return_value = mock.Mock(returncode=1, stdout="", stderr="index not found")
-        result = ap._run_leann_search("leann", "product_kb", "q", 3, 10)
-    assert result == "(LEANN search failed)"
-
-
-def test_run_leann_search_returns_failure_marker_on_exception():
-    with mock.patch("agent_provider.subprocess.run", side_effect=OSError("boom")):
-        result = ap._run_leann_search("leann", "product_kb", "q", 3, 10)
-    assert result == "(LEANN search failed)"
-
-
-def test_tool_result_to_text_summarizes_json_results():
-    raw = json.dumps({
-        "results": [
-            {"title": "T1", "content": "C1" * 500},
-            {"title": "T2", "content": "C2"},
-        ]
+def _contract(action="reply", reply_text="answer", reason_code="answered", risk_level="low"):
+    return json.dumps({
+        "schema_version": 1,
+        "action": action,
+        "reply_text": reply_text,
+        "reason_code": reason_code,
+        "risk_level": risk_level,
     })
-    text = ap._tool_result_to_text(raw)
-    assert "[1] T1" in text
-    assert "[2] T2" in text
 
 
-def test_tool_result_to_text_returns_no_results_marker_for_empty_list():
-    assert ap._tool_result_to_text(json.dumps({"results": []})) == "(LEANN search returned no results)"
+def _completed(stdout, stderr="", rc=0):
+    return mock.Mock(returncode=rc, stdout=stdout, stderr=stderr)
 
 
-def test_hermes_provider_runs_tool_loop_and_re_runs_hermes():
-    """HermesProvider.run should invoke leann_search when the agent emits a tool call."""
-    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=2, leann_cli_path="leann")
-
-    first_stdout = (
-        '{"tool": "leann_search", "index_name": "kb", "query": "q", "top_k": 3}\n'
-        "Query: q\n"
-    )
-    second_stdout = "最终回复内容"
-
-    def fake_invoke(prompt, wait):
-        if "[工具调用结果" in prompt:
-            return {"ok": True, "stdout": second_stdout, "stderr": "", "rc": 0}
-        return {"ok": True, "stdout": first_stdout, "stderr": "", "rc": 0}
-
-    with mock.patch.object(provider, "_invoke_hermes", side_effect=fake_invoke), \
-         mock.patch("agent_provider._run_leann_search", return_value='{"results": [{"title": "R", "content": "C"}]}') as mock_leann:
-        result = provider.run({"payload": {"prompt": "q", "agent_mode": "tool_agent"}})
-
+def test_hermes_provider_run_is_strict_without_payload_flag():
+    """HermesProvider.run is always strict; a missing reliable_result_contract flag does not select the legacy path."""
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    with mock.patch("agent_provider.subprocess.run", return_value=_completed(_contract())):
+        result = provider.run({"payload": {"prompt": "q"}}, timeout=5)
     assert result.ok is True
-    assert result.reply_text == "最终回复内容"
-    mock_leann.assert_called_once_with("leann", "kb", "q", 3, 120)
+    assert result.status == "done"
+    assert result.reply_text == "answer"
+    assert result.raw.get("strict") is True
+    assert result.raw["agent_result"]["action"] == "reply"
 
 
-def test_hermes_provider_stops_at_max_tool_rounds():
-    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=1, leann_cli_path="leann")
-    stdout = '{"tool": "leann_search", "index_name": "kb", "query": "q", "top_k": 3}\n仍想再查'
-
-    with mock.patch.object(provider, "_invoke_hermes", return_value={"ok": True, "stdout": stdout, "stderr": "", "rc": 0}), \
-         mock.patch("agent_provider._run_leann_search", return_value='{"results": []}') as mock_leann:
-        result = provider.run({"payload": {"prompt": "q", "agent_mode": "tool_agent"}})
-
-    assert result.ok is True
-    # Should run tool once, then stop because max_tool_rounds=1 was reached.
-    assert mock_leann.call_count == 1
-
-
-def test_hermes_provider_strips_tool_call_json_at_max_rounds():
-    """If the model still emits a tool call after the budget is exhausted,
-    the JSON line must not appear in the final reply."""
-    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=1, leann_cli_path="leann")
-    stdout = '{"tool": "leann_search", "index_name": "kb", "query": "q", "top_k": 3}\n这是最终回复'
-
-    with mock.patch.object(provider, "_invoke_hermes", return_value={"ok": True, "stdout": stdout, "stderr": "", "rc": 0}), \
-         mock.patch("agent_provider._run_leann_search", return_value='{"results": []}'):
-        result = provider.run({"payload": {"prompt": "q", "agent_mode": "tool_agent"}})
-
-    assert result.ok is True
-    assert "leann_search" not in result.reply_text
-    assert "{" not in result.reply_text
-    assert "这是最终回复" in result.reply_text
-
-
-def test_extract_tool_call_ignores_malformed_and_empty_json():
-    """Invalid/empty JSON lines must be ignored; _extract_tool_call should not loop forever."""
-    assert ap._extract_tool_call("{") is None
-    assert ap._extract_tool_call("") is None
-    assert ap._extract_tool_call("not json at all") is None
-    assert ap._extract_tool_call("{ }") is None
-
-
-def test_hermes_provider_handles_missing_tool_arguments_gracefully():
-    """A tool call missing index_name or query should not crash or loop forever."""
-    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=2, leann_cli_path="leann")
-
-    first_stdout = '{"tool": "leann_search", "index_name": "", "query": "", "top_k": 3}\n'
-    second_stdout = "最终回复内容"
-
-    def fake_invoke(prompt, wait):
-        if "[工具调用结果" in prompt:
-            return {"ok": True, "stdout": second_stdout, "stderr": "", "rc": 0}
-        return {"ok": True, "stdout": first_stdout, "stderr": "", "rc": 0}
-
-    with mock.patch.object(provider, "_invoke_hermes", side_effect=fake_invoke), \
-         mock.patch("agent_provider._run_leann_search") as mock_leann:
-        result = provider.run({"payload": {"prompt": "q", "agent_mode": "tool_agent"}})
-
-    assert result.ok is True
-    assert result.reply_text == "最终回复内容"
-    # LEANN should not be called when required arguments are missing.
-    assert mock_leann.call_count == 0
-
-
-def test_run_leann_search_keeps_query_as_single_argv_element():
-    """Queries with spaces or special characters must remain one argv element."""
-    query = 'hello world & more "things"'
-    with mock.patch("agent_provider.subprocess.run") as mock_run:
-        mock_run.return_value = mock.Mock(returncode=0, stdout="[]", stderr="")
-        ap._run_leann_search("leann", "kb", query, 3, 10)
-
-    args, kwargs = mock_run.call_args
-    cmd = kwargs.get("args") or args[0]
-    # The query should appear exactly once and un-split in the command list.
-    assert cmd == [
-        "leann",
-        "search",
-        "kb",
-        query,
-        "--top-k",
-        "3",
-        "--json",
-        "--non-interactive",
+def test_hermes_provider_run_rejects_legacy_display_text_and_tool_call_json():
+    """Legacy display-text, box frames, ANSI, and bare tool-call JSON are rejected regardless of payload/meta."""
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    invalid_outputs = [
+        "╭─ ⚕ Hermes ─╮\nanswer\n╰─╯",
+        "\x1b[31merror\x1b[0m",
+        "Warning: tool failed\nanswer",
+        "plain Chinese reply",
+        '{"tool":"leann_search","query":"x"}',
+        _contract() + "\nextra trailing prose",
+        json.dumps({"schema_version": 1, "action": "reply", "reply_text": "answer"}),
     ]
+    for stdout in invalid_outputs:
+        with mock.patch("agent_provider.subprocess.run", return_value=_completed(stdout)):
+            result = provider.run({"payload": {"prompt": "q"}}, timeout=5)
+        assert result.ok is False, stdout
+        assert result.status == "failed"
+
+
+def test_hermes_provider_run_and_poll_produce_equivalent_agent_result():
+    """The same strict contract fixture produces equivalent AgentResult via run and submit/poll."""
+    contract = _contract()
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        provider = ap.HermesProvider(cli_path="hermes-test", hermes_home=str(home))
+        with mock.patch("agent_provider.subprocess.run", return_value=_completed(contract)):
+            run_result = provider.run({"payload": {"prompt": "q"}}, timeout=5)
+
+        with mock.patch("agent_provider.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock.Mock(pid=123)
+            sub = provider.submit({"id": 2, "payload": {"prompt": "q"}}, timeout=5)
+        session_dir = home / ".wechat_agent_jobs" / sub.raw["bridge_session_id"]
+        (session_dir / "result.json").write_text(
+            json.dumps({"rc": 0, "stdout": contract, "stderr": "", "latency": 0.1}),
+            encoding="utf-8",
+        )
+        poll_result = provider.poll(sub.raw["bridge_session_id"], 1)
+
+    assert run_result.ok == poll_result.ok is True
+    assert run_result.status == poll_result.status == "done"
+    assert run_result.reply_text == poll_result.reply_text == "answer"
+    assert run_result.raw["agent_result"] == poll_result.raw["agent_result"]
+
+
+def test_hermes_provider_submit_persists_strict_meta_always():
+    """HermesProvider.submit always writes strict=True in session meta.json regardless of incoming payload."""
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        provider = ap.HermesProvider(cli_path="hermes-test", hermes_home=str(home))
+        with mock.patch("agent_provider.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock.Mock(pid=123)
+            result = provider.submit({"id": 1, "payload": {"prompt": "q"}}, timeout=5)
+        assert result.ok is True
+        assert result.status == "submitted"
+        meta_path = home / ".wechat_agent_jobs" / result.raw["bridge_session_id"] / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["strict"] is True
+        prompt_path = home / ".wechat_agent_jobs" / result.raw["bridge_session_id"] / "prompt.txt"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        assert "严格输出协议" in prompt
+
+
+def test_hermes_provider_poll_is_strict_only():
+    """HermesProvider.poll parses the whole stdout as AgentResult and rejects legacy display text."""
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        provider = ap.HermesProvider(cli_path="hermes-test", hermes_home=str(home))
+        session = "hermes-test-session"
+        session_dir = home / ".wechat_agent_jobs" / session
+        session_dir.mkdir(parents=True)
+        (session_dir / "meta.json").write_text(
+            json.dumps({"strict": True, "deadline_at": time.time() + 60}),
+            encoding="utf-8",
+        )
+        result_path = session_dir / "result.json"
+        result_path.write_text(
+            json.dumps({"rc": 0, "stdout": _contract(), "stderr": "", "latency": 0.1}),
+            encoding="utf-8",
+        )
+        reply = provider.poll(session, 1)
+        assert reply.ok is True
+        assert reply.status == "done"
+        assert reply.raw["agent_result"]["reply_text"] == "answer"
+
+        result_path.write_text(
+            json.dumps({"rc": 0, "stdout": "plain text reply", "stderr": "", "latency": 0.1}),
+            encoding="utf-8",
+        )
+        invalid = provider.poll(session, 1)
+        assert invalid.ok is False
+
 
 
 def test_build_prompt_includes_wechat_mcp_hint_when_enabled():
@@ -338,51 +265,13 @@ def test_build_prompt_lists_allowed_index_names():
     assert "禁止搜索未列出的索引" in prompt
 
 
-def test_hermes_provider_enforces_allowed_index_names():
-    """If the model asks for a disallowed index, do not run leann_search."""
-    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=1, leann_cli_path="leann")
-    stdout = '{"tool": "leann_search", "index_name": "forbidden", "query": "q", "top_k": 3}\n回复'
-
-    with mock.patch.object(provider, "_invoke_hermes", return_value={"ok": True, "stdout": stdout, "stderr": "", "rc": 0}), \
-         mock.patch("agent_provider._run_leann_search") as mock_leann:
-        result = provider.run({
-            "payload": {
-                "prompt": "q",
-                "agent_mode": "tool_agent",
-                "available_tools": [
-                    {"name": "leann_search", "allowed_index_names": ["allowed"], "default_index_name": "allowed"}
-                ],
-            }
-        })
-
-    assert result.ok is True
-    assert "forbidden" not in result.reply_text
-    assert mock_leann.call_count == 0
-
-
-def test_hermes_provider_uses_default_index_name_when_omitted():
-    """If the model omits index_name, fall back to default_index_name."""
-    provider = ap.HermesProvider(cli_path="hermes", max_tool_rounds=1, leann_cli_path="leann")
-    stdout = '{"tool": "leann_search", "query": "q", "top_k": 3}\n回复'
-
-    with mock.patch.object(provider, "_invoke_hermes", return_value={"ok": True, "stdout": stdout, "stderr": "", "rc": 0}), \
-         mock.patch("agent_provider._run_leann_search", return_value='{"results": []}') as mock_leann:
-        result = provider.run({
-            "payload": {
-                "prompt": "q",
-                "agent_mode": "tool_agent",
-                "available_tools": [
-                    {"name": "leann_search", "allowed_index_names": ["allowed"], "default_index_name": "allowed"}
-                ],
-            }
-        })
-
-    assert result.ok is True
-    mock_leann.assert_called_once_with("leann", "allowed", "q", 3, 120)
+# Legacy HermesProvider.run tool-loop tests (removed in Stage 2 Phase B strict cutover).
+# The strict-only provider no longer runs the Python tool loop; tool execution is
+# delegated to Hermes's native MCP layer.
 
 
 def test_hermes_args_include_skill_and_toolsets_in_order():
-    """CLI args must include -s/--skill before -t/--toolsets when configured."""
+
     provider = ap.HermesProvider(
         cli_path="hermes",
         profile="p1",

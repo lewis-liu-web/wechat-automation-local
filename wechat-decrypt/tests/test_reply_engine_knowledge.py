@@ -12,6 +12,11 @@ sys.path.insert(0, str(ROOT))
 from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools, _tool_agent_allowed_leann_indexes, _resolve_skill_name, _wechat_side_payload, _thin_monitor_enabled
 import agent_provider as ap
 
+
+def _tool_agent_result_mock(reply_text="工具查询结果回复", action="reply", status="done", risk_level="low"):
+    return mock.Mock(ok=True, status=status, reply_text=reply_text, raw={"agent_result": {"action": action, "reply_text": reply_text, "reason_code": "test", "risk_level": risk_level}})
+
+
 class KnowledgeArchitectureTests(unittest.TestCase):
     def make_wiki(self):
         td = tempfile.TemporaryDirectory()
@@ -319,7 +324,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         }
         with mock.patch('agent_provider.HermesProvider') as MockProvider:
             instance = MockProvider.return_value
-            instance.run.return_value = mock.Mock(ok=True, reply_text='工具查询结果回复')
+            instance.run.return_value = _tool_agent_result_mock()
             d = generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
 
         self.assertTrue(d.should_reply)
@@ -330,6 +335,8 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         job = instance.run.call_args.args[0]
         payload = job.get('payload') or job
         self.assertEqual(payload.get('agent_mode'), 'tool_agent')
+        self.assertTrue(payload.get('reliable_result_contract'))
+        self.assertEqual(payload.get('_allowed_kb_ids'), ['scene.a'])
         self.assertTrue(any(t.get('name') == 'leann_search' for t in payload.get('available_tools', [])))
 
     def test_generate_reply_tool_agent_sync_falls_back_when_provider_fails(self):
@@ -342,13 +349,88 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         }
         with mock.patch('agent_provider.HermesProvider') as MockProvider:
             instance = MockProvider.return_value
-            instance.run.return_value = mock.Mock(ok=False, reply_text='', error='hermes not found')
+            instance.run.return_value = mock.Mock(ok=False, status='failed', reply_text='', raw={})
             d = generate_reply('小助手 苹果是什么', {'knowledge_bases':['scene.a']}, cfg)
 
         self.assertTrue(d.should_reply)
         # When the deep-agent provider fails, we should fall back to standard retrieval.
         self.assertTrue(any('scene.a' in x for x in d.wiki_hits))
         self.assertIn('tool_agent', d.retrieval_debug.get('agent_mode', ''))
+
+    def test_generate_reply_tool_agent_sync_silent_decision(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = _tool_agent_result_mock(reply_text="", action="silent", status="silent")
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['scene.a']}, cfg)
+        self.assertFalse(d.should_reply)
+        self.assertEqual(d.reply_text, "")
+        self.assertEqual(d.intent, "tool_agent_silent")
+        self.assertEqual(d.risk_level, "low")
+
+    def test_generate_reply_tool_agent_sync_escalate_decision(self):
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = _tool_agent_result_mock(reply_text="", action="escalate", status="escalated", risk_level="high")
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['scene.a']}, cfg)
+        self.assertFalse(d.should_reply)
+        self.assertEqual(d.reply_text, "")
+        self.assertEqual(d.intent, "tool_agent_escalate")
+        self.assertEqual(d.risk_level, "high")
+        self.assertTrue(d.need_human)
+
+    def test_generate_reply_tool_agent_sync_no_display_text_fallback(self):
+        """A raw display-text reply_text must not be used when action is not reply."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = mock.Mock(
+                ok=True, status="done", reply_text="display text fallback",
+                raw={"agent_result": {"action": "silent", "reply_text": "", "reason_code": "test", "risk_level": "low"}}
+            )
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['scene.a']}, cfg)
+        self.assertFalse(d.should_reply)
+        self.assertEqual(d.reply_text, "")
+        self.assertEqual(d.intent, "tool_agent_silent")
+
+    def test_generate_reply_tool_agent_sync_reply_requires_contract_reply_text(self):
+        """Strict reply action cannot fall back to AgentResult.reply_text."""
+        td, root = self.make_wiki()
+        self.addCleanup(td.cleanup)
+        cfg = {
+            'wiki_dir': str(root),
+            'knowledge_bases': {'scene.a': {'type': 'local', 'path': 'scenes/a'}},
+            'reply_engine': {'agent_mode': 'tool_agent'},
+        }
+        with mock.patch('agent_provider.HermesProvider') as MockProvider:
+            instance = MockProvider.return_value
+            instance.run.return_value = mock.Mock(
+                ok=True,
+                status="done",
+                reply_text="display text fallback",
+                raw={"agent_result": {"action": "reply", "reply_text": "", "reason_code": "test", "risk_level": "low"}},
+            )
+            d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['scene.a']}, cfg)
+        self.assertNotIn("display text fallback", d.reply_text)
 
     def test_provider_from_config_reads_max_tool_rounds_and_leann_cli_path(self):
         cfg = {
@@ -400,7 +482,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         }
         with mock.patch('agent_provider.HermesProvider') as MockProvider:
             instance = MockProvider.return_value
-            instance.run.return_value = mock.Mock(ok=True, reply_text='工具查询结果回复')
+            instance.run.return_value = _tool_agent_result_mock()
             d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['scene.a']}, cfg)
 
         self.assertTrue(d.should_reply)
@@ -481,12 +563,13 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         }
         with mock.patch('agent_provider.HermesProvider') as MockProvider:
             instance = MockProvider.return_value
-            instance.run.return_value = mock.Mock(ok=True, reply_text='工具查询结果回复')
+            instance.run.return_value = _tool_agent_result_mock()
             d = generate_reply('小助手 苹果是什么', {'knowledge_bases': ['leann.a']}, cfg)
 
         self.assertTrue(d.should_reply)
         job = instance.run.call_args.args[0]
         payload = job.get('payload') or job
+        self.assertEqual(payload.get('_allowed_kb_ids'), ['leann.a'])
         tool = payload['available_tools'][0]
         self.assertEqual(tool['allowed_index_names'], ['idx_a'])
         self.assertEqual(tool['default_index_name'], 'idx_a')

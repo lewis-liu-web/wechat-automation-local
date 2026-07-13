@@ -146,214 +146,6 @@ def discover_hermes_profiles(cli_path: str = "hermes", timeout: float = 5.0) -> 
     return parse_hermes_profile_list(proc.stdout or "")
 
 
-_NOISE_LINE_PATTERNS = [
-    re.compile(r"^Initializing\b", re.IGNORECASE),
-    re.compile(r"^Query:"),
-    re.compile(r"^preparing\b", re.IGNORECASE),
-    re.compile(r"^\s*read\b", re.IGNORECASE),
-    re.compile(r"^\s*find\b", re.IGNORECASE),
-    re.compile(r"^[─╭╮╰╯│\s]+$"),
-    re.compile(r"resume session", re.IGNORECASE),
-]
-
-
-def _clean_agent_output(text: str) -> str:
-    """Return only sendable lines from agent stdout, dropping tool/init noise."""
-    text = str(text or "").strip()
-    if not text:
-        return ""
-    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-    lines = text.splitlines()
-    useful: List[str] = []
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if any(p.search(line) for p in _NOISE_LINE_PATTERNS):
-            continue
-        useful.append(line)
-    if not useful:
-        return ""
-    return "\n".join(useful)
-
-
-def _extract_hermes_reply(stdout: str) -> str:
-    """Extract the actual reply from Hermes terminal output.
-
-    Strips the Hermes box frame, ANSI codes, tool hints. Uses the last
-    non-empty Hermes box because Hermes may emit intermediate reasoning
-    boxes before the final reply box.  In quiet mode Hermes prints no
-    frame, so we also drop stderr-style warnings and session metadata.
-    """
-    text = str(stdout or "").strip()
-    hermes_reply = ""
-    boxes = list(re.finditer(r"╭─ ⚕ Hermes ─+╮(.*?)╰─+╯", text, re.DOTALL))
-    if boxes:
-        last_box = boxes[-1]
-        box_content = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", last_box.group(1))
-        lines = [line.strip().strip("│").strip() for line in box_content.split("\n") if line.strip()]
-        hermes_reply = "\n".join(line for line in lines if line)
-    if not hermes_reply:
-        # Quiet mode: Hermes emits the reply followed by session metadata.
-        # Drop known metadata/warning lines and tool/init noise, and strip an
-        # inline warning prefix that may have been merged with the reply line.
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        cleaned_lines: List[str] = []
-        for line in lines:
-            # If a warning was concatenated with the reply, remove the warning part first.
-            line = re.sub(r"^Warning:[^@]*?(?=\@)", "", line, flags=re.IGNORECASE).strip()
-            if not line:
-                continue
-            if re.match(r"^(Warning:|session_id:|Session:|Duration:|Messages?|Tokens?|Resume this|Model:)", line, re.IGNORECASE):
-                continue
-            if any(p.search(line) for p in _NOISE_LINE_PATTERNS):
-                continue
-            cleaned_lines.append(line)
-        hermes_reply = "\n".join(cleaned_lines)
-    if not hermes_reply:
-        hermes_reply = _clean_agent_output(text)
-    return postcheck(hermes_reply)
-
-
-def _read_hermes_reply_file(session_dir: Path) -> str:
-    """Read final reply from response.txt or reply.txt if Hermes wrote it there."""
-    for filename in ("response.txt", "reply.txt"):
-        try:
-            reply_path = session_dir / filename
-            if reply_path.exists():
-                return reply_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-    return ""
-
-
-
-
-def _trim_reply_json_block(text: str) -> str:
-    """Remove trailing JSON object from the reply, including an optional 'json' label.
-
-    Kept for backward compatibility with old skill prompts that still ask for JSON.
-    """
-    text = str(text or "").rstrip()
-    if not text:
-        return ""
-    lines = text.splitlines()
-    cut_index = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.lower() == "json":
-            if i + 1 < len(lines) and lines[i + 1].strip().startswith("{"):
-                cut_index = i
-                break
-        elif stripped.startswith("{") and stripped.endswith("}"):
-            try:
-                json.loads(stripped)
-                cut_index = i
-                break
-            except Exception:
-                pass
-    if cut_index is not None:
-        trimmed = "\n".join(lines[:cut_index]).rstrip()
-        return trimmed
-    return text
-
-
-def _extract_tool_call(text: str) -> Dict[str, Any] | None:
-    """Look for a single-line JSON tool call such as {"tool": "leann_search", ...}."""
-    for raw_line in str(text or "").splitlines():
-        line = raw_line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict) and obj.get("tool") == "leann_search":
-                return obj
-        except Exception:
-            continue
-    return None
-
-
-def _strip_leann_tool_calls(text: str) -> str:
-    """Remove lines that are JSON leann_search tool calls from stdout.
-
-    When the model hits the tool-round budget and still emits a tool call,
-    the JSON line must not leak into the final WeChat reply.
-    """
-    cleaned: List[str] = []
-    for raw_line in str(text or "").splitlines():
-        line = raw_line.strip()
-        if line.startswith("{"):
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict) and obj.get("tool") == "leann_search":
-                    continue
-            except Exception:
-                pass
-        cleaned.append(raw_line)
-    return "\n".join(cleaned)
-
-
-def _run_leann_search(cli_path: str, index_name: str, query: str, top_k: int, timeout: float) -> str:
-    """Execute leann search CLI and return JSON text or a failure marker."""
-    env = dict(os.environ)
-    env.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-    cmd = [
-        str(cli_path or "leann"),
-        "search",
-        str(index_name),
-        str(query),
-        "--top-k",
-        str(int(top_k or 3)),
-        "--json",
-        "--non-interactive",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(1.0, float(timeout or 120)),
-            env=env,
-            creationflags=_NO_WINDOW_FLAGS,
-        )
-        if proc.returncode != 0 or not (proc.stdout or "").strip():
-            logger.warning("leann search failed rc=%s stderr=%s", proc.returncode, (proc.stderr or "")[:200])
-            return "(LEANN search failed)"
-        return (proc.stdout or "").strip()
-    except Exception as exc:
-        logger.warning("leann search exception: %s", exc)
-        return "(LEANN search failed)"
-
-
-def _tool_result_to_text(raw: str) -> str:
-    """Best-effort summarize leann JSON output for the agent prompt."""
-    text = str(raw or "").strip()
-    if not text:
-        return "(LEANN search returned no results)"
-    try:
-        payload = json.loads(text)
-        if isinstance(payload, dict):
-            results = payload.get("results") or payload.get("data") or payload.get("hits") or []
-        elif isinstance(payload, list):
-            results = payload
-        else:
-            results = []
-        if not results:
-            return "(LEANN search returned no results)"
-        lines: List[str] = []
-        for idx, item in enumerate(results[:5], start=1):
-            if isinstance(item, dict):
-                title = str(item.get("title") or item.get("id") or "").strip()
-                content = str(item.get("content") or item.get("text") or item.get("summary") or "").strip()
-                lines.append(f"[{idx}] {title}\n{content[:800]}")
-            else:
-                lines.append(f"[{idx}] {str(item)[:800]}")
-        return "\n\n".join(lines)
-    except Exception:
-        # Not JSON: return raw text truncated.
-        return text[:4000]
 
 
 def _strict_mode_available() -> bool:
@@ -548,10 +340,6 @@ def _last_assistant_message(messages: List[Dict[str, Any]], min_id: int = 0) -> 
         if msg.get("role") == "assistant" and msg_id > min_id:
             return msg
     return None
-
-
-def _sendable_reply_from_assistant(content: str) -> str:
-    return postcheck(_clean_agent_output(str(content or "").strip()))
 
 
 def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
@@ -939,161 +727,14 @@ class HermesProvider:
         status = "idle" if h.ok else "unavailable"
         return [WorkerStatus(worker_id=self.worker_id, provider=self.name, status=status)]
 
-    def _invoke_hermes(self, prompt_text: str, wait: float) -> Dict[str, Any]:
-        """Run Hermes once with the given prompt text and return raw result."""
-        import tempfile
-        prompt_file: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-                f.write(prompt_text)
-                prompt_file = Path(f.name)
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            proc = subprocess.run(
-                self._args(prompt_path=str(prompt_file)),
-                capture_output=True,
-                text=True,
-                timeout=wait,
-                env=self._build_env(),
-                encoding="utf-8",
-                errors="replace",
-                creationflags=_NO_WINDOW_FLAGS,
-                startupinfo=startupinfo,
-            )
-            return {
-                "stdout": (proc.stdout or "").strip(),
-                "stderr": (proc.stderr or "").strip(),
-                "rc": proc.returncode,
-                "ok": True,
-            }
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "hermes chat timed out", "timeout": True}
-        except Exception as e:
-            return {"ok": False, "error": repr(e)}
-        finally:
-            if prompt_file and prompt_file.exists():
-                try:
-                    prompt_file.unlink()
-                except Exception:
-                    pass
-
     def run(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
         t0 = time.time()
-        deadline = t0 + float(timeout or job.get("timeout") or 90)
         model_job, env = self._prepare_model_job(job)
-        wants_strict = _job_wants_strict(model_job)
-        if not wants_strict:
-            # Legacy tool_agent loop uses ``max_tool_rounds`` rounds of tool calls.
-            # Legacy path uses ``self._invoke_hermes`` (with ``self._build_env()``)
-            # rather than the strict-mode MCP-enriched env.  This is intentional:
-            # the strict MCP env only applies to strict jobs.
-            payload = dict(job)
-            payload["payload"] = _json_safe(payload.get("payload") or {})
-            payload["payload"]["max_tool_rounds"] = self.max_tool_rounds
-            prompt = _build_wechat_deep_prompt(payload)
-            full_prompt = (
-                f"{prompt}\n\n"
-                "[WECHAT_AGENT_JOB_JSON]\n"
-                f"{json.dumps(_json_safe(payload), ensure_ascii=False, indent=2)}\n"
-                "[/WECHAT_AGENT_JOB_JSON]"
-            )
-
-            current_prompt = full_prompt
-            tool_round = 0
-            last_stdout = ""
-            last_stderr = ""
-            last_rc = 0
-            leann_cfg = (payload.get("payload") or {}).get("leann") or {}
-            leann_cli = str(leann_cfg.get("cli_path") or self.leann_cli_path or "leann")
-            leann_timeout = float(leann_cfg.get("timeout") or 120)
-            available_tools = (payload.get("payload") or {}).get("available_tools") or []
-            allowed_index_names: List[str] = []
-            default_index_name = ""
-            for tool in available_tools or []:
-                if str(tool.get("name") or "").strip() == "leann_search":
-                    raw_allowed = tool.get("allowed_index_names") or []
-                    if raw_allowed:
-                        allowed_index_names = [str(x).strip() for x in raw_allowed if str(x).strip()]
-                        default_index_name = str(tool.get("default_index_name") or raw_allowed[0]).strip()
-                    break
-
-            while True:
-                remaining = max(5.0, deadline - time.time())
-                result = self._invoke_hermes(current_prompt, remaining)
-                if not result.get("ok"):
-                    return AgentResult(False, "timeout" if result.get("timeout") else "failed",
-                                       error=result.get("error", "hermes invocation failed"),
-                                       latency=time.time() - t0, provider=self.name,
-                                       worker_id=self.worker_id, raw={"cli_path": self.cli_path})
-                stdout = result["stdout"]
-                stderr = result["stderr"]
-                rc = result["rc"]
-                last_stdout = stdout
-                last_stderr = stderr
-                last_rc = rc
-
-                tool_call = _extract_tool_call(stdout)
-                if not tool_call or tool_round >= self.max_tool_rounds:
-                    # If the model still emitted a tool call after the budget was
-                    # exhausted, strip the JSON line so it cannot leak into the
-                    # final WeChat reply.
-                    if tool_call and tool_round >= self.max_tool_rounds:
-                        logger.warning("hermes emitted a tool call at max_tool_rounds=%s; stripping JSON from reply",
-                                       self.max_tool_rounds)
-                        stdout = _strip_leann_tool_calls(stdout)
-                    reply = _extract_hermes_reply(stdout)
-                    if not reply:
-                        return AgentResult(False, "failed",
-                                           error=f"hermes returned no sendable reply (rc={rc}): {stderr[:200] or 'no stderr'}",
-                                           latency=time.time() - t0, provider=self.name,
-                                           worker_id=self.worker_id, raw={"stdout": stdout, "stderr": stderr, "rc": rc})
-                    if rc != 0:
-                        logger.warning("hermes chat returned rc=%s but produced a sendable reply; accepting reply", rc)
-                    break
-
-                tool_name = str(tool_call.get("tool") or "").strip()
-                if tool_name == "leann_search":
-                    index_name = str(tool_call.get("index_name") or "").strip()
-                    if not index_name and default_index_name:
-                        index_name = default_index_name
-                    query = str(tool_call.get("query") or "").strip()
-                    top_k = int(tool_call.get("top_k") or 3)
-                    if allowed_index_names and index_name not in allowed_index_names:
-                        tool_result = f"(LEANN search failed: index_name '{index_name}' is not in the allowed list: {allowed_index_names})"
-                    elif not index_name or not query:
-                        tool_result = "(LEANN search failed: missing index_name or query)"
-                    else:
-                        raw_output = _run_leann_search(leann_cli, index_name, query, top_k, leann_timeout)
-                        tool_result = _tool_result_to_text(raw_output)
-                    tool_invocation = f"leann_search({index_name!r}, {query!r}, {top_k})"
-                else:
-                    tool_result = f"(unknown tool: {tool_name})"
-                    tool_invocation = f"{tool_name}(...)"
-                tool_round += 1
-                current_prompt = (
-                    f"{current_prompt}\n\n"
-                    f"[工具调用结果 #{tool_round}]\n"
-                    f"工具: {tool_invocation}\n"
-                    f"结果:\n{tool_result}\n"
-                    "请根据工具结果继续推理。如果已有足够信息，直接输出最终微信回复；否则可再次调用工具。"
-                )
-
-            if not reply:
-                return AgentResult(False, "failed", error="hermes returned no sendable reply",
-                                   latency=time.time() - t0, provider=self.name,
-                                   worker_id=self.worker_id, raw={"stdout": last_stdout, "stderr": last_stderr})
-            return AgentResult(True, "done", reply_text=reply,
-                               latency=time.time() - t0, provider=self.name,
-                               worker_id=self.worker_id,
-                               raw={"profile": self.profile, "model": self.model, "rc": last_rc,
-                                    "tool_rounds": tool_round})
-
-        # ---- Strict contract path ----
-        # Single-shot Hermes invocation: the model is required to emit one
-        # AgentResult JSON object.  No tool-call loop, no inline leann_search.
-        # The prompt is written to a fresh tempfile; the subprocess runs with
-        # the MCP-enriched env produced by ``_prepare_model_job``.
+        # Stage 2 Phase B: Hermes is strict-only. Force the contract flag even if
+        # the incoming payload omits it, and run the single-shot strict path.
+        payload = dict(model_job.get("payload") or {})
+        payload["reliable_result_contract"] = True
+        model_job["payload"] = payload
         prompt = _build_wechat_deep_prompt(model_job)
         full_prompt = (
             f"{prompt}\n\n"
@@ -1150,12 +791,9 @@ class HermesProvider:
                 except Exception:
                     pass
 
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        if wants_strict:
-            return self._strict_finalize_run(
-                proc=proc, stdout=stdout, stderr=stderr, t0=t0,
-            )
+        return self._strict_finalize_run(
+            proc=proc, stdout=(proc.stdout or "").strip(), stderr=(proc.stderr or "").strip(), t0=t0,
+        )
     def _strict_finalize_run(self, *, proc, stdout: str, stderr: str, t0: float) -> "AgentResult":
         """Validate the synchronous run output against the AgentResult contract.
         Strict mode rejects everything that is not a parseable AgentResult
@@ -1320,13 +958,11 @@ class HermesProvider:
             session_dir = base / session_id
             session_dir.mkdir(parents=True, exist_ok=True)
             model_job, env = self._prepare_model_job(job)
-            if not _job_wants_strict(model_job):
-                # Legacy submit path: surface max_tool_rounds so the model
-                # sees how many inline leann_search calls it may emit.
-                legacy_payload = dict(job)
-                legacy_payload["payload"] = _json_safe(legacy_payload.get("payload") or {})
-                legacy_payload["payload"]["max_tool_rounds"] = self.max_tool_rounds
-                model_job = legacy_payload
+            # Stage 2 Phase B: Hermes submit is strict-only. Force the contract
+            # flag so the prompt instructs the model to emit AgentResult JSON.
+            payload = dict(model_job.get("payload") or {})
+            payload["reliable_result_contract"] = True
+            model_job["payload"] = payload
             prompt = _build_wechat_deep_prompt(model_job)
             full_prompt = (
                 f"{prompt}\n\n"
@@ -1389,7 +1025,7 @@ class HermesProvider:
                 "result_path": str(result_path),
                 "profile": self.profile,
                 "model": self.model,
-                "strict": bool(_job_wants_strict(job)),
+                "strict": True,
             }, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
@@ -1401,7 +1037,14 @@ class HermesProvider:
 
     def poll(self, external_session_id: str, external_user_msg_id: int,
              timeout: float | None = None) -> AgentResult:
-        """Poll the background Hermes helper result file without blocking."""
+        """Poll the background Hermes helper result file without blocking.
+
+        Stage 2 Phase B: Hermes is strict-only.  The result file is parsed as
+        a whole-stdout AgentResult document.  Legacy jobs that still have
+        ``strict: false`` in their meta are expected to have been terminal-
+        expired by the explicit migration control before cutover; poll no
+        longer extracts free-form display text.
+        """
         t0 = time.time()
         session_id = str(external_session_id or "").strip()
         base = Path(self.hermes_home or os.getcwd()) / ".wechat_agent_jobs"
@@ -1410,74 +1053,180 @@ class HermesProvider:
         result_path = session_dir / "result.json"
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            if meta.get("strict") is False:
+                return _strict_failed_result(
+                    "legacy protocol job not migrated",
+                    latency=time.time() - t0,
+                    raw={"bridge_session_id": session_id, "stage": "legacy_not_migrated"},
+                    provider=self.name, worker_id=self.worker_id,
+                )
             if not result_path.exists():
                 if meta.get("deadline_at") and time.time() > float(meta.get("deadline_at") or 0):
-                    if meta.get("strict"):
-                        return _strict_failed_result(
-                            "hermes async timed out (strict mode)",
-                            latency=time.time() - t0,
-                            raw={"bridge_session_id": session_id, "timeout": True},
-                            provider=self.name, worker_id=self.worker_id,
-                        )
-                    return AgentResult(False, "timeout", error="hermes async timed out",
-                                       latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
-                                       raw={"bridge_session_id": session_id})
+                    return _strict_failed_result(
+                        "hermes async timed out (strict mode)",
+                        latency=time.time() - t0,
+                        raw={"bridge_session_id": session_id, "timeout": True},
+                        provider=self.name, worker_id=self.worker_id,
+                    )
                 return AgentResult(False, "running", reply_text="",
                                    latency=time.time() - t0, provider=self.name, worker_id=self.worker_id,
                                    raw={"bridge_session_id": session_id})
             data = json.loads(result_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            return AgentResult(False, "failed", error=repr(e), latency=time.time() - t0,
+        except Exception:
+            return AgentResult(False, "failed", error="poll failed", latency=time.time() - t0,
                                provider=self.name, worker_id=self.worker_id,
                                raw={"bridge_session_id": session_id})
-        if meta.get("strict"):
-            return self._strict_finalize_poll(data=data, session_id=session_id)
-        stdout = str(data.get("stdout") or "").strip()
-        stderr = str(data.get("stderr") or "").strip()
-        rc = int(data.get("rc") or 0)
-        # Helper: try to read response.txt/reply.txt when Hermes writes the final reply to a file
-        # instead of printing it to stdout.
-        def _read_reply_txt() -> str:
-            return _read_hermes_reply_file(session_dir)
-
-        def _trim_if_legacy(text: str) -> str:
-            """Only trim JSON for legacy skill_prompt jobs that still ask for JSON."""
-            return _trim_reply_json_block(text)
-
-        def _extract(text: str) -> str:
-            reply = _extract_hermes_reply(text)
-            if not reply:
-                reply = _read_reply_txt()
-            return reply
-
-        if data.get("timeout"):
-            reply = _extract(stdout)
-            if reply:
-                # For legacy prompts that asked for JSON metadata, keep only the prose part.
-                reply = _trim_if_legacy(reply)
-                return AgentResult(True, "done", reply_text=reply,
-                                   latency=float(data.get("latency") or 0), provider=self.name,
-                                   worker_id=self.worker_id, raw=data)
-            return AgentResult(False, "timeout", error="hermes chat timed out",
-                               latency=float(data.get("latency") or 0), provider=self.name,
-                               worker_id=self.worker_id, raw=data)
-        if rc != 0 and not stdout:
-            return AgentResult(False, "failed", error=f"hermes chat failed (rc={rc}): {stderr[:200] or 'no output'}",
-                               latency=float(data.get("latency") or 0), provider=self.name,
-                               worker_id=self.worker_id, raw=data)
-        reply = _extract(stdout)
-        if not reply:
-            return AgentResult(False, "failed", error="hermes returned no sendable reply",
-                               latency=float(data.get("latency") or 0), provider=self.name,
-                               worker_id=self.worker_id, raw=data)
-        # For legacy prompts that asked for JSON metadata, keep only the prose part.
-        reply = _trim_if_legacy(reply)
-        return AgentResult(True, "done", reply_text=reply,
-                           latency=float(data.get("latency") or 0), provider=self.name,
-                           worker_id=self.worker_id, raw=data)
+        return self._strict_finalize_poll(data=data, session_id=session_id)
 
     def cancel(self, job_id: str) -> bool:
         return False
+
+
+def preflight_hermes_profile(
+    prompt: str,
+    *,
+    cli_path: str = "hermes",
+    profile: str | None = None,
+    hermes_home: str | None = None,
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    """Isolated dry-run helper for a Hermes profile.
+
+    Does not accept a live job, does not enqueue, and does not persist provider
+    stdout. It executes a supplied Hermes profile only when deliberately invoked,
+    parses the whole stdout against the strict AgentResult contract, and returns
+    only safe metadata.
+    """
+    t0 = time.time()
+    if not _strict_mode_available():
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "strict contract validator unavailable",
+            "stage": "validator_unavailable",
+        }
+
+    provider = HermesProvider(
+        cli_path=cli_path,
+        profile=profile,
+        hermes_home=hermes_home,
+        worker_id="preflight",
+    )
+    job: Dict[str, Any] = {
+        "payload": {
+            "reliable_result_contract": True,
+            "allowed_kb_ids": [],
+            "prompt": str(prompt or "").strip(),
+            "clean_text": str(prompt or "").strip(),
+        }
+    }
+    prompt_text = _build_wechat_deep_prompt(job)
+    full_prompt = (
+        f"{prompt_text}\n\n"
+        "[WECHAT_AGENT_JOB_JSON]\n"
+        f"{json.dumps(_json_safe(job), ensure_ascii=False, indent=2)}\n"
+        "[/WECHAT_AGENT_JOB_JSON]"
+    )
+
+    import tempfile
+    prompt_file: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            f.write(full_prompt)
+            prompt_file = Path(f.name)
+
+        run_kwargs: Dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "timeout": max(1.0, float(timeout)),
+            "env": provider._build_env(),
+            "encoding": "utf-8",
+            "errors": "replace",
+            "creationflags": _NO_WINDOW_FLAGS,
+        }
+        if hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            run_kwargs["startupinfo"] = startupinfo
+        proc = subprocess.run(provider._args(prompt_path=str(prompt_file)), **run_kwargs)
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "hermes chat timed out",
+            "stage": "timeout",
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "hermes runner error",
+            "stage": "runner_error",
+        }
+    finally:
+        if prompt_file and prompt_file.exists():
+            try:
+                prompt_file.unlink()
+            except Exception:
+                pass
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    rc = proc.returncode
+    if rc != 0 and not stdout:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "hermes chat failed",
+            "stage": "rc_nonzero_no_stdout",
+        }
+    if rc != 0:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "hermes chat returned nonzero exit",
+            "stage": "rc_nonzero_with_stdout",
+        }
+    if not stdout:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "hermes chat returned empty stdout",
+            "stage": "empty_stdout",
+        }
+    try:
+        contract = _strict_parse_stdout(stdout)
+    except AgentResultContractError:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "AgentResult contract violation",
+            "stage": "contract_violation",
+        }
+    return {
+        "ok": True,
+        "status": "pass",
+        "action": getattr(contract, "action", None),
+        "schema_version": getattr(contract, "schema_version", 1),
+        "reason": "preflight_ok",
+        "stage": "parsed",
+        "latency": round(time.time() - t0, 3),
+    }
 
 
 def provider_from_config(config: Dict[str, Any] | None = None,

@@ -117,3 +117,27 @@ def test_strict_prompt_replaces_legacy_no_json_instruction():
     prompt = provider_module._build_wechat_deep_prompt(_strict_job())
     assert "仅输出一个符合下方严格协议的 JSON 对象" in prompt
     assert "不要输出思考过程、工具日志、Markdown 计划或 JSON 外壳" not in prompt
+
+
+def test_strict_run_without_flag_is_strict():
+    """A payload that omits reliable_result_contract still runs the strict path."""
+    provider = provider_module.HermesProvider(cli_path="hermes-test")
+    with mock.patch("agent_provider.subprocess.run", return_value=_completed(_contract())):
+        result = provider.run({"payload": {"prompt": "question"}}, timeout=5)
+    assert result.ok is True
+    assert result.status == "done"
+    assert result.raw["agent_result"]["action"] == "reply"
+
+
+def test_strict_submit_always_persists_strict_meta():
+    """HermesProvider.submit always writes strict=True in meta.json regardless of payload."""
+    with tempfile.TemporaryDirectory() as tmp:
+        provider = provider_module.HermesProvider(cli_path="hermes-test", hermes_home=str(tmp))
+        with mock.patch("agent_provider.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock.Mock(pid=42)
+            result = provider.submit({"id": 1, "payload": {"prompt": "q"}}, timeout=5)
+        assert result.ok is True
+        assert result.status == "submitted"
+        meta_path = Path(tmp) / ".wechat_agent_jobs" / result.raw["bridge_session_id"] / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta.get("strict") is True

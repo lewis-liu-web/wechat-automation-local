@@ -1,37 +1,13 @@
-"""Stage 2 target-state tests.
+"""Stage 2 strict Hermes AgentResult contract tests.
 
-Lock in the property previously guarded by ``agent_provider._clean_agent_output``
-/ ``agent_provider._extract_hermes_reply`` /
-``agent_provider._sendable_reply_from_assistant``: **anything that is not a
-valid AgentResult contract JSON document must be rejected** by
-``HermesProvider.run`` under the strict contract path.  Display-text noise
-(Hermes box frames, ANSI escapes, tool logs, partial-JSON chatter) is no
-longer parsed or extracted — those legacy helpers will be removed from the
-production path once legacy callers are migrated to
-``reliable_worker`` / ``reliable_pipeline``.
+Anything that is not a valid AgentResult contract JSON document must be
+rejected by ``HermesProvider.run``. Display-text noise (Hermes box frames,
+ANSI escapes, tool logs, partial-JSON chatter) is never extracted into a
+WeChat reply.
 
-These tests are written against the target-state HermesProvider behavior:
-
-* ``reliable_result_contract: True`` (or any truthy value) on the job payload
-  forces strict parsing of the entire stdout as an AgentResult document.
-* Valid contract → ``AgentResult(ok=True, status="done"|"silent"|"escalated",
-  reply_text=<only when action=="reply">, raw["agent_result"]=<contract>)``.
-* Anything else (boxes, ANSI, tool logs, partial JSON, missing fields, wrong
-  action, reply_text on silent/escalate, etc.) → ``AgentResult(ok=False,
-  status="failed", reply_text="", raw["stage"]=<one of
-  "rc_nonzero_no_stdout"|"rc_nonzero_with_stdout"|"empty_stdout"|
-  "contract_violation"|"timeout">)``.
-
-Until ``agent_provider.HermesProvider`` is switched to strict-only and the
-legacy ``_extract_hermes_reply`` callers (agent_worker, wechat_bot_monitor,
-reply_engine manual routes) are migrated, these tests intentionally
-characterise the strict-only target behavior and may report failure on the
-current legacy code path. They pass once Stage 2 production migration lands.
-
-These tests do NOT call ``_clean_agent_output``,
-``_extract_hermes_reply`` or ``_sendable_reply_from_assistant``: the
-directives for Stage 2 keep the function symbols around for diagnostic
-purposes, but they MUST NOT appear in any production path or in these tests.
+The strict provider accepts exactly one AgentResult JSON object and projects it
+to ``AgentResult(ok=True, status="done"|"silent"|"escalated")``. Any other
+output produces ``AgentResult(ok=False, status="failed")`` with a fixed stage.
 """
 
 import json

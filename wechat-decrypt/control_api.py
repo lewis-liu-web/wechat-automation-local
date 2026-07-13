@@ -62,6 +62,7 @@ from agent_provider import (  # noqa: E402
     HermesProvider,
     discover_hermes_profiles,
     list_agent_instances,
+    preflight_hermes_profile,
     provider_from_config,
 )
 import manage_targets as mt  # noqa: E402
@@ -472,6 +473,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             instance_id = (params.get("instance_id") or [None])[0]
             provider = _build_agent_provider(provider_name, instance_id=instance_id)
             return _ok(health=provider.health().to_dict())
+        if method == "POST" and path == "/agent/preflight/run":
+            return _ok(**_preflight_configured_hermes(body))
 
 
         # ---- Stage 1 reliable pipeline (run-once + status + scheduler) ----
@@ -502,6 +505,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(**_async_loop_start(body))
         if method == "POST" and path == "/agent/async-loop/stop":
             return _ok(**_async_loop_stop())
+        if method == "POST" and path == "/agent/async-jobs/expire-legacy":
+            return _ok(**_expire_legacy_async_jobs())
         if method == "POST" and (m := _match(path, "/agent/instance/{id}/on-duty")):
             return _ok(**_async_loop_start({"instance_id": str(m[0])}))
         if method == "POST" and (m := _match(path, "/agent/instance/{id}/off-duty")):
@@ -2015,6 +2020,70 @@ def _async_loop_status() -> Dict[str, Any]:
     state["running"] = bool(thread and thread.is_alive() and not _ASYNC_LOOP_STOP.is_set())
     state["thread_alive"] = bool(thread and thread.is_alive())
     return state
+
+
+def _preflight_configured_hermes(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a strict preflight for one configured Hermes provider only.
+
+    HTTP callers can select a registered instance, but cannot provide an
+    executable path or Hermes home directory. This keeps the local control API
+    from becoming an arbitrary-command launcher while preserving an explicit
+    per-profile preflight.
+    """
+    instance_id = str(body.get("instance_id") or "").strip() or None
+    try:
+        provider = _build_agent_provider(instance_id=instance_id)
+    except Exception:
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "configured Hermes provider unavailable",
+            "stage": "provider_unavailable",
+        }
+    if not isinstance(provider, HermesProvider):
+        return {
+            "ok": False,
+            "status": "fail",
+            "action": None,
+            "schema_version": None,
+            "reason": "configured provider is not Hermes",
+            "stage": "provider_invalid",
+        }
+    return preflight_hermes_profile(
+        prompt=str(body.get("prompt") or "").strip(),
+        cli_path=provider.cli_path,
+        profile=provider.profile,
+        hermes_home=provider.hermes_home,
+        timeout=float(body.get("timeout") or 30),
+    )
+
+
+def _expire_legacy_async_jobs(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Explicit, manual control to terminal-expire active legacy async jobs.
+
+    Identifies jobs that are in dispatching/submitted/agent_running, have an
+    external session id, and do not have the strict contract flag in their
+    payload. Marks them expired with a fixed safe reason. Queued jobs are left
+    untouched; the strict-only provider will process them correctly. Returns
+    only sanitized scalar IDs/counts and never the payload or raw provider text.
+    """
+    job_ids = agent_jobs.list_legacy_async_jobs(db_path=db_path)
+    expired: List[int] = []
+    for job_id in job_ids:
+        if agent_jobs.mark_expired(
+            job_id,
+            reason="legacy protocol job expired before strict cutover",
+            db_path=db_path,
+        ):
+            expired.append(job_id)
+    return {
+        "ok": True,
+        "action": "expired",
+        "count": len(expired),
+        "job_ids": expired,
+    }
 
 
 def _async_loop_start(body: Dict[str, Any]) -> Dict[str, Any]:

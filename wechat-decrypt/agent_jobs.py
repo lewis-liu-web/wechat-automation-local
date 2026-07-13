@@ -108,10 +108,8 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def sanitize_agent_result_text(text: str) -> str:
     """Lightweight format cleanup before a reply is stored or sent.
 
-    Responsibilities: strip ANSI escapes, terminal box characters, and the
-    "Resume this session" prompt; merge remaining non-empty lines into a single
-    line.  Detection of tool logs or Hermes init noise belongs to the provider
-    layer (``agent_provider._clean_agent_output``).
+    This is defense in depth for persisted replies. Hermes output validation is
+    enforced at the provider boundary by the strict AgentResult contract.
     """
     value = str(text or "").replace("\r", "").strip()
     if not value:
@@ -793,18 +791,52 @@ def mark_agent_running(job_id: int, *, next_poll_at: float | None = None,
 
 
 def mark_expired(job_id: int, *, reason: str = "past deadline", db_path: Optional[Path] = None) -> bool:
-    """Mark a submitted/agent_running job as expired (past agent_deadline_at)."""
+    """Mark an active async job as expired.
+
+    ``dispatching`` is accepted for the explicit legacy-protocol cutover
+    control. Normal deadline expiry only reaches submitted/agent_running.
+    """
     now = _now()
     with _WRITE_LOCK, _connect(db_path) as con:
         cur = con.execute(
             """
             UPDATE agent_jobs
-            SET status=?, error=?, finished_at=?, external_status=?
-            WHERE id=? AND status IN (?, ?)
+            SET status=?, error=?, finished_at=?, external_status=?,
+                dispatch_owner=NULL, dispatch_locked_until=NULL
+            WHERE id=? AND status IN (?, ?, ?)
             """,
-            (STATUS_EXPIRED, str(reason or "past deadline")[:500], now, "expired", int(job_id), STATUS_SUBMITTED, STATUS_AGENT_RUNNING),
+            (
+                STATUS_EXPIRED, str(reason or "past deadline")[:500], now, "expired",
+                int(job_id), STATUS_DISPATCHING, STATUS_SUBMITTED, STATUS_AGENT_RUNNING,
+            ),
         )
         return cur.rowcount == 1
+
+
+def list_legacy_async_jobs(*, db_path: Optional[Path] = None) -> List[int]:
+    """Return IDs of active async jobs launched under the legacy protocol.
+
+    Legacy means an external session is present and the persisted payload does
+    not opt in to the strict AgentResult contract. Queued jobs are excluded by
+    design; the strict-only provider will process them correctly.
+    """
+    active_statuses = (STATUS_DISPATCHING, STATUS_SUBMITTED, STATUS_AGENT_RUNNING)
+    out: List[int] = []
+    with _connect(db_path) as con:
+        rows = con.execute(
+            """
+            SELECT id, payload_json FROM agent_jobs
+            WHERE status IN (?, ?, ?)
+              AND external_session_id IS NOT NULL
+              AND external_session_id != ''
+            """,
+            active_statuses,
+        ).fetchall()
+        for row in rows:
+            payload = _json_loads(row["payload_json"])
+            if not bool(payload.get("reliable_result_contract")):
+                out.append(int(row["id"]))
+    return out
 
 
 def update_poll_state(job_id: int, *, next_poll_at: float, external_status: str | None = None,
