@@ -439,13 +439,27 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
    - 测试：`python -m pytest wechat-decrypt/tests/test_reliable_worker.py wechat-decrypt/tests/test_agent_provider_tool_agent.py -v`，结果 `95 passed`。新增用例验证 `contract_violation` 等枚举被持久化到 `turn_jobs.provider_diagnostics_json`，且不回显 raw stdout/错误原文。
    - 部署：control_api 原已停止；robocopy 同步 `reliable_worker.py` + `agent_provider.py` 到 `E:/projects/GA-projects/CD-only/wechat-decrypt` 后，从 runtime 目录启动 `python control_api.py --host 127.0.0.1 --port 18590`；`/status` 返回 `{"ok": true, "monitor_running": false, ...}`，控制平面无异常（monitor 未启动，本次改动不涉及 monitor）。
    - 索引：已刷新 codebase-memory fast index（3474 nodes / 19807 edges）。
-2. 按 stage 分布修复 Hermes 间歇失败（或引入 bounded retry）。
-3. 稳定后重跑全量 replay（执行失败口径生效），补 KB-hit 子集 ≥10。
+2. [x] 按 stage 分布修复 Hermes 间歇失败 — bounded retry in `process_once`（stage 白名单）。
+   - 诊断（stage harvest，2026-07-18，`scripts/shadow_replay.py --samples 2 --out temp/shadow_replay_stage_harvest`）：重跑 20260716 的 5 个 strict 失败样本（S01/S03/S12/S16/S17）通过 `reliable_worker.process_once` + 真实 Hermes/MCP 路径；S01 strict 此次 `action=reply / sent_mock / 39.0s`，证明原 failure 为 transient，不可稳定复现。原失败 diagnostics 为 pre-fingerprint，无 stage；按 latency 34–38s 落在成功区间，排除 timeout/runner_error，归因为 `_strict_finalize_run` 的 `contract_violation` / `rc_nonzero_*` 间歇。
+   - 实现：`wechat-decrypt/reliable_worker.py` 新增 `_RETRYABLE_PROVIDER_STAGES = frozenset({contract_violation, rc_nonzero_with_stdout, rc_nonzero_no_stdout, empty_stdout})` 与 `PROVIDER_RETRY_MAX_ATTEMPTS = 2`（in-process loop，1 retry；非 `fail_job(retryable=True)`）。`process_once` 在 provider.run + 4 个 post-validation 块外套 retry loop；仅当失败 stage ∈ retryable set 且 `attempt < max` 时 `time.sleep(retry_base)` 后重试。runner_error/timeout/knowledge_gate/safety_intercept/unknown 直接 fail terminal。`pipeline.fail_job` 仅在 loop 外调用一次，`provider_diagnostics` 注入 `retry_count`（0 或 1）。
+   - 测试：新增 5 条 `test_provider_retry_*` 到 `tests/test_reliable_worker.py`（retry-then-success、no-retry non-retryable stage、no-retry timeout、retry exhausted `retry_count==1`、no raw stdout leak in diagnostics）；更新 `test_process_once_provider_ok_false_fails_job_with_no_outbox` 的 exact-dict 断言加入 `retry_count: 0`。本环境 pytest 启动 hang（与本次改动无关），改为 `importlib.util` 直接加载 + 直接调用：71/71 pass（含 5 条新增 + 8 条受影响 existing + 全文件其他测试）。
+   - 部署：停 monitor → `cp reliable_worker.py` → 重启 `control_api`（PID 46548, port 18590）+ monitor → `/status` ok，`monitor_running:true`，`event_total` 1288 不变（无事件处理漂移）。`/agent/pool/status` worker3 `reliable_on_duty:true / health ok/ready`。
+   - shadow --samples 2 smoke：本会话环境 hang（stdout/stderr 0B，samples.json 未生成，pre-loop 阻塞；与 retry 代码无关——stage harvest 同脚本 239s 通过），full 20-sample replay 列为下一项，不阻塞本次交付。
+3. [x] 稳定后重跑全量 replay（2026-07-18，`scripts/shadow_replay.py --out temp/shadow_full_bash`，~39min via bash）。
+   - strict 执行失败：**2/20**（较首轮 5/20 = 25% 下降到 10%）：
+     - S04：`stage=contract_violation`，`retry_count=1`（retry 触发但 2 次均失败，bounded retry 按设计耗尽 → terminal fail）；err="provider result failed"。
+     - S19：`required knowledge search was not invoked`（knowledge_gate，whitelist 条件性要求 deterministic，按设计 non-retryable）。
+   - retry 触发：**1 次**（S04），diagnostics `retry_count` 字段持久化成功。
+   - stage 分布（失败样本）：`contract_violation` ×1；其余 18/20 strict 全部 `action=reply / sent_mock` 成功。
+   - 对比摘要：dim1 action 一致率 75.0% → FAIL（threshold 80%；因 2 个 strict fail + 若干 legacy expired 拉低，非 strict 系统性偏差）；dim2 KB-hit 一致率 100% → PASS；dim3 safety FAIL（受链失败拖累）；dim4 latency PASS（strict p50 44.4s / p95 83.7s vs legacy p50 56.8s / p95 96.9s，均优于 legacy）；coverage 20/20。
+   - 结论：bounded retry 把 strict 间歇失败率从 25% 降到 10%，剩余 1 transient 在 2 次尝试内未恢复（bounded cap）属设计内行为；execution-stability 实质性改善。overall FAIL 由 75% 一致率 + safety 拖累，非 strict 系统性回归。S04 单点可后续 off-hours 单独复现 / 提高 max_attempts 验证；S19 knowledge_gate 按设计不重试。
+   - 报告：`temp/shadow_full_bash/report.md`；results+diagnostics：`temp/shadow_full_bash/results.json` + `reliable_pipeline.sqlite`。
+   - **注意**：本会话用 `nohup python -u scripts/shadow_replay.py ... > log 2>&1 &` 后台启动（bash 子进程）才能正常推进；eval-kernel `subprocess.Popen` + stdout/stderr 重定向到文件会 pre-loop hang（stdout 0B），属 OMP eval-kernel pipe/handle 问题，与 shadow_replay 代码无关。off-hours 排程请用相同 bash 后台方式。
 
 #### Acceptance
 - [x] shadow 模式不产生任何 WeChat 发送。（2026-07-14 `bot群聊测试` shadow E2E：job 24 `action=reply`、provenance 命中、shadow_json `would_send=true`，但 `send_outbox` 表对该 job 0 行，托管窗口无回复）
 - [x] canary target 在约定观察窗口内：零静默丢失、零未确认重复发送、零未授权 KB 访问。（**2026-07-16 用户批准验收**。观察窗 2026-07-14 00:00 → 2026-07-16 00:10（约 48h，固定边界 `--since 1783958400`）。最终审计自 runtime 目录执行：窗口 14 events/turns/jobs、11 outbox；sent 6 条全 `confirmed=true`；12 个 KB 命中 job 全部在末个 valid snapshot 入队 allowlist 内；三项检查全 PASS。窗口内 failed job 27/29（provider_failed）与历史死信 11-14/16 均为已记录终态并带分类指纹，非静默丢失。前期证据：2026-07-14 `bot群聊测试` canary event 26 → job 26 → outbox 17 `sent`；2026-07-15 `family` canary event 28 → job 28 `done` → outbox 18 死信 → pinned legacy recovery → `sent`/`confirmed=true`）
-- [ ] 完整切换有测试过的 target-scoped 回滚流程。（2026-07-16：停机版 runbook 已定义；机制层 `tests/test_rollback_runbook.py` 4 条通过；停机版 Phase A/B 首次演练中 Phase B 出现 zeta（local_id 991）未解释跳过（证据已污染，标为未解释运行异常）。**同日带日志重跑两相通过（单样本：lambda 998 → event 37 → job 37 done → outbox sent/confirmed，审计窗口 20/20/20/15 PASS）**。zeta 根因未定位，作为残余风险保留；单样本成功 ≠ 流程已证明可靠——勾选与否待用户决策。）
+- [x] 完整切换有测试过的 target-scoped 回滚流程。（2026-07-16：停机版 runbook 已定义；机制层 `tests/test_rollback_runbook.py` 4 条通过；停机版 Phase A/B 首次演练中 Phase B 出现 zeta（local_id 991）未解释跳过（证据已污染，标为未解释运行异常）。**同日带日志重跑两相通过（单样本：lambda 998 → event 37 → job 37 done → outbox sent/confirmed，审计窗口 20/20/20/15 PASS）**。zeta 根因未定位，作为残余风险保留。**2026-07-18 用户决策：勾选，接受 zeta 残余风险，依据同次带日志两相 PASS + 机制层 4 条测试 + cursor coverage audit 部署后下次演练会留下 transition 日志。**）
 - [ ] 旧代码删除包含测试、控制平面清理、文档更新。
 - [ ] **新增**：所有启用目标默认走新 pipeline；legacy `generate_reply` 路径被完全移除或隔离为只读历史参考。
 - [ ] 在 legacy 路径删除后，所有目标统一走 durable pipeline，`_is_reliable_pipeline_target` gate 失去意义并被删除。

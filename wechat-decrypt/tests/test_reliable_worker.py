@@ -21,6 +21,10 @@ import reliable_pipeline as pipeline
 import reliable_worker as worker
 from wechat_bot_monitor import build_event_payload
 
+# Bounded in-process retry in process_once calls time.sleep between
+# attempts.  Tests must not pay real seconds for that backoff, so we
+# neuter sleep for the worker module only (production code is untouched).
+worker.time.sleep = lambda *_a, **_kw: None  # type: ignore[attr-defined]
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -275,7 +279,7 @@ def test_process_once_provider_ok_false_fails_job_with_no_outbox():
         assert "/secret/path" not in (out["job"]["error"] or "")
         # Provider diagnostics must be a fixed safe schema with no secrets.
         diag = out["job"].get("provider_diagnostics") or {}
-        assert diag == {"result_type": "SimpleNamespace", "ok": False, "status": "error", "stage": "unknown"}
+        assert diag == {"result_type": "SimpleNamespace", "ok": False, "status": "error", "stage": "unknown", "retry_count": 0}
         assert "SECRET_TOKEN" not in str(diag)
         assert "/secret/path" not in str(diag)
         # Persisted JSON must also exclude secrets.
@@ -1987,3 +1991,134 @@ def test_process_once_shadow_job_completes_without_outbox():
             assert shadow["reply_chars"] == len("reply")
         finally:
             os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+
+# --- Provider retry (in-process bounded retry) -----------------------------
+
+class _SequencedProvider:
+    """Provider stub that returns a preset sequence of results/raises.
+
+    Each ``run`` pops the next entry from ``results`` and returns it or
+    raises it.  ``calls`` records the arguments of every invocation.
+    """
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []  # list of (job, timeout)
+
+    def run(self, job, timeout=None):
+        self.calls.append((job, timeout))
+        item = self._results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+
+
+def test_provider_retry_then_success_skips_fail_job():
+    """A retryable stage on attempt 1 must be retried; success on attempt 2.
+
+    fail_job must NOT be called and no outbox may be created on the first
+    attempt.  The second attempt's success must produce an outbox.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        provider = _SequencedProvider([
+            _agent_result(ok=False, status="failed",
+                          raw={"stage": "contract_violation"}),
+            _agent_result(ok=True, status="done",
+                          raw={"agent_result": _contract_dict("reply", "hello", "ok")}),
+        ])
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "applied"
+        assert out["outbox"] is not None
+        assert len(provider.calls) == 2
+
+
+def test_provider_no_retry_on_non_retryable_stage():
+    """An AgentResult with ok=False and a non-retryable stage must fail
+    terminally on the first attempt (no retry, no sleep).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        provider = _SequencedProvider([
+            _agent_result(ok=False, status="failed",
+                          raw={"stage": "runner_error"}),
+        ])
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert len(provider.calls) == 1
+        diag = out["job"].get("provider_diagnostics") or {}
+        assert diag.get("stage") == "runner_error"
+        assert diag.get("retry_count") == 0
+
+
+def test_provider_no_retry_on_timeout():
+    """A TimeoutExpired (stage=timeout) must fail terminally without retry."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        provider = _SequencedProvider([subprocess.TimeoutExpired(cmd="hermes", timeout=120)])
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert len(provider.calls) == 1
+        diag = out["job"].get("provider_diagnostics") or {}
+        assert diag.get("stage") == "timeout"
+        assert diag.get("retry_count") == 0
+
+
+def test_provider_retry_exhausted_records_retry_count_one():
+    """Two retryable-stage failures must exhaust the retry budget and
+    record retry_count=1 in the final diagnostics.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        provider = _SequencedProvider([
+            _agent_result(ok=False, status="failed",
+                          raw={"stage": "contract_violation"}),
+            _agent_result(ok=False, status="failed",
+                          raw={"stage": "contract_violation"}),
+        ])
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert len(provider.calls) == 2  # exactly 2 attempts
+        diag = out["job"].get("provider_diagnostics") or {}
+        assert diag.get("stage") == "contract_violation"
+        assert diag.get("retry_count") == 1
+
+
+def test_provider_retry_diagnostics_do_not_leak_raw_stdout():
+    """The persisted diagnostics must not contain the provider's raw stdout,
+    even when the failure payload includes a long sentinel string."""
+    SENTINEL = "X" * 300  # > 200 chars to make leakage obvious
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        provider = _SequencedProvider([
+            _agent_result(ok=False, status="failed",
+                          raw={"stage": "contract_violation", "stdout": SENTINEL}),
+            _agent_result(ok=False, status="failed",
+                          raw={"stage": "contract_violation", "stdout": SENTINEL}),
+        ])
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        diag = out["job"].get("provider_diagnostics") or {}
+        # The sentinel must not appear in any stringified diagnostic value.
+        assert SENTINEL not in json.dumps(diag)
+        # And the persisted SQLite column must not contain it either.
+        with pipeline._connect(db) as con:
+            raw_col = con.execute(
+                "SELECT provider_diagnostics_json FROM turn_jobs WHERE id=?",
+                (out["job"]["id"],),
+            ).fetchone()[0]
+        assert SENTINEL not in raw_col

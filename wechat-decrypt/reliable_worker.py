@@ -74,6 +74,23 @@ _ALLOWED_PROVIDER_FAILURE_STAGES = {
     "runner_error",
 }
 
+# Stages eligible for in-process retry in process_once.  These represent
+# transient provider/parser failures where a second attempt has a real
+# chance of succeeding; deterministic per-prompt gates (knowledge_gate,
+# contract_reject, safety_intercept, unknown) are deliberately excluded so
+# the retry budget is spent only on recoverable signal.
+_RETRYABLE_PROVIDER_STAGES = frozenset({
+    "contract_violation",
+    "rc_nonzero_with_stdout",
+    "rc_nonzero_no_stdout",
+    "empty_stdout",
+})
+
+# In-process provider retry budget: 1 retry on top of the initial attempt.
+# Kept minimal to bound latency and match the observed transient rate
+# harvested from the Stage 4 shadow replay on 2026-07-18.
+PROVIDER_RETRY_MAX_ATTEMPTS = 2
+
 # Statuses that represent a successful terminal run.  Only when the
 # provider reports one of these (in addition to ``ok=True`` and a valid
 # ``AgentResult``) may the worker apply the contract.  Anything else
@@ -878,101 +895,129 @@ def process_once(
     provider_timeout = timeout
     if provider_timeout is None and _requires_knowledge_trace(provider_job.get("payload") or {}):
         provider_timeout = DEFAULT_KNOWLEDGE_PROVIDER_TIMEOUT
-    try:
-        result = effective_provider.run(provider_job, timeout=provider_timeout)
-    except Exception as exc:  # provider raised; transition job to failed
-        logger.warning("provider run raised for job=%s: %s", job_id, exc)
+    # Bounded in-process retry around the provider invocation.  Stages in
+    # ``_RETRYABLE_PROVIDER_STAGES`` are transient (parse / runner races) and
+    # worth a second attempt; deterministic per-prompt gates (knowledge_gate,
+    # contract_reject, safety_intercept, unknown) and budget-exhausting
+    # failures (timeout, runner_error) fail terminally so the retry budget is
+    # spent only on recoverable signal.  ``pipeline.fail_job`` is never called
+    # inside the loop; it runs exactly once after the loop with the final
+    # attempt's diagnostics plus a ``retry_count`` field.
+    retry_base = _resolve_retry_base(config)
+    attempt = 0
+    contract = None
+    final_failure = None  # type: ignore[assignment]
+    while attempt < PROVIDER_RETRY_MAX_ATTEMPTS:
+        attempt += 1
+        try:
+            result = effective_provider.run(provider_job, timeout=provider_timeout)
+        except Exception as exc:
+            # runner_error / timeout — never retry; budget already spent or
+            # the runner itself faulted.
+            logger.warning(
+                "provider run raised for job=" + str(job_id) + " (attempt " + str(attempt) + "/" + str(PROVIDER_RETRY_MAX_ATTEMPTS) + "): " + repr(exc)
+            )
+            diag = _classify_provider_failure(exc)
+            final_failure = {
+                "error": "provider run failed",
+                "diagnostics": diag,
+                "retryable": diag.get("stage") in _RETRYABLE_PROVIDER_STAGES,
+            }
+            break
+
+        provider_status = str(getattr(result, "status", "") or "").strip()
+        if not _looks_like_agent_result(result):
+            # Anything that does not expose ok + status (or whose values are
+            # the wrong type) is a contract violation.
+            diag = _classify_provider_failure({
+                "result_type": type(result).__name__,
+                "ok": False,
+                "status": provider_status.lower(),
+                "raw": {"stage": "contract_violation"},
+            })
+            final_failure = {
+                "error": "provider returned non-AgentResult",
+                "diagnostics": diag,
+                "retryable": diag.get("stage") in _RETRYABLE_PROVIDER_STAGES,
+            }
+        elif result.ok is not True or _provider_status_failed(provider_status):
+            # ok=False / failed / error / cancelled / no_reply: retry only
+            # when the provider explicitly tagged the failure with a
+            # transient stage.  Deterministic per-prompt gates
+            # (knowledge_gate, contract_reject, safety_intercept, unknown)
+            # fail terminally.
+            diag = _classify_provider_failure(result)
+            final_failure = {
+                "error": "provider result failed",
+                "diagnostics": diag,
+                "retryable": diag.get("stage") in _RETRYABLE_PROVIDER_STAGES,
+            }
+        elif not _provider_status_terminal_success(provider_status):
+            diag = _classify_provider_failure({
+                "result_type": type(result).__name__,
+                "ok": result.ok is True,
+                "status": provider_status,
+                "raw": {"stage": "contract_violation"},
+            })
+            status_repr = repr(provider_status or "<empty>")
+            final_failure = {
+                "error": "provider status " + status_repr + " is not a successful terminal run",
+                "diagnostics": diag,
+                "retryable": diag.get("stage") in _RETRYABLE_PROVIDER_STAGES,
+            }
+        else:
+            contract_value = _resolve_contract_payload(result)
+            contract = _validate_contract(contract_value)
+            if contract is None:
+                diag = _classify_provider_failure({
+                    "result_type": type(result).__name__,
+                    "ok": result.ok is True,
+                    "status": provider_status,
+                    "raw": {"stage": "contract_violation"},
+                })
+                final_failure = {
+                    "error": "invalid agent result contract",
+                    "diagnostics": diag,
+                    "retryable": diag.get("stage") in _RETRYABLE_PROVIDER_STAGES,
+                }
+            else:
+                final_failure = None
+                break
+
+        if (final_failure is not None
+                and final_failure["retryable"]
+                and attempt < PROVIDER_RETRY_MAX_ATTEMPTS):
+            stage_val = final_failure["diagnostics"].get("stage")
+            logger.info(
+                "provider attempt " + str(attempt) + "/" + str(PROVIDER_RETRY_MAX_ATTEMPTS) + " for job=" + str(job_id) + " failed retryable stage=" + repr(stage_val) + "; sleeping " + str(retry_base) + "s before retry"
+            )
+            time.sleep(retry_base)
+            continue
+        break
+
+    if final_failure is not None:
+        # Load the trace artifact written by the MCP server for this job.
+        # The trace is read only when we are about to record a terminal
+        # failure so the provenance summary can be correlated with the
+        # search that happened before the failure.  Provider failure
+        # remains a separate status in the job row; the provenance
+        # summary only describes the knowledge search.
         provenance = _load_trace_provenance(trace_id, trace_dir)
-        pipeline.fail_job(job_id=job_id, error="provider run failed",
-                          provenance=provenance, retryable=False, db_path=db, now=ts,
-                          provider_diagnostics=_classify_provider_failure(exc))
+        retry_count = max(0, attempt - 1)
+        pipeline.fail_job(
+            job_id=job_id,
+            error=final_failure["error"],
+            provenance=provenance,
+            retryable=False,
+            db_path=db,
+            now=ts,
+            provider_diagnostics={**final_failure["diagnostics"], "retry_count": retry_count},
+        )
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
-    # Load the trace artifact written by the MCP server for this job. The
-    # trace is read regardless of whether the provider succeeded so that
-    # failures can still be correlated with any search that happened before
-    # the failure. Provider failure remains a separate status in the job
-    # row; the provenance summary only describes the knowledge search.
+    # Success: load provenance and proceed to post-success gates + apply.
     provenance = _load_trace_provenance(trace_id, trace_dir)
 
-    if not _looks_like_agent_result(result):
-        # Anything that does not expose ``ok`` + ``status`` (or whose
-        # values are the wrong type) is a contract violation.  The
-        # provider is supposed to return an ``AgentResult``-shaped
-        # object; a bare string or arbitrary dict cannot be trusted to
-        # carry the versioned document, so we fail the job without
-        # creating an outbox.
-        pipeline.fail_job(job_id=job_id, error="provider returned non-AgentResult",
-                          provenance=provenance, retryable=False, db_path=db, now=ts,
-                          provider_diagnostics=_classify_provider_failure({
-                              "result_type": type(result).__name__,
-                              "ok": False,
-                              "status": str(getattr(result, "status", "") or "").strip().lower(),
-                              "raw": {"stage": "contract_violation"},
-                          }))
-        return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
-
-    provider_status = str(getattr(result, "status", "") or "").strip()
-    if result.ok is not True or _provider_status_failed(provider_status):
-        # An explicit ``ok=False`` or a known-failure status (``failed``,
-        # ``error``, ``timeout``, ``cancelled``, ``no_reply``, ...) is
-        # a non-retryable failure.  The provider did not produce a
-        # usable document; ``fail_job`` without retry keeps the lease
-        # free and the job in a terminal state.  Never echo the provider's
-        # error attribute; it may contain filesystem paths or secrets.
-        pipeline.fail_job(job_id=job_id, error="provider result failed",
-                          provenance=provenance, retryable=False, db_path=db, now=ts,
-                          provider_diagnostics=_classify_provider_failure(result))
-        return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
-
-    if not _provider_status_terminal_success(provider_status):
-        # ``ok=True`` is not enough; only a successful terminal status
-        # (done/sent/completed/succeeded/success) may apply the
-        # contract.  ``submitted``, ``running``, ``pending``, ``queued``,
-        # ``in_progress``, or any other in-progress marker means the
-        # process has not actually exited successfully, so the
-        # document cannot be trusted and no outbox is created.
-        pipeline.fail_job(
-            job_id=job_id,
-            error=("provider status %r is not a successful terminal run"
-                   % (provider_status or "<empty>",)),
-            provenance=provenance,
-            retryable=False,
-            db_path=db,
-            now=ts,
-            provider_diagnostics=_classify_provider_failure({
-                "result_type": type(result).__name__,
-                "ok": result.ok is True,
-                "status": provider_status,
-                "raw": {"stage": "contract_violation"},
-            }),
-        )
-        return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
-
-    contract_value = _resolve_contract_payload(result)
-    contract = _validate_contract(contract_value)
-    if contract is None:
-        # Provider produced something that is not the strict wire contract;
-        # plain text, box frames, ANSI, JSON-looking tool output, etc. all
-        # land here.  No outbox may be created from this state.  The
-        # persisted/returned reason is a fixed safe marker — never provider
-        # body text such as reply_text or raw stdout, which could contain
-        # user content or secrets.
-        pipeline.fail_job(
-            job_id=job_id,
-            error="invalid agent result contract",
-            provenance=provenance,
-            retryable=False,
-            db_path=db,
-            now=ts,
-            provider_diagnostics=_classify_provider_failure({
-                "result_type": type(result).__name__,
-                "ok": result.ok is True,
-                "status": provider_status,
-                "raw": {"stage": "contract_violation"},
-            }),
-        )
-        return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
     payload = provider_job.get("payload") or {}
     if _requires_knowledge_trace(payload) and provenance.get("status") == "no_tool_call":
