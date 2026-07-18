@@ -624,6 +624,42 @@ def _outcome(chain_rec):
     return "failed:%s" % (chain_rec.get("terminal") or "unknown")
 
 
+# ---------------------------------------------------------------------------
+# Frozen rule (plan line 411, 2026-07-16): single-chain provider fail/timeout
+# counts as ``execution_failure`` and is dropped from the dim1 denominator.
+# Whitelist-classified mismatches (knowledge_gate etc.) still go to mismatches
+# with their class; only unclassifiable provider-side single-chain failures
+# are excluded.  A failure terminal of ``failed:expired`` is always a timeout
+# and therefore execution_failure.
+# ---------------------------------------------------------------------------
+EXECUTION_FAILURE_MARKERS = (
+    "provider result failed",
+    "provider run failed",
+    "provider contract",
+    "poll expired",
+    "agent_timeout",
+)
+
+
+def _is_execution_failure(lo, so, l_err, s_err):
+    """Return True iff this single-chain mismatch is a provider fail/timeout.
+
+    Single-chain = exactly one side has outcome ``failed:...``.  The failed
+    side's outcome or error fingerprint must indicate a provider-side
+    infrastructure failure (contract exhausted, timeout) rather than a
+    deterministic per-prompt gate (knowledge_gate, contract_reject, etc.).
+    """
+    lo_failed = lo.startswith("failed:")
+    so_failed = so.startswith("failed:")
+    if lo_failed == so_failed:  # both or neither failed -> not single-chain
+        return False
+    failed_outcome = so if so_failed else lo
+    failed_err = s_err if so_failed else l_err
+    if failed_outcome == "failed:expired":
+        return True
+    return any(m in failed_err for m in EXECUTION_FAILURE_MARKERS)
+
+
 def compare(samples, results):
     pairs = []
     for s in samples:
@@ -633,7 +669,7 @@ def compare(samples, results):
     processed = [p for p in pairs if p["legacy"].get("terminal") and p["strict"].get("terminal")]
     # 一致 = 两链最终动作相同；一侧有动作另一侧失败 = 分歧（按白名单归类）；
     # 双链同终态失败 = 非分歧也不构成动作一致，单独成桶透明列出，不计入一致率分母。
-    consistent, mismatches, both_failed = [], [], []
+    consistent, mismatches, both_failed, execution_failures = [], [], [], []
     for p in processed:
         lo, so = _outcome(p["legacy"]), _outcome(p["strict"])
         if lo == so and not lo.startswith("failed:"):
@@ -645,14 +681,26 @@ def compare(samples, results):
                                 "strict_error_fp": p["strict"].get("error_fp") or ""})
             continue
         cls, ev = _classify_mismatch(p["strict"], p["legacy"])
+        l_err = p["legacy"].get("error_fp") or ""
+        s_err = p["strict"].get("error_fp") or ""
+        # Frozen rule: single-chain provider fail/timeout -> execution_failure,
+        # dropped from dim1 denominator (transparent bucket, not a mismatch).
+        # Whitelist-classified single-chain mismatches (knowledge_gate etc.)
+        # still go to mismatches with their class — the gate is a deliberate
+        # per-prompt behavior, not an execution instability.
+        if cls == "unclassifiable" and _is_execution_failure(lo, so, l_err, s_err):
+            execution_failures.append({"id": p["sample"]["id"],
+                                       "legacy_outcome": lo, "strict_outcome": so,
+                                       "legacy_error_fp": l_err,
+                                       "strict_error_fp": s_err})
+            continue
         mismatches.append({"id": p["sample"]["id"],
                            "legacy_outcome": lo, "strict_outcome": so,
                            "legacy_action": p["legacy"].get("action") or "",
                            "strict_action": p["strict"].get("action") or "",
                            "class": cls, "evidence": ev,
-                           "legacy_error_fp": p["legacy"].get("error_fp") or "",
-                           "strict_error_fp": p["strict"].get("error_fp") or ""})
-    rate_n = len(processed) - len(both_failed)
+                           "legacy_error_fp": l_err, "strict_error_fp": s_err})
+    rate_n = len(processed) - len(both_failed) - len(execution_failures)
     rate = (len(consistent) / rate_n) if rate_n else None
     action_pairs = [p for p in processed if p["legacy"].get("action") and p["strict"].get("action")]
     chain_failures = [m for m in mismatches
@@ -678,8 +726,10 @@ def compare(samples, results):
         d1_note = "一致率 %.1f%% < 阈值 %.0f%%" % (rate * 100, THRESHOLDS["action_min_rate"] * 100)
     else:
         d1 = "PASS"
-        d1_note = "一致率 %.1f%% ≥ %.0f%%（分母 %d = 处理 %d - 双链同败 %d），不一致均可归类" % (
-            rate * 100, THRESHOLDS["action_min_rate"] * 100, rate_n, len(processed), len(both_failed))
+        d1_note = ("一致率 %.1f%% ≥ %.0f%%（分母 %d = 处理 %d - 双链同败 %d - 单链执行失败 %d），"
+                   "不一致均可归类") % (
+            rate * 100, THRESHOLDS["action_min_rate"] * 100, rate_n, len(processed),
+            len(both_failed), len(execution_failures))
 
     # 维度2：来源一致性（双方均 reply 的样本；kb_id 集合比较，排序容忍）
     both_reply = [p for p in action_pairs
@@ -764,7 +814,8 @@ def compare(samples, results):
                             "legacy_error_fp": m["legacy_error_fp"],
                             "strict_error_fp": m["strict_error_fp"]}
                            for m in chain_failures],
-        "both_failed": both_failed, "rate_denominator": rate_n,
+        "both_failed": both_failed, "execution_failures": execution_failures,
+        "rate_denominator": rate_n,
         "dim1": {"verdict": d1, "note": d1_note, "rate": rate,
                  "threshold": THRESHOLDS["action_min_rate"],
                  "consistent_n": len(consistent), "mismatches": mismatches,

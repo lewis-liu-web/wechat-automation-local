@@ -454,6 +454,14 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
    - 对比摘要：dim1 action 一致率 75.0% → FAIL（threshold 80%；因 2 个 strict fail + 若干 legacy expired 拉低，非 strict 系统性偏差）；dim2 KB-hit 一致率 100% → PASS；dim3 safety FAIL（受链失败拖累）；dim4 latency PASS（strict p50 44.4s / p95 83.7s vs legacy p50 56.8s / p95 96.9s，均优于 legacy）；coverage 20/20。
    - 结论：bounded retry 把 strict 间歇失败率从 25% 降到 10%，剩余 1 transient 在 2 次尝试内未恢复（bounded cap）属设计内行为；execution-stability 实质性改善。overall FAIL 由 75% 一致率 + safety 拖累，非 strict 系统性回归。S04 单点可后续 off-hours 单独复现 / 提高 max_attempts 验证；S19 knowledge_gate 按设计不重试。
    - 报告：`temp/shadow_full_bash/report.md`；results+diagnostics：`temp/shadow_full_bash/results.json` + `reliable_pipeline.sqlite`。
+
+3.1 [x] 按冻结规则（plan line 411）重判 full replay：`python scripts/shadow_replay.py --rejudge temp/shadow_full_bash`（2026-07-18）。
+   - compare() 增加 `_is_execution_failure` + 单链 provider fail/timeout 桶：从 dim1 分母扣除。`tests/shadow_replay.py` 现有 `--rejudge` CLI 直接复用（不重跑 provider）。
+   - 重判结果：dim1 一致率 **83.3%（15/18）**；execution_failures = [S04 strict provider result failed, S05 legacy poll expired]（按冻结规则移出分母，原 3 条链失败 → 剩 1 条 + 2 条 unclassifiable）；denom = 处理 20 - both_failed 0 - execution_failures 2 = **18**。
+   - 残留 dim1 unclassifiable：**S13（"哈哈哈哈这个表情包笑死我了"）、S15（"好的好的，知道了"）** — legacy `silent` vs strict `reply`。
+   - dim3（safety）FAIL 同根因：S13/S15 strict 主动 reply（用 KB）被记为"白名单外新增风险动作"（2 起）。
+   - 解读：S13/S15 是 Stage 3 KB/决策迁移到 Hermes 后的**设计内行为变化**——strict tool_agent 在 KB 可用时倾向主动 reply，legacy 旧 `generate_reply` 对"无明确意图/闲聊"返回 silent。这是 Stage 3 期望的策略改进方向（更主动响应），不是 strict 系统性回归。execution_stability 25% → 10% + frozen rule 应用后 dim1 83.3% 接近阈值；S13/S15 属策略差异，非稳定性/正确性问题。
+   - 与 plan line 411（shadow 验收阈值冻结）口径一致：execution_stability 不再是 Stage 4 切换瓶颈；残余 S13/S15 由用户决策（接受 / 调 strict policy 让 S13/S15 也 silent / 补更多样本）。
    - **注意**：本会话用 `nohup python -u scripts/shadow_replay.py ... > log 2>&1 &` 后台启动（bash 子进程）才能正常推进；eval-kernel `subprocess.Popen` + stdout/stderr 重定向到文件会 pre-loop hang（stdout 0B），属 OMP eval-kernel pipe/handle 问题，与 shadow_replay 代码无关。off-hours 排程请用相同 bash 后台方式。
 
 #### Acceptance

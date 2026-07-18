@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "b7f0a0891424559c697612b0d08675b3a0a3e138",
-    "indexed_at": "2026-07-18T14:52:52Z",
+    "commit": "0f250961ae0955be28d893cdd586295c08a0841b",
+    "indexed_at": "2026-07-18T15:02:42Z",
     "project": "E-projects-GA-projects-wechat-automation-local",
-    "nodes": 3865,
-    "edges": 20809,
-    "original_size": 20512768,
-    "compressed_size": 3476125,
-    "compression_level": 3
+    "nodes": 3576,
+    "edges": 19912,
+    "original_size": 12451840,
+    "compressed_size": 2572725,
+    "compression_level": 9
 }
