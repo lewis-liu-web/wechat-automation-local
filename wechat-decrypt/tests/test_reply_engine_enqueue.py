@@ -416,3 +416,153 @@ def test_customer_service_no_kb_hit_is_enqueued_as_standard_trigger():
             assert len(all_jobs) >= 1
         finally:
             jobs.DEFAULT_DB_PATH = orig_default
+
+
+# --- Scoped MCP authorization snapshot (legacy enqueue gap fix) ---------------
+#
+# Stage 2 forces every enqueued agent job onto the strict AgentResult contract,
+# whose prompt instructs Hermes to call mcp__wechat_kb_search__search_knowledge.
+# The fast (agent_provider_enqueued) branch previously lacked ``_config_path`` /
+# ``_allowed_kb_ids`` / trace fields, so the MCP server saw an empty allowlist
+# and fail-closed ``invalid`` for every legacy job: legacy replies never had KB
+# grounding and the calls were unaudited.  Both enqueue branches now share
+# ``reply_engine._scoped_mcp_payload_fields``.
+
+import json as _json
+from unittest import mock as _mock
+
+import agent_provider as _ap
+import task_router as _tr
+
+
+def _scoped_setup(tmpdir, *, kbs=("scene.a", "scene.b")):
+    """Minimal raw_agent target/config plus a REAL config file on disk."""
+    wiki_root = Path(tmpdir) / "wiki"
+    for kb in kbs:
+        (wiki_root / "scenes" / kb.split(".")[-1]).mkdir(parents=True, exist_ok=True)
+    config_path = Path(tmpdir) / "wechat_bot_targets.json"
+    config_path.write_text(_json.dumps({"targets": [], "knowledge_bases": {}}), encoding="utf-8")
+    target = {
+        "name": "parity-replay",
+        "username": "wxid_parity_replay",
+        "table": "Msg_parity",
+        "triggers": [],
+        "knowledge_bases": list(kbs),
+        "mode": "customer_service",
+        "thin_monitor": True,
+    }
+    config = {
+        "reply_engine": {"raw_mode": True},
+        "knowledge_bases": {kb: {"type": "local", "path": "scenes/%s" % kb.split(".")[-1]} for kb in kbs},
+        "wiki_dir": str(wiki_root),
+    }
+    message = {
+        "content": "苹果是什么",
+        "message_content": "苹果是什么",
+        "local_id": 1,
+        "local_type": 1,
+        "context_messages": [],
+        "is_aggregated": False,
+        "text_parts_count": 1,
+    }
+    return target, config, config_path, message
+
+
+def _enqueue(tmpdir, target, config, config_path, message):
+    db = Path(tmpdir) / "agent_jobs.sqlite"
+    orig_default = jobs.DEFAULT_DB_PATH
+    try:
+        jobs.DEFAULT_DB_PATH = db
+        decision = re.generate_reply(message, target, config, config_path=str(config_path))
+    finally:
+        jobs.DEFAULT_DB_PATH = orig_default
+    return decision, db
+
+
+def _assert_scoped_payload(payload, config_path, kbs):
+    """Shared assertions for both enqueue branches."""
+    assert payload.get("_config_path") == str(config_path), payload.get("_config_path")
+    assert payload.get("_allowed_kb_ids") == list(kbs), payload.get("_allowed_kb_ids")
+    assert payload.get("_knowledge_trace_id"), "trace id must be snapshotted at enqueue"
+    assert str(payload.get("_knowledge_trace_dir") or "").endswith("knowledge_traces")
+    # Pre-staged source specs must never escape the snapshotted scope.
+    for spec in payload.get("knowledge_base_specs") or []:
+        spec_id = spec.get("id") or spec.get("kb_id")
+        if spec_id is None:
+            continue
+        assert spec_id in payload["_allowed_kb_ids"], "spec %r escapes _allowed_kb_ids" % (spec_id,)
+
+
+def test_fast_enqueue_payload_carries_scoped_mcp_fields():
+    """Plain text routes default_fast; the fast branch must snapshot the scope."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target, config, config_path, message = _scoped_setup(tmpdir)
+        fast_route = _tr.RouteDecision(route=_tr.ROUTE_FAST, reason="default_fast", detail="")
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        orig_default = jobs.DEFAULT_DB_PATH
+        try:
+            jobs.DEFAULT_DB_PATH = db
+            with _mock.patch.object(re._task_router, "route_message", return_value=fast_route):
+                decision = re.generate_reply(message, target, config, config_path=str(config_path))
+        finally:
+            jobs.DEFAULT_DB_PATH = orig_default
+        assert decision.intent == "agent_job_queued", decision.intent
+        payload = (jobs.list_jobs(db_path=db)[-1].get("payload") or {})
+        assert payload.get("route") == "fast_reply"
+        _assert_scoped_payload(payload, config_path, ("scene.a", "scene.b"))
+
+
+def test_deep_enqueue_payload_carries_same_scoped_fields():
+    """The deep branch already had two keys; the shared helper must not regress it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target, config, config_path, message = _scoped_setup(tmpdir)
+        decision_route = _tr.RouteDecision(route=_tr.ROUTE_DEEP, reason="test_deep", detail="")
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        orig_default = jobs.DEFAULT_DB_PATH
+        try:
+            jobs.DEFAULT_DB_PATH = db
+            with _mock.patch.object(re._task_router, "route_message", return_value=decision_route):
+                decision = re.generate_reply(message, target, config, config_path=str(config_path))
+        finally:
+            jobs.DEFAULT_DB_PATH = orig_default
+        assert decision.intent == "deep_agent_queued", decision.intent
+        payload = (jobs.list_jobs(db_path=db)[-1].get("payload") or {})
+        _assert_scoped_payload(payload, config_path, ("scene.a", "scene.b"))
+
+
+def test_prepare_model_job_injects_scoped_env_from_enqueue_payload():
+    """End-to-end: the enqueued payload must yield the trusted MCP env."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target, config, config_path, message = _scoped_setup(tmpdir)
+        _enqueue(tmpdir, target, config, config_path, message)
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        job = jobs.list_jobs(db_path=db)[-1]
+        provider = _ap.HermesProvider(cli_path="hermes-test")
+        model_job, env = provider._prepare_model_job(job)
+        assert env["WECHAT_MCP_CONFIG"] == str(config_path)
+        assert _json.loads(env["WECHAT_MCP_ALLOWED_KB_IDS"]) == ["scene.a", "scene.b"]
+        assert env["WECHAT_MCP_TRACE_ID"] == job["payload"]["_knowledge_trace_id"]
+        assert env["WECHAT_MCP_TRACE_DIR"] == job["payload"]["_knowledge_trace_dir"]
+        leaked = [k for k in (model_job.get("payload") or {}) if str(k).startswith("_")]
+        assert leaked == [], leaked
+
+
+def test_scoped_snapshot_immutable_after_enqueue():
+    """Later config edits must never retro-scope an already queued job."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        target, config, config_path, message = _scoped_setup(tmpdir)
+        _enqueue(tmpdir, target, config, config_path, message)
+        config["knowledge_bases"] = {"other.kb": {"type": "local", "path": "scenes/other"}}
+        target["knowledge_bases"] = ["other.kb"]
+        db = Path(tmpdir) / "agent_jobs.sqlite"
+        payload = (jobs.list_jobs(db_path=db)[-1].get("payload") or {})
+        assert payload.get("_allowed_kb_ids") == ["scene.a", "scene.b"]
+
+
+def test_monitor_generate_reply_call_sites_pass_config_path():
+    """All three monitor call sites must pass the same config file through."""
+    src = (Path(__file__).resolve().parent.parent / "wechat_bot_monitor.py").read_text(encoding="utf-8")
+    assert src.count("generate_reply(agg_msg, t, cfg, config_path=config_path)") == 2  # thin + main loop
+    assert "generate_reply(agg_msg, turn_target, turn_cfg, config_path=config_path)" in src  # aggregator flush
+    assert "generate_reply(agg_msg, t, cfg)" not in src
+    assert "generate_reply(agg_msg, turn_target, turn_cfg)" not in src

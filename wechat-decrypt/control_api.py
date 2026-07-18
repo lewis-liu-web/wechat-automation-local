@@ -492,6 +492,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(**_reliable_scheduler_stop())
         if method == "POST" and (m := _match(path, "/reliable-pipeline/turn-jobs/{id}/quarantine")):
             return _ok(**_reliable_quarantine_turn_job(m[0], body))
+        if method == "POST" and (m := _match(path, "/reliable-pipeline/outbox/{id}/requeue")):
+            return _ok(**_reliable_requeue_outbox(m[0], body))
         # ---- M5 async: dispatcher / reconciler / sender ----
         if method == "POST" and path == "/agent/dispatcher/run-once":
             return _ok(**_async_dispatcher_run_once(body))
@@ -852,6 +854,7 @@ def _agent_pool_status() -> Dict[str, Any]:
             "label": inst.get("label") or iid,
             "provider": kind,
             "on_duty": iid in on_duty_ids,
+            "reliable_on_duty": bool(inst.get("reliable_on_duty")),
             "status": status,
             "health": health,
             "current_job": None if not current else {
@@ -1021,6 +1024,11 @@ def _reliable_worker_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
     fallback when the target binding is missing or the factory fails.
     ``test_target_only`` lives in the same config and is therefore
     unspoofable by the HTTP body.
+
+    When ``body.get("instance_id")`` is provided, only jobs whose payload
+    carries the same ``dedicated_agent_instance_id`` are claimed. The
+    scheduler uses this to route dedicated targets to their matching instance;
+    unbound jobs are drained only by the general run.
     """
     cfg = reg.load_config()
     if not _reliable_pipeline_enabled(cfg):
@@ -1036,6 +1044,7 @@ def _reliable_worker_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         timeout = float(timeout_raw) if timeout_raw is not None else None
     except (TypeError, ValueError):
         return _err_reliable("timeout must be a number")
+    instance_id = str(body.get("instance_id") or "").strip() or None
     provider = _build_agent_provider()
     def _provider_factory(instance_id=None):
         return provider_from_config(cfg, instance_id=instance_id)
@@ -1047,6 +1056,7 @@ def _reliable_worker_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
             provider_factory=_provider_factory,
             final_filter=reply_engine.postcheck,
             timeout=timeout,
+            instance_id=instance_id,
         )
     except reliable_worker.FinalFilterRequired:
         # Programming error: control_api always passes reply_engine.postcheck.
@@ -1059,7 +1069,7 @@ def _reliable_worker_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
         # embed filesystem paths and outbound URLs that should never
         # leave the control plane.
         return _err_reliable("worker raised; see control_api log")
-    return {"action": "processed", **_sanitize_process_once_result(result)}
+    return {"action": "processed", "instance_id": instance_id, **_sanitize_process_once_result(result)}
 
 
 def _reliable_sender_run_once(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1158,6 +1168,52 @@ def _resolve_scheduler_interval(config: Optional[Dict[str, Any]]) -> float:
         return _RELIABLE_SCHEDULER_DEFAULT_INTERVAL
 
 
+def _active_on_duty_instance_ids() -> List[str]:
+    """Return instance IDs that are on-duty and healthy enough to run durable jobs.
+
+    On-duty state comes from two sources:
+    - Runtime manual overrides via the agent pool / on-duty endpoint.
+    - Persistent config flag ``reliable_on_duty: true`` on agent_provider instances.
+      This makes dedicated reliable routing survive control_api restarts without
+      requiring a manual /agent/instance/{id}/on-duty call after startup.
+
+    In both cases the instance must pass a health check; unhealthy instances are
+    not routed dedicated jobs.
+    """
+    try:
+        pool_status = _agent_pool_status()
+    except Exception:
+        return []
+    health_by_id = {}
+    active_ids = set()
+    for inst in (pool_status.get("instances") or []):
+        iid = str(inst.get("id") or "").strip()
+        if not iid:
+            continue
+        health_by_id[iid] = inst.get("health") or {}
+        if not inst.get("on_duty"):
+            continue
+        health = health_by_id[iid]
+        if health.get("ok") or health.get("ready"):
+            active_ids.add(iid)
+    # Persistent on-duty instances declared in config
+    try:
+        cfg = reg.load_config()
+    except Exception:
+        cfg = None
+    if isinstance(cfg, dict):
+        instances = (cfg.get("agent_provider") or {}).get("instances") or []
+        for inst in instances:
+            if isinstance(inst, dict) and inst.get("reliable_on_duty"):
+                iid = str(inst.get("id") or "").strip()
+                if not iid:
+                    continue
+                health = health_by_id.get(iid) or {}
+                if health.get("ok") or health.get("ready"):
+                    active_ids.add(iid)
+    return [iid for iid in active_ids if iid]
+
+
 def _reliable_scheduler_tick() -> None:
     """Run one worker-then-sender iteration and record the outcome.
 
@@ -1168,6 +1224,9 @@ def _reliable_scheduler_tick() -> None:
     and action summaries so no exception repr or helper-provided error text can
     leak through the status route.  Handled error dicts are logged as warnings
     without interpolating their text so user content is never written to logs.
+
+    A general worker run drains only unbound jobs; each on-duty instance then
+    gets a dedicated run that can claim only jobs bound to that instance.
     """
     worker_result: Any = None
     sender_result: Any = None
@@ -1179,6 +1238,14 @@ def _reliable_scheduler_tick() -> None:
     except Exception:
         logger.exception("Reliable scheduler worker iteration failed")
         worker_error = "worker iteration error"
+
+    # Route dedicated jobs only to instances that are on-duty and healthy.
+    on_duty_ids = _active_on_duty_instance_ids()
+    for iid in on_duty_ids:
+        try:
+            _reliable_worker_run_once({"instance_id": iid})
+        except Exception:
+            logger.exception("Reliable scheduler dedicated iteration failed instance_id=%s", iid)
 
     # Always run the sender so previously ready outbox rows can drain even when
     # the worker iteration raises or reports an error.
@@ -1355,6 +1422,50 @@ def _reliable_quarantine_turn_job(job_id: Any, body: Dict[str, Any]) -> Dict[str
         "job_id": job_id,
         "retryable": False,
         "quarantined": bool(quarantined),
+    }
+
+
+def _reliable_requeue_outbox(outbox_id: Any, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Recover a dead-letter outbox row that provably never reached the sender.
+
+    Safe path only: delegates to ``reliable_pipeline.requeue_dead_letter``,
+    which refuses any row whose ``send_started_at`` is set (i.e. any row a send
+    was ever authorized for).  The pre-tracking legacy override
+    (``recover_legacy_gate_rejection``) is deliberately NOT exposed over HTTP —
+    it requires manual content verification and is invoked directly.  ``actor``
+    is fixed to ``control_api`` because this surface has no caller
+    authentication, so a client-supplied identity would not be trustworthy.
+    Available even when the pipeline is globally disabled (like quarantine) so
+    safe tracked dead-letters (``send_started_at IS NULL``) can be recovered
+    before enabling; pre-tracking legacy rows are refused here by design.
+    """
+    try:
+        cfg = reg.load_config()
+        outbox_id = int(outbox_id)
+        if outbox_id <= 0:
+            return _err_reliable("outbox_id must be a positive integer")
+        db_path = reliable_worker._resolve_db_path(cfg, None)
+        if not isinstance(body, dict):
+            return _err_reliable("request body must be a JSON object")
+        reason = str(body.get("reason") or "").strip()
+        if not reason:
+            return _err_reliable("reason is required")
+        updated = reliable_pipeline.requeue_dead_letter(
+            outbox_id=outbox_id,
+            reason=reason,
+            actor="control_api",
+            db_path=db_path,
+        )
+    except (TypeError, ValueError) as exc:
+        return _err_reliable("requeue rejected: %s" % (exc,))
+    except Exception:
+        logger.exception("Reliable outbox requeue failed")
+        return _err_reliable("requeue failed; see control_api log", status=500)
+    return {
+        "action": "requeued",
+        "outbox_id": outbox_id,
+        "status": updated.get("status"),
+        "requeue_count": updated.get("requeue_count"),
     }
 
 

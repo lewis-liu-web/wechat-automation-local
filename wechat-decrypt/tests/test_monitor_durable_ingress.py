@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -159,6 +160,14 @@ class TestPayloadBuilder(unittest.TestCase):
         self.assertNotIn("knowledge_bases", payload)
         self.assertNotIn("kb_results", payload)
         self.assertNotIn("retrieved_chunks", payload)
+
+    def test_payload_includes_kb_allowlist(self):
+        t = _target()
+        m = _event(8)
+        with patch.object(monitor, "resolve_target_kb_ids", return_value=["kb_sales", "kb_faq"]) as mock_kb:
+            payload = monitor.build_event_payload(t, m, cfg={"targets": []})
+        mock_kb.assert_called_once()
+        self.assertEqual(payload["_allowed_kb_ids"], ["kb_sales", "kb_faq"])
 
     def test_payload_target_includes_dedicated_agent_instance_id(self):
         t = _target()
@@ -616,6 +625,130 @@ class TestPipelineAllowlistMainLoop(unittest.TestCase):
         self.assertEqual(kwargs['target'], 'bot群聊测试')
         self.assertEqual(kwargs['payload']['local_id'], 42)
         self.assertEqual(target['last_local_id'], 42)
+
+
+class TestReliablePipelineBypassesLegacy(unittest.TestCase):
+    """Invariant: reliable eligible targets only persist durable ingress and never
+    run legacy aggregation, reply_decision_decide, generate_reply, KB prefetch,
+    or direct reply logic.
+    """
+
+    def _allowed_event(self):
+        return {
+            "local_id": 42,
+            "message_content": "@飞扬的跟屁虫 帮我查一下",
+            "real_sender_id": "wxid_allowed",
+            "sender": "wxid_allowed",
+            "sender_username": "wxid_allowed",
+            "sender_display_name": "Allowed",
+            "mention_name": "飞扬",
+            "local_type": 1,
+            "status": 0,
+            "create_time": 1234567890,
+        }
+
+    def _build_target(self):
+        return {
+            "name": "bot群聊测试",
+            "username": "wxid_target@chatroom",
+            "db": "message_0.db",
+            "table": "Msg_target",
+            "enabled": True,
+            "last_local_id": 0,
+            "reliable_pipeline_target": True,
+            "triggers": ["@飞扬的跟屁虫"],
+            "reply_policy": "balanced",
+        }
+
+    def _build_config(self, tmp_stop, db_path):
+        return {
+            "reliable_pipeline": {
+                "enabled": True,
+                "test_target_only": False,
+                "db_path": str(db_path),
+            },
+            "stop_file": str(tmp_stop),
+            "poll_interval": 3,
+            "default_triggers": ["@飞扬的跟屁虫"],
+            "session_window": 60,
+        }
+
+    @patch.object(monitor, 'reply_decision_decide')
+    @patch.object(monitor, 'generate_reply')
+    @patch.object(monitor, 'send_reply')
+    @patch.object(monitor, 'ingest_event')
+    @patch.object(monitor, 'event_from_monitor_message')
+    @patch.object(monitor, 'has_open_window')
+    @patch.object(monitor, 'flush_due', return_value=[])
+    @patch.object(monitor, 'drain_due_pipeline', return_value={'closed_turns': 0, 'created_jobs': 0})
+    @patch.object(monitor, 'enrich_sender_display_name', side_effect=lambda m, names: m)
+    @patch.object(monitor, 'fetch_new_for_db')
+    @patch.object(monitor, 'group_targets_by_db')
+    @patch.object(monitor, 'load_contact_name_map', return_value={})
+    @patch.object(monitor, 'fetch_latest_for_target', return_value=None)
+    @patch.object(monitor, 'enabled_targets')
+    @patch.object(monitor, 'load_config')
+    @patch('sys.argv', ['wechat_bot_monitor.py', '--once', '--no-fast-refresh', '--no-save-state', '--config', 'C:\\fake_config.json'])
+    def test_allowed_sender_skips_legacy_paths_and_preserves_payload(
+        self, mock_load_config, mock_enabled_targets, mock_fetch_latest,
+        mock_load_contact, mock_group, mock_fetch_new, mock_enrich,
+        mock_drain, mock_flush_due, mock_has_open_window,
+        mock_event_from_monitor, mock_ingest, mock_send_reply,
+        mock_generate_reply, mock_reply_decision
+    ):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmp_path = Path(tmp.name)
+        tmp_stop = tmp_path / 'monitor.stop'
+        tmp_db = tmp_path / 'reliable_pipeline.sqlite'
+        target = self._build_target()
+        cfg = self._build_config(tmp_stop, tmp_db)
+
+        def _load_config(path):
+            return cfg
+        mock_load_config.side_effect = _load_config
+
+        def _enabled_targets(c):
+            return [target]
+        mock_enabled_targets.side_effect = _enabled_targets
+
+        def group_by_db(targets):
+            return {t['db']: [t] for t in targets}
+        mock_group.side_effect = group_by_db
+
+        allowed = self._allowed_event()
+        mock_fetch_new.return_value = [(target, allowed)]
+
+        with patch.object(monitor, 'resolve_target_kb_ids', return_value=['kb1', 'kb2']):
+            monitor.main()
+
+        # Legacy aggregator and reply paths must not run.
+        mock_ingest.assert_not_called()
+        mock_event_from_monitor.assert_not_called()
+        mock_has_open_window.assert_not_called()
+        mock_reply_decision.assert_not_called()
+        mock_generate_reply.assert_not_called()
+        mock_send_reply.assert_not_called()
+
+        # Durable ingress must have advanced the cursor.
+        self.assertEqual(target['last_local_id'], 42)
+
+        # The persisted payload must retain target policy and KB allowlist.
+        with pipeline._connect(tmp_db) as con:
+            row = con.execute(
+                "SELECT payload_json FROM inbound_events WHERE local_id=42"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        payload = json.loads(row['payload_json'])
+        self.assertEqual(payload['target_policy']['reply_policy'], 'balanced')
+        self.assertEqual(payload['_allowed_kb_ids'], ['kb1', 'kb2'])
+        # Trigger/session flags must be computed by the reliable branch.
+        event_ctx = payload['event_context']
+        self.assertIs(event_ctx['trigger_matched'], True)
+        self.assertIs(event_ctx['session_active'], True)
+        self.assertEqual(event_ctx['session_state'], 'active')
+        self.assertEqual(event_ctx['session_turns'], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

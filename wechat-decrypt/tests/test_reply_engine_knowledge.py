@@ -9,7 +9,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from reply_engine import retrieve_knowledge, retrieve_knowledge_layers, generate_reply, _tool_agent_available_tools, _tool_agent_allowed_leann_indexes, _resolve_skill_name, _wechat_side_payload, _thin_monitor_enabled
+import knowledge_retrieval as kr
+from reply_engine import generate_reply, _tool_agent_available_tools, _tool_agent_allowed_leann_indexes, _resolve_skill_name, _wechat_side_payload, _thin_monitor_enabled
 import agent_provider as ap
 
 
@@ -33,7 +34,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         cfg={'wiki_dir': str(root), 'knowledge_bases': {}}
-        hits=retrieve_knowledge('完全无关问题', cfg, {'knowledge_bases': []})
+        hits=kr.retrieve_knowledge('完全无关问题', cfg, {'knowledge_bases': []})
         labels=[h.label for h in hits]
         self.assertTrue(any('core' in x for x in labels))
         self.assertFalse(any('scene' in x for x in labels))
@@ -45,11 +46,11 @@ class KnowledgeArchitectureTests(unittest.TestCase):
             'scene.a': {'type':'local','path':'scenes/a'},
             'scene.b': {'type':'local','path':'scenes/b'},
         }}
-        hits=retrieve_knowledge('苹果', cfg, {'knowledge_bases':['scene.a']})
+        hits=kr.retrieve_knowledge('苹果', cfg, {'knowledge_bases':['scene.a']})
         labels='\n'.join(h.label for h in hits)
         self.assertIn('scene.a', labels)
         self.assertNotIn('scene.b', labels)
-        hits2=retrieve_knowledge('香蕉', cfg, {'knowledge_bases':['scene.a','scene.b']})
+        hits2=kr.retrieve_knowledge('香蕉', cfg, {'knowledge_bases':['scene.a','scene.b']})
         self.assertIn('scene.b', '\n'.join(h.label for h in hits2))
 
     def test_scene_limit_is_independent_from_core_limit(self):
@@ -63,7 +64,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
             },
             'reply_engine': {'core_limit': 1, 'scene_limit': 2},
         }
-        layers = retrieve_knowledge_layers('苹果 香蕉', cfg, {'knowledge_bases': ['scene.a', 'scene.b']})
+        layers = kr.retrieve_knowledge_layers('苹果 香蕉', cfg, {'knowledge_bases': ['scene.a', 'scene.b']})
         self.assertLessEqual(len(layers['core']), 1, 'core_limit should cap core hits')
         self.assertLessEqual(len(layers['scene']), 2, 'scene_limit should cap scene hits')
         self.assertEqual(len(layers['scene']), 2, 'both scene KBs should appear')
@@ -79,16 +80,16 @@ class KnowledgeArchitectureTests(unittest.TestCase):
             'reply_engine': {'scene_limit': 5},
         }
         # Mock _retrieve_local_kb to return two hits for the same rel_path.
-        from reply_engine import _retrieve_local_kb as real_local
+        from knowledge_retrieval import _retrieve_local_kb as real_local
         def fake_local(query, root, spec, limit):
-            from reply_engine import KnowledgeHit
+            from knowledge_retrieval import KnowledgeHit
             kb_id = str(spec.get('id') or spec.get('path') or 'local')
             return [
                 KnowledgeHit('local', kb_id, 'scene', 'scenes/a/faq.md', '片段1', 3),
                 KnowledgeHit('local', kb_id, 'scene', 'scenes/a/faq.md', '片段2', 2),
             ]
-        with mock.patch('reply_engine._retrieve_local_kb', fake_local):
-            layers = retrieve_knowledge_layers('苹果', cfg, {'knowledge_bases': ['scene.a']})
+        with mock.patch('knowledge_retrieval._retrieve_local_kb', fake_local):
+            layers = kr.retrieve_knowledge_layers('苹果', cfg, {'knowledge_bases': ['scene.a']})
         self.assertEqual(len(layers['scene']), 1, 'duplicate rel_path should be deduped')
 
 
@@ -100,7 +101,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         cfg={'wiki_dir': str(root), 'knowledge_bases': {
             'scene.a': {'type':'local','path':'scenes/a'},
         }}
-        hits=retrieve_knowledge('工作号真实号', cfg, {'knowledge_bases':['scene.a']})
+        hits=kr.retrieve_knowledge('工作号真实号', cfg, {'knowledge_bases':['scene.a']})
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
 
@@ -109,7 +110,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景', encoding='utf-8')
-        from reply_engine import _retrieve_local_kb_fts
+        from knowledge_retrieval import _retrieve_local_kb_fts
         hits=_retrieve_local_kb_fts('工作号真实号', root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
@@ -138,8 +139,8 @@ class KnowledgeArchitectureTests(unittest.TestCase):
                 "query": query,
             }
 
-        with mock.patch('reply_engine._target_registry.search_leann_kb', fake_search):
-            layers = retrieve_knowledge_layers('公交卡充值失败', cfg, {'knowledge_bases': ['bus_index']})
+        with mock.patch('knowledge_retrieval._target_registry.search_leann_kb', fake_search):
+            layers = kr.retrieve_knowledge_layers('公交卡充值失败', cfg, {'knowledge_bases': ['bus_index']})
         contents = '\n'.join(h.content for h in layers['scene'])
         self.assertIn('NFC', contents)
         self.assertIn('超级 SIM', contents)
@@ -148,7 +149,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
-        from reply_engine import _retrieve_local_kb_fts
+        from knowledge_retrieval import _retrieve_local_kb_fts
         hits=_retrieve_local_kb_fts('工作号真实号', root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
@@ -157,7 +158,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         (root/'scenes'/'a'/'body_only.md').write_text('简单介绍一下，工作号真实号是一款号码认证产品。', encoding='utf-8')
-        from reply_engine import _retrieve_local_kb_fts
+        from knowledge_retrieval import _retrieve_local_kb_fts
         hits=_retrieve_local_kb_fts('介绍一下工作号真实号产品', root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
@@ -166,7 +167,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
-        from reply_engine import _retrieve_local_kb_fts, _clean_query_for_fts
+        from knowledge_retrieval import _retrieve_local_kb_fts, _clean_query_for_fts
         raw = 'lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢'
         cleaned = _clean_query_for_fts(raw)
         self.assertIn('工作号真实号', cleaned)
@@ -181,7 +182,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         cfg={'wiki_dir': str(root), 'knowledge_bases': {
             'scene.a': {'type':'local','path':'scenes/a'},
         }}
-        hits=retrieve_knowledge('工作号真实号', cfg, {'knowledge_bases':['scene.a']})
+        hits=kr.retrieve_knowledge('工作号真实号', cfg, {'knowledge_bases':['scene.a']})
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
 
@@ -192,7 +193,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         cfg={'wiki_dir': str(root), 'knowledge_bases': {
             'scene.a': {'type':'local','path':'scenes/a'},
         }}
-        hits=retrieve_knowledge('介绍一下工作号真实号产品', cfg, {'knowledge_bases':['scene.a']})
+        hits=kr.retrieve_knowledge('介绍一下工作号真实号产品', cfg, {'knowledge_bases':['scene.a']})
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
 
@@ -203,14 +204,14 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         cfg={'wiki_dir': str(root), 'knowledge_bases': {
             'scene.a': {'type':'local','path':'scenes/a'},
         }}
-        hits=retrieve_knowledge('lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢', cfg, {'knowledge_bases':['scene.a']})
+        hits=kr.retrieve_knowledge('lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢', cfg, {'knowledge_bases':['scene.a']})
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
     def test_ima_without_key_is_safe_no_hit(self):
         td, root = self.make_wiki()
         self.addCleanup(td.cleanup)
         cfg={'wiki_dir': str(root), 'knowledge_bases': {'online.ima.x': {'type':'ima','api_key_env':'NON_EXISTENT_IMA_KEY_FOR_TEST'}}}
-        hits=retrieve_knowledge('whatever', cfg, {'knowledge_bases':['online.ima.x']})
+        hits=kr.retrieve_knowledge('whatever', cfg, {'knowledge_bases':['online.ima.x']})
         self.assertTrue(all(h.source == 'local' for h in hits))
 
     def test_ima_search_uses_official_contract_and_parses_hits(self):
@@ -256,7 +257,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         }}}
         with mock.patch.dict(os.environ, {'TEST_IMA_CLIENT':'cid', 'TEST_IMA_KEY':'akey'}), \
              mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
-            hits=retrieve_knowledge('苹果', cfg, {'knowledge_bases':['online.ima.x']})
+            hits=kr.retrieve_knowledge('苹果', cfg, {'knowledge_bases':['online.ima.x']})
         ima_hits=[h for h in hits if h.source == 'ima']
         self.assertEqual(len(ima_hits), 1)
         search_req = next(r for r in requests if '/openapi/wiki/v1/search_knowledge' in r['url'])
@@ -297,7 +298,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         q='lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢'
         with mock.patch.dict(os.environ, {'TEST_IMA_CLIENT':'cid', 'TEST_IMA_KEY':'akey'}), \
              mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
-            hits=retrieve_knowledge(q, cfg, {'knowledge_bases':['online.ima.x']})
+            hits=kr.retrieve_knowledge(q, cfg, {'knowledge_bases':['online.ima.x']})
         ima_hits=[h for h in hits if h.source == 'ima']
         self.assertTrue(any('工作号真实号用于号码认证场景' in h.content for h in ima_hits))
         self.assertGreaterEqual(len(calls), 2)

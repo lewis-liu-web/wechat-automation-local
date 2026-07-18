@@ -919,7 +919,7 @@ def _cua_list_windows_json(timeout: float = 30) -> Optional[dict]:
 def _cua_run(cmd: list, timeout: float = 30, log: Optional[LogFn] = None) -> 'subprocess.CompletedProcess[str]':
     """Run cua-driver CLI without popping a console window on Windows."""
     import subprocess
-    kwargs: dict = dict(capture_output=True, text=True, timeout=timeout)
+    kwargs: dict = dict(capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     if sys.platform == 'win32':
         kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
     return subprocess.run(cmd, **kwargs)
@@ -1033,7 +1033,7 @@ def _cua_find_wechat_window(log=None) -> Optional[Tuple[int, int]]:
     def _main_candidates(windows):
         return [c for c in _cua_filter_usable_candidates(windows) if c[5] in main_titles]
 
-    result = _cua_run(['cua-driver', 'list_windows'], log=log)
+    result = _cua_run(['cua-driver', 'list_windows', '--json'], log=log)
     windows = _parse(result)
     pids = _cua_weixin_pids_from_windows(windows)
 
@@ -1062,7 +1062,7 @@ def _cua_find_wechat_window(log=None) -> Optional[Tuple[int, int]]:
                 time.sleep(0.6)
         except Exception as e:
             _log(log, 'cua restore main window failed: %r' % e)
-        retry = _cua_run(['cua-driver', 'list_windows'], log=log)
+        retry = _cua_run(['cua-driver', 'list_windows', '--json'], log=log)
         windows = _parse(retry)
         mains = _main_candidates(windows)
         if mains:
@@ -1079,7 +1079,7 @@ def _cua_find_wechat_window(log=None) -> Optional[Tuple[int, int]]:
         for pid in sorted(pids):
             _cua_call_bring_to_front(pid, log=log)
         time.sleep(0.5)
-        retry = _cua_run(['cua-driver', 'list_windows'], log=log)
+        retry = _cua_run(['cua-driver', 'list_windows', '--json'], log=log)
         windows = _parse(retry)
         mains = _main_candidates(windows)
         if mains:
@@ -1124,7 +1124,7 @@ def _cua_find_separate_chat_window(target: Optional[dict], cfg: Optional[dict] =
         _log(log, 'cua separate window: no target aliases')
         return None
 
-    result = _cua_run(['cua-driver', 'list_windows'], log=log)
+    result = _cua_run(['cua-driver', 'list_windows', '--json'], log=log)
     if result.returncode != 0:
         _log(log, 'cua separate window list_windows failed rc=%s stderr=%s' % (result.returncode, result.stderr[:200]))
         return None
@@ -1758,7 +1758,7 @@ def _cua_find_any_separate_window(main_hwnd: int, log: Optional[LogFn] = None) -
     Used after a pop-out when the title does not match any known alias.
     """
     import json
-    result = _cua_run(['cua-driver', 'list_windows'], log=log)
+    result = _cua_run(['cua-driver', 'list_windows', '--json'], log=log)
     if result.returncode != 0:
         return None
     try:

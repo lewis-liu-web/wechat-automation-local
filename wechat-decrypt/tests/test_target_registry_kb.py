@@ -627,6 +627,18 @@ class TestLeannEnv(unittest.TestCase):
         self.assertIn(r"cache\leann\huggingface", env["HF_HOME"])
         self.assertEqual(env["HF_ENDPOINT"], "https://hf-mirror.com")
 
+    def test_leann_env_discards_parent_python_runtime_overrides(self):
+        with mock.patch.dict(os.environ, {
+            "PYTHONPATH": r"C:\\hermes\\venv\\Lib\\site-packages",
+            "PYTHONHOME": r"C:\\hermes\\venv",
+            "PYTHONSTARTUP": r"C:\\hermes\\startup.py",
+            "PYTHONUSERBASE": r"C:\\hermes\\userbase",
+        }, clear=False):
+            env = reg._leann_env({})
+        for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+            self.assertNotIn(key, env)
+        self.assertEqual(env["PYTHONNOUSERSITE"], "1")
+
 
 class TestMigrateLeannCache(unittest.TestCase):
     def test_migrate_copies_files(self):

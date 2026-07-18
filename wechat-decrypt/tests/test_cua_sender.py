@@ -466,5 +466,27 @@ class SeparateWindowTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, 'cua_input_not_found')
 
+class CuaRunTests(unittest.TestCase):
+    """Verify _cua_run forwards subprocess safety flags."""
+
+    def test_cua_run_passes_stdin_devnull_and_no_window(self):
+        import subprocess
+        fake_result = _FakeResult(0, stdout='ok')
+        with patch.object(subprocess, 'run', return_value=fake_result) as mock_run:
+            result = sender._cua_run(['cua-driver', 'list_windows', '--json'], timeout=25)
+        self.assertIs(result, fake_result)
+        mock_run.assert_called_once()
+        call_args, call_kwargs = mock_run.call_args
+        self.assertEqual(call_args[0], ['cua-driver', 'list_windows', '--json'])
+        self.assertEqual(call_kwargs.get('timeout'), 25)
+        self.assertIs(call_kwargs.get('stdin'), subprocess.DEVNULL)
+        self.assertTrue(call_kwargs.get('capture_output'))
+        self.assertTrue(call_kwargs.get('text'))
+        if sys.platform == 'win32':
+            self.assertEqual(call_kwargs.get('creationflags'), subprocess.CREATE_NO_WINDOW)
+        else:
+            self.assertNotIn('creationflags', call_kwargs)
+
+
 if __name__ == '__main__':
     unittest.main()

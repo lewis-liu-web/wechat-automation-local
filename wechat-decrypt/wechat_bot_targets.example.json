@@ -44,8 +44,9 @@
         "scene.bot_testing"
       ],
       "reliable_pipeline_target": false,
+      "reliable_pipeline_shadow": false,
       "dedicated_agent_instance_id": "",
-      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding.",
+      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding. reliable_pipeline_shadow only takes effect when reliable_pipeline_target is true: shadow jobs run the full pipeline and record their decision and provenance, but never create a sendable outbox row and never send a WeChat message.",
       "_knowledge_bases_comment": "Each target can bind at most ONE knowledge-base alias (local or online). Remove the second alias if you want online retrieval."
     },
     {
@@ -86,8 +87,9 @@
         "scene.chongqing_mobile_work"
       ],
       "reliable_pipeline_target": false,
+      "reliable_pipeline_shadow": false,
       "dedicated_agent_instance_id": "",
-      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding."
+      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding. reliable_pipeline_shadow only takes effect when reliable_pipeline_target is true: shadow jobs run the full pipeline and record their decision and provenance, but never create a sendable outbox row and never send a WeChat message."
     }
   ],
   "wiki_dir": "./wiki",
@@ -187,5 +189,13 @@
       "description": "Get笔记/工作资料知识库（重生之我在重庆移动当牛做马群专用）"
     }
   },
-  "pyweixin_first": true
+  "pyweixin_first": true,
+  "reliable_pipeline": {
+    "enabled": false,
+    "test_target_only": true,
+    "test_target_names": ["bot群聊测试"],
+    "db_path": "temp/reliable_pipeline.sqlite",
+    "max_send_attempts": 5,
+    "retry_base_seconds": 2
+  }
 }

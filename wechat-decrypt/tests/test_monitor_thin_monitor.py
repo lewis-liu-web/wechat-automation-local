@@ -150,6 +150,9 @@ class ThinMonitorHandleTests(unittest.TestCase):
         agg_msg = mock_gen.call_args[0][0]
         self.assertIn("target_policy", agg_msg)
         self.assertIn("event_context", agg_msg)
+        # The same config file that produced this job must reach the enqueue
+        # payload (scoped MCP authorization snapshot).
+        self.assertEqual(mock_gen.call_args.kwargs.get("config_path"), "wechat_bot_targets.json")
         mock_send.assert_not_called()  # dry_run=True
 
     def test_handle_does_not_touch_pending_images_or_sessions(self):

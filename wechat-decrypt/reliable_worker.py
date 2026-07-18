@@ -20,10 +20,15 @@ file starts a background thread.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import subprocess
+import tempfile
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import reliable_pipeline as pipeline
 from wechat_sender import SendResult, send_reply_detailed
@@ -38,12 +43,37 @@ DEFAULT_SEND_OWNER = "reliable-sender"
 DEFAULT_LEASE_SECONDS = 120.0
 DEFAULT_DEADLINE_SECONDS = 300.0
 DEFAULT_SEND_LEASE_SECONDS = 45.0
+DEFAULT_SEND_IN_FLIGHT_LEASE_SECONDS = 180.0
 DEFAULT_MAX_SEND_ATTEMPTS = 5
 DEFAULT_SEND_LIMIT = 10
 DEFAULT_RETRY_BASE_SECONDS = 5.0
+DEFAULT_KNOWLEDGE_PROVIDER_TIMEOUT = 240.0
 RELIABLE_RESULT_CONTRACT_FLAG = "reliable_result_contract"
 TEST_TARGET_ONLY_NAME = "bot群聊测试"
 TARGET_NOT_CONFIGURED_REASON = "target not configured"
+
+# Knowledge-search trace provenance fields (Stage 3). The worker owns the
+# trace directory and id; the model only sees the id via env, never the path.
+TRACE_ENV_ID = "WECHAT_MCP_TRACE_ID"
+TRACE_ENV_DIR = "WECHAT_MCP_TRACE_DIR"
+TRACE_PAYLOAD_ID = "_knowledge_trace_id"
+TRACE_PAYLOAD_DIR = "_knowledge_trace_dir"
+TRACE_FILE_SUFFIX = ".json"
+MAX_TRACE_BYTES = 1024 * 1024  # 1 MiB cap on a single trace file
+TRACE_SCHEMA_KEYS = {"trace_id", "status", "provenance", "no_source_reason"}
+
+# Whitelisted provider failure stages that may be persisted safely.  Anything
+# outside this set is normalized to a fixed fallback so a misbehaving provider
+# can never leak arbitrary error text or raw stdout via the ``stage`` key.
+_ALLOWED_PROVIDER_FAILURE_STAGES = {
+    "rc_nonzero_no_stdout",
+    "rc_nonzero_with_stdout",
+    "empty_stdout",
+    "contract_violation",
+    "timeout",
+    "runner_error",
+}
+
 # Statuses that represent a successful terminal run.  Only when the
 # provider reports one of these (in addition to ``ok=True`` and a valid
 # ``AgentResult``) may the worker apply the contract.  Anything else
@@ -299,6 +329,66 @@ def _resolve_retry_base(config: Optional[Dict[str, Any]]) -> float:
         return DEFAULT_RETRY_BASE_SECONDS
 
 
+def _resolve_send_lease_seconds(config: Optional[Dict[str, Any]]) -> float:
+    """Lease window granted to a row once a send is *authorized* (marker set).
+
+    Must comfortably cover the worst-case ``send_reply_detailed`` duration
+    (UI/OCR actions plus DB confirmation) so the lease cannot expire mid-send
+    and let another worker reclaim + double-send.  Config:
+    ``reliable_pipeline.send_lease_seconds``; default
+    ``DEFAULT_SEND_IN_FLIGHT_LEASE_SECONDS``.
+
+    RESIDUAL RISK (accepted, not closed): this is a fixed window, so a send
+    that actually runs longer than the configured value can still be reclaimed
+    mid-flight and duplicated.  Size it above the real worst-case sender +
+    confirmation time for the deployment.
+    """
+    section = _safe_get(config or {}, "reliable_pipeline", {}) or {}
+    raw = _safe_get(section, "send_lease_seconds", DEFAULT_SEND_IN_FLIGHT_LEASE_SECONDS)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_SEND_IN_FLIGHT_LEASE_SECONDS
+
+
+def _classify_provider_failure(result: Any) -> Dict[str, Any]:
+    """Return a safe, minimal classification of a provider failure.
+
+    Fixed schema: result type name, ok flag, normalized status, and a
+    whitelisted ``stage`` enum.  Never includes the provider's error message,
+    reply text, or raw body, which may contain filesystem paths, secrets,
+    or user content.
+    """
+    if isinstance(result, dict):
+        result_type = str(result.get("result_type") or "dict")
+        ok = bool(result.get("ok"))
+        status = str(result.get("status") or "").strip().lower()
+        raw = result.get("raw")
+    else:
+        result_type = type(result).__name__
+        ok = getattr(result, "ok", None) is True
+        status = str(getattr(result, "status", "") or "").strip().lower()
+        raw = getattr(result, "raw", None) if not isinstance(result, BaseException) else None
+    if not isinstance(raw, dict):
+        raw = {}
+    stage = raw.get("stage")
+    if not isinstance(stage, str) or stage not in _ALLOWED_PROVIDER_FAILURE_STAGES:
+        if isinstance(result, subprocess.TimeoutExpired):
+            stage = "timeout"
+        elif isinstance(result, BaseException):
+            stage = "runner_error"
+        elif _provider_status_timeout(status):
+            stage = "timeout"
+        else:
+            stage = "unknown"
+    return {
+        "result_type": result_type,
+        "ok": ok,
+        "status": status,
+        "stage": stage,
+    }
+
+
 def _provider_status_terminal_success(status: str) -> bool:
     """Return True only when the provider reports a successful terminal run.
 
@@ -334,7 +424,180 @@ def _extract_turn_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
-def _build_provider_job(*, job: Dict[str, Any], config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _requires_knowledge_trace(payload: Dict[str, Any]) -> bool:
+    """Return whether the target policy requires an MCP search attempt."""
+    target_policy = payload.get("target_policy")
+    if not isinstance(target_policy, dict):
+        return False
+    if target_policy.get("reply_policy") != "knowledge_grounded":
+        return False
+    allowed_kb_ids = payload.get("_allowed_kb_ids")
+    return isinstance(allowed_kb_ids, list) and bool(allowed_kb_ids)
+
+
+# --- Knowledge-search trace provenance (Stage 3) ----------------------------
+
+# The worker owns the trace directory and trace id. The id and directory are
+# passed to the provider as internal payload keys (stripped from the model
+# prompt by ``agent_provider._prepare_model_job``) and forwarded to the MCP
+# server only via the trusted environment variables. Hermes never receives a
+# generic filesystem capability; the path is fixed and worker-generated.
+
+
+def _resolve_trace_base_dir(config: Optional[Dict[str, Any]], db_path: Optional[Path] = None) -> Path:
+    """Return the worker-controlled base directory for knowledge traces.
+
+    The trace base is resolved in order of trust: explicit env, then config,
+    then the directory containing the actual pipeline DB being used by the
+    current job.  This prevents a global default from leaking across multiple
+    pipeline DB instances.
+    """
+    env_dir = os.environ.get(TRACE_ENV_DIR)
+    if env_dir:
+        return Path(env_dir)
+    cfg = config or {}
+    section = _safe_get(cfg, "reliable_pipeline", {}) or {}
+    candidate = _safe_get(section, "knowledge_trace_dir", None)
+    if candidate:
+        return Path(candidate)
+    resolved_db = db_path or pipeline.DEFAULT_DB_PATH
+    return resolved_db.parent / "knowledge_traces"
+
+
+def _create_trace_context(job_id: int, config: Optional[Dict[str, Any]], db_path: Optional[Path] = None) -> Tuple[str, Path]:
+    """Generate a fresh trace id and a per-job trace directory under the base."""
+    trace_id = uuid.uuid4().hex
+    base_dir = _resolve_trace_base_dir(config, db_path)
+    trace_dir = base_dir / f"job_{job_id}_{trace_id}"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return trace_id, trace_dir
+
+
+def _trace_artifact_path(trace_id: str, trace_dir: Path) -> Path:
+    """Return the fixed trace artifact path for a job."""
+    return trace_dir / f"{trace_id}{TRACE_FILE_SUFFIX}"
+
+
+def _load_trace_provenance(trace_id: str, trace_dir: Path) -> Dict[str, Any]:
+    """Load, validate, and clean up the MCP trace artifact for one job.
+
+    Returns a structured metadata summary. Missing files are reported as
+    ``no_tool_call``; an attempted search with no hits is reported as
+    ``no_hit``; malformed or out-of-scope artifacts are reported as
+    ``invalid`` (or ``error`` when the MCP file itself reports an error).
+    The file is deleted after reading; the per-job directory is removed if
+    empty.
+    """
+    summary: Dict[str, Any] = {
+        "trace_id": trace_id,
+        "status": "no_tool_call",
+        "provenance": [],
+        "no_source_reason": "",
+        "loaded_at": _now(),
+    }
+    if not trace_id or not trace_dir:
+        return summary
+
+    path = _trace_artifact_path(trace_id, trace_dir)
+    if not path.is_file():
+        return summary
+
+    try:
+        size = path.stat().st_size
+        if size > MAX_TRACE_BYTES:
+            summary["status"] = "invalid"
+            summary["error"] = "trace file exceeds %d bytes" % MAX_TRACE_BYTES
+            return summary
+
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read(MAX_TRACE_BYTES + 1)
+        if len(raw) > MAX_TRACE_BYTES:
+            summary["status"] = "invalid"
+            summary["error"] = "trace file exceeds %d bytes" % MAX_TRACE_BYTES
+            return summary
+
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            summary["status"] = "invalid"
+            summary["error"] = "trace file is not a JSON object"
+            return summary
+        if set(data.keys()) != TRACE_SCHEMA_KEYS:
+            summary["status"] = "invalid"
+            summary["error"] = "trace file has unexpected schema keys"
+            return summary
+        if data.get("trace_id") != trace_id:
+            summary["status"] = "invalid"
+            summary["error"] = "trace_id mismatch"
+            return summary
+
+        provenance = data.get("provenance") or []
+        if not isinstance(provenance, list):
+            summary["status"] = "invalid"
+            summary["error"] = "provenance is not a list"
+            return summary
+
+        no_source_reason = str(data.get("no_source_reason") or "").strip()
+        mcp_status = str(data.get("status") or "").strip().lower()
+
+        if mcp_status == "error":
+            summary["status"] = "error"
+            summary["no_source_reason"] = no_source_reason
+            return summary
+        if mcp_status == "provider_failure":
+            summary["status"] = "provider_failure"
+            summary["no_source_reason"] = no_source_reason
+            return summary
+        if mcp_status == "no_hit" or not provenance:
+            summary["status"] = "no_hit"
+            summary["no_source_reason"] = no_source_reason
+            return summary
+        if mcp_status in ("ok", "success") and provenance:
+            summary["status"] = "ok"
+            summary["provenance"] = provenance
+            summary["no_source_reason"] = no_source_reason
+            return summary
+
+        summary["status"] = "invalid"
+        summary["error"] = "unrecognized trace status: %r" % mcp_status
+        return summary
+    except Exception as exc:
+        summary["status"] = "invalid"
+        summary["error"] = "trace read failed: %s" % exc
+        return summary
+    finally:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        try:
+            if trace_dir.exists() and not any(trace_dir.iterdir()):
+                trace_dir.rmdir()
+        except Exception:
+            pass
+
+
+
+def _validate_trace_kb_authorization(provenance: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+    """Reject successful grounded-search traces that escape the target allowlist."""
+    if not _requires_knowledge_trace(payload) or provenance.get("status") != "ok":
+        return True
+    allowed_kb_ids = {
+        str(kb_id).strip()
+        for kb_id in (payload.get("_allowed_kb_ids") or [])
+        if str(kb_id).strip()
+    }
+    for item in provenance.get("provenance") or []:
+        kb_id = str(item.get("kb_id") or "").strip() if isinstance(item, dict) else ""
+        if not kb_id or kb_id not in allowed_kb_ids:
+            provenance["status"] = "invalid"
+            provenance["provenance"] = []
+            provenance["no_source_reason"] = ""
+            provenance["error"] = "knowledge trace contains unauthorized KB"
+            return False
+    return True
+def _build_provider_job(*, job: Dict[str, Any], config: Optional[Dict[str, Any]],
+                          trace_id: str, trace_dir: Path) -> Dict[str, Any]:
     """Translate a leased durable turn job into a provider job dict.
 
     The provider contract flag is required so providers can opt in to the
@@ -343,9 +606,16 @@ def _build_provider_job(*, job: Dict[str, Any], config: Optional[Dict[str, Any]]
     turn are aggregated into a conversation prompt, and authorization/
     policy fields are promoted from the last event's snapshot so queued jobs
     do not change KB scope or policy when config is edited later.
+
+    Internal trace keys ``_knowledge_trace_id`` and ``_knowledge_trace_dir``
+    are attached here; ``agent_provider._prepare_model_job`` strips them
+    from the model prompt and forwards them to the MCP server as trusted
+    environment variables.
     """
     raw_payload = _extract_turn_payload(job)
     payload = _normalize_turn_payload(raw_payload)
+    payload[TRACE_PAYLOAD_ID] = trace_id
+    payload[TRACE_PAYLOAD_DIR] = str(trace_dir)
     target_id = str(job.get("target_id") or "")
     group_key = str(job.get("group_key") or "")
     provider_job: Dict[str, Any] = {
@@ -511,6 +781,7 @@ def process_once(
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
     timeout: Optional[float] = None,
     now: Optional[float] = None,
+    instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Claim one durable turn job, run the provider, and apply its contract.
 
@@ -528,6 +799,16 @@ def process_once(
     boxes, ANSI, JSON-looking tool output, ``AgentResult`` violations,
     or any exception) fails the durable job without creating an outbox
     so a leaked provider stdout can never reach the sender.
+
+    For each leased job, the worker creates a unique knowledge-search trace
+    id and directory under the worker-controlled base (env
+    ``WECHAT_MCP_TRACE_DIR``, config ``knowledge_trace_dir``, or the
+    fixed ``knowledge_traces`` directory under the DB parent). The id and
+    directory are passed as internal payload keys and forwarded by the
+    provider to the MCP server via environment variables. After the provider
+    run, the worker reads the fixed trace artifact
+    ``{trace_dir}/{trace_id}.json``, validates it, and persists a structured
+    provenance summary alongside the durable job result.
     """
     if not callable(final_filter):
         raise FinalFilterRequired("process_once requires a callable final_filter")
@@ -542,17 +823,21 @@ def process_once(
         deadline_seconds=float(deadline_seconds),
         db_path=db,
         now=ts,
+        instance_id=instance_id,
     )
     if not claimed:
         return {"status": "empty", "job": None, "outbox": None}
 
     job_id = int(claimed.get("id") or 0)
-    provider_job = _build_provider_job(job=claimed, config=config)
+    trace_id, trace_dir = _create_trace_context(job_id, config, db_path=db)
+    provider_job = _build_provider_job(job=claimed, config=config,
+                                         trace_id=trace_id, trace_dir=trace_dir)
     norm_error = provider_job.get("payload", {}).get("_normalization_error")
     if norm_error:
         logger.warning("job=%s normalization failed: %s", job_id, norm_error)
+        provenance = _load_trace_provenance(trace_id, trace_dir)
         pipeline.fail_job(job_id=job_id, error="normalization failed: %s" % norm_error,
-                          retryable=False, db_path=db, now=ts)
+                          provenance=provenance, retryable=False, db_path=db, now=ts)
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
     # Resolve the effective provider.  When the caller supplied a
@@ -585,17 +870,30 @@ def process_once(
                 effective_provider = resolved
 
     if effective_provider is None or not hasattr(effective_provider, "run"):
+        provenance = _load_trace_provenance(trace_id, trace_dir)
         pipeline.fail_job(job_id=job_id, error="no runnable provider available",
-                          retryable=False, db_path=db, now=ts)
+                          provenance=provenance, retryable=False, db_path=db, now=ts)
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
+    provider_timeout = timeout
+    if provider_timeout is None and _requires_knowledge_trace(provider_job.get("payload") or {}):
+        provider_timeout = DEFAULT_KNOWLEDGE_PROVIDER_TIMEOUT
     try:
-        result = effective_provider.run(provider_job, timeout=timeout)
+        result = effective_provider.run(provider_job, timeout=provider_timeout)
     except Exception as exc:  # provider raised; transition job to failed
         logger.warning("provider run raised for job=%s: %s", job_id, exc)
+        provenance = _load_trace_provenance(trace_id, trace_dir)
         pipeline.fail_job(job_id=job_id, error="provider run failed",
-                          retryable=False, db_path=db, now=ts)
+                          provenance=provenance, retryable=False, db_path=db, now=ts,
+                          provider_diagnostics=_classify_provider_failure(exc))
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
+
+    # Load the trace artifact written by the MCP server for this job. The
+    # trace is read regardless of whether the provider succeeded so that
+    # failures can still be correlated with any search that happened before
+    # the failure. Provider failure remains a separate status in the job
+    # row; the provenance summary only describes the knowledge search.
+    provenance = _load_trace_provenance(trace_id, trace_dir)
 
     if not _looks_like_agent_result(result):
         # Anything that does not expose ``ok`` + ``status`` (or whose
@@ -605,7 +903,13 @@ def process_once(
         # carry the versioned document, so we fail the job without
         # creating an outbox.
         pipeline.fail_job(job_id=job_id, error="provider returned non-AgentResult",
-                          retryable=False, db_path=db, now=ts)
+                          provenance=provenance, retryable=False, db_path=db, now=ts,
+                          provider_diagnostics=_classify_provider_failure({
+                              "result_type": type(result).__name__,
+                              "ok": False,
+                              "status": str(getattr(result, "status", "") or "").strip().lower(),
+                              "raw": {"stage": "contract_violation"},
+                          }))
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
     provider_status = str(getattr(result, "status", "") or "").strip()
@@ -617,7 +921,8 @@ def process_once(
         # free and the job in a terminal state.  Never echo the provider's
         # error attribute; it may contain filesystem paths or secrets.
         pipeline.fail_job(job_id=job_id, error="provider result failed",
-                          retryable=False, db_path=db, now=ts)
+                          provenance=provenance, retryable=False, db_path=db, now=ts,
+                          provider_diagnostics=_classify_provider_failure(result))
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
     if not _provider_status_terminal_success(provider_status):
@@ -631,9 +936,16 @@ def process_once(
             job_id=job_id,
             error=("provider status %r is not a successful terminal run"
                    % (provider_status or "<empty>",)),
+            provenance=provenance,
             retryable=False,
             db_path=db,
             now=ts,
+            provider_diagnostics=_classify_provider_failure({
+                "result_type": type(result).__name__,
+                "ok": result.ok is True,
+                "status": provider_status,
+                "raw": {"stage": "contract_violation"},
+            }),
         )
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
@@ -649,13 +961,42 @@ def process_once(
         pipeline.fail_job(
             job_id=job_id,
             error="invalid agent result contract",
+            provenance=provenance,
+            retryable=False,
+            db_path=db,
+            now=ts,
+            provider_diagnostics=_classify_provider_failure({
+                "result_type": type(result).__name__,
+                "ok": result.ok is True,
+                "status": provider_status,
+                "raw": {"stage": "contract_violation"},
+            }),
+        )
+        return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
+
+    payload = provider_job.get("payload") or {}
+    if _requires_knowledge_trace(payload) and provenance.get("status") == "no_tool_call":
+        pipeline.fail_job(
+            job_id=job_id,
+            error="required knowledge search was not invoked",
+            provenance=provenance,
             retryable=False,
             db_path=db,
             now=ts,
         )
         return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
 
-    payload = provider_job.get("payload") or {}
+    if _requires_knowledge_trace(payload) and not _validate_trace_kb_authorization(provenance, payload):
+        pipeline.fail_job(
+            job_id=job_id,
+            error="invalid knowledge search trace",
+            provenance=provenance,
+            retryable=False,
+            db_path=db,
+            now=ts,
+        )
+        return {"status": "failed", "job": _fetch_job(db, job_id), "outbox": None}
+
     mention = str(payload.get("mention_name") or "").strip()
     applied = pipeline.apply_agent_result(
         job_id=job_id,
@@ -663,6 +1004,7 @@ def process_once(
         final_filter=final_filter,
         mention_name=mention,
         max_send_attempts=_resolve_max_send_attempts(config),
+        provenance=provenance,
         db_path=db,
         now=ts,
     )
@@ -671,26 +1013,46 @@ def process_once(
 
 # --- send_once ---------------------------------------------------------------
 
+def _resolve_test_target_names(config: Optional[Dict[str, Any]]) -> Tuple[str, ...]:
+    """Return the allowlist of target names permitted in test mode.
+
+    Only accepts a list of strings; empty/invalid values fall back to the
+    single default test target.  Names are stripped and empty entries are
+    dropped, but no case normalization is applied so matching remains exact.
+    """
+    section = _safe_get(config or {}, "reliable_pipeline", {}) or {}
+    raw = section.get("test_target_names")
+    if not isinstance(raw, list):
+        return (TEST_TARGET_ONLY_NAME,)
+    names = [str(n).strip() for n in raw if isinstance(n, str) and str(n).strip()]
+    return tuple(names) if names else (TEST_TARGET_ONLY_NAME,)
+
+
 def _enforce_test_target_only(target: Optional[Dict[str, Any]], config: Optional[Dict[str, Any]]) -> Optional[str]:
     """Return an error string when the gate rejects the target, else None.
 
-    Compares ``target['name']`` verbatim against ``bot群聊测试``; any
-    deviation in whitespace, case, suffix, or absence rejects the send.
+    Compares ``target['name']`` verbatim against the configured allowlist
+    (default: ``bot群聊测试``); any deviation in whitespace, case, suffix,
+    or absence rejects the send.
     """
     if not _resolve_test_target_only(config):
         return None
     if not isinstance(target, dict):
         return "test_mode_target_rejected: target not configured"
     name = _target_raw_name(target)
-    if name != TEST_TARGET_ONLY_NAME:
-        return "test_mode_target_rejected: target name %r is not %r" % (name, TEST_TARGET_ONLY_NAME)
+    allowed = _resolve_test_target_names(config)
+    if name not in allowed:
+        return "test_mode_target_rejected: target name %r is not in %r" % (name, allowed)
     return None
 
 
-def _record_skip(db: Path, outbox_id: int, error: str, ts: float, retry_base: float) -> Dict[str, Any]:
+def _record_skip(db: Path, outbox_id: int, error: str, ts: float, retry_base: float,
+                 owner: str, lease_id: str) -> Dict[str, Any]:
     """Record a non-send terminal state for an outbox row (any gate rejection)."""
     return pipeline.record_send_result(
         outbox_id=int(outbox_id),
+        owner=owner,
+        lease_id=lease_id,
         confirmed=False,
         detail={"skipped": True, "reason": error[:200]},
         error=error[:500],
@@ -730,8 +1092,12 @@ def send_once(
     db = _resolve_db_path(config, db_path)
     ts = float(now if now is not None else _now())
     retry_base = _resolve_retry_base(config)
+    send_owner = str(owner or DEFAULT_SEND_OWNER)
+    # Once a send is authorized the marker extends the lease to cover the
+    # worst-case send+confirmation duration; never shorter than the claim lease.
+    send_lease = max(_resolve_send_lease_seconds(config), float(lease_seconds))
     claimed = pipeline.claim_sendable(
-        owner=str(owner or DEFAULT_SEND_OWNER),
+        owner=send_owner,
         limit=max(1, int(limit)),
         lease_seconds=float(lease_seconds),
         db_path=db,
@@ -745,6 +1111,7 @@ def send_once(
     for row in claimed:
         outbox_id = int(row.get("id") or 0)
         target_id = str(row.get("target_id") or "")
+        lease_id = str(row.get("lease_id") or "")
         target = _resolve_target(config, target_id)
         # Hard precondition: never call the sender without a target from
         # the caller's config.  ``send_reply_detailed(..., target=None)``
@@ -753,13 +1120,28 @@ def send_once(
         # unconfigured target the same way as a test-mode rejection.
         if target is None:
             gate_error = "%s: target_id=%r" % (TARGET_NOT_CONFIGURED_REASON, target_id)
-            updated = _record_skip(db, outbox_id, gate_error, ts, retry_base)
+            updated = _record_skip(db, outbox_id, gate_error, ts, retry_base, send_owner, lease_id)
             skipped.append({"outbox_id": outbox_id, "target_id": target_id, "error": gate_error, "row": updated})
             continue
         gate_error = _enforce_test_target_only(target, config)
         if gate_error is not None:
-            updated = _record_skip(db, outbox_id, gate_error, ts, retry_base)
+            updated = _record_skip(db, outbox_id, gate_error, ts, retry_base, send_owner, lease_id)
             skipped.append({"outbox_id": outbox_id, "target_id": target_id, "error": gate_error, "row": updated})
+            continue
+        # Persist the durable send-start marker immediately before invoking the
+        # sender.  ``record_send_started`` is guarded by the current lease; a
+        # False return means the row was reclaimed by another owner, so we must
+        # not send (the new owner will retry it).  Use a fresh timestamp rather
+        # than the claim-time ``ts`` so the lease-validity check and extension
+        # reflect the real mark moment; when the caller injected ``now`` (tests)
+        # this stays on that same deterministic clock.
+        mark_ts = float(now if now is not None else _now())
+        if not pipeline.record_send_started(outbox_id=outbox_id, lease_id=lease_id,
+                                            lease_extension_seconds=send_lease,
+                                            db_path=db, now=mark_ts):
+            logger.warning("send aborted for outbox=%s: lease no longer owned by %s", outbox_id, send_owner)
+            skipped.append({"outbox_id": outbox_id, "target_id": target_id,
+                            "error": "send aborted: lease lost before send"})
             continue
         try:
             send_result: SendResult = send_reply_detailed(
@@ -775,6 +1157,8 @@ def send_once(
             logger.warning("send_reply_detailed raised for outbox=%s: %s", outbox_id, exc)
             updated = pipeline.record_send_result(
                 outbox_id=outbox_id,
+                owner=send_owner,
+                lease_id=lease_id,
                 confirmed=False,
                 detail={"exception": repr(exc)},
                 error="send_reply_detailed raised: %r" % (exc,),
@@ -794,6 +1178,8 @@ def send_once(
         confirmed = bool(getattr(send_result, "ok", False))
         updated = pipeline.record_send_result(
             outbox_id=outbox_id,
+            owner=send_owner,
+            lease_id=lease_id,
             confirmed=confirmed,
             detail=detail,
             error="" if confirmed else (detail["reason"] or "send confirmation failed"),

@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "description": "Annotated regression corpus for Stage 3 knowledge-grounded reply pipeline. Each case fixes input, authorized KBs, and expected provenance/decision; the test adapter supplies local documents or fake retrieval outcomes.",
+  "cases": [
+    {
+      "id": "lexical_match",
+      "description": "Query term directly appears in an authorized local KB document.",
+      "query": "苹果是什么",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "facade_status": "ok",
+        "provenance": [
+          {"kb_id": "scene.a", "status": "hit"}
+        ]
+      },
+      "covered_by": "tests/test_knowledge_corpus.py::KnowledgeCorpusTests::test_lexical_match"
+    },
+    {
+      "id": "semantic_match",
+      "description": "Query does not literally match keywords; fake LEANN returns a semantically related document.",
+      "query": "公交卡充值失败怎么退款",
+      "allowed_kb_ids": ["leann.bus"],
+      "expected": {
+        "facade_status": "ok",
+        "provenance": [
+          {"kb_id": "leann.bus", "status": "hit"}
+        ]
+      },
+      "covered_by": "tests/test_knowledge_corpus.py::KnowledgeCorpusTests::test_semantic_match"
+    },
+    {
+      "id": "cross_kb_isolation",
+      "description": "Only authorized KBs may return hits; a second configured KB must not leak in.",
+      "query": "苹果",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "facade_status": "ok",
+        "provenance": [
+          {"kb_id": "scene.a", "status": "hit"}
+        ]
+      },
+      "covered_by": "tests/test_knowledge_corpus.py::KnowledgeCorpusTests::test_cross_kb_isolation"
+    },
+    {
+      "id": "no_hit",
+      "description": "Authorized KBs exist but contain no relevant content.",
+      "query": "完全无关的问题",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "facade_status": "no_hit",
+        "provenance": [
+          {"kb_id": "scene.a", "status": "no_hit", "count": 0}
+        ]
+      },
+      "covered_by": "tests/test_knowledge_corpus.py::KnowledgeCorpusTests::test_no_hit"
+    },
+    {
+      "id": "provider_outage",
+      "description": "Authorized IMA KB lacks credentials; facade returns provider_failure, not silent no_hit.",
+      "query": "工作号真实号",
+      "allowed_kb_ids": ["online.ima.work"],
+      "expected": {
+        "facade_status": "provider_failure",
+        "provenance": [
+          {"kb_id": "online.ima.work", "status": "failure"}
+        ]
+      },
+      "covered_by": "tests/test_knowledge_corpus.py::KnowledgeCorpusTests::test_provider_outage"
+    },
+    {
+      "id": "image_message",
+      "description": "A pure image message is valid ingress; the durable worker receives image_paths, not text.",
+      "query": "",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "worker_action": "reply"
+      },
+      "covered_by": "tests/test_reliable_worker.py::test_process_once_pure_image_message_is_valid"
+    },
+    {
+      "id": "multi_message_turn",
+      "description": "Multiple events in one turn aggregate into a single prompt, preserving order.",
+      "query": "请问苹果怎么买",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "worker_action": "reply"
+      },
+      "covered_by": "tests/test_reliable_worker.py::test_process_once_multi_event_aggregates_text_and_uses_last_auth"
+    },
+    {
+      "id": "silent_chat",
+      "description": "Agent decides the turn is smalltalk; no outbox is created.",
+      "query": "哈哈",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "worker_action": "silent"
+      },
+      "covered_by": "tests/test_reliable_worker.py::test_process_once_silent_creates_no_outbox"
+    },
+    {
+      "id": "escalation",
+      "description": "Agent decides the turn requires human escalation; escalation row is written.",
+      "query": "我要投诉你们",
+      "allowed_kb_ids": ["scene.a"],
+      "expected": {
+        "worker_action": "escalate"
+      },
+      "covered_by": "tests/test_reliable_worker.py::test_process_once_escalate_creates_no_outbox_and_marks_escalation"
+    }
+  ]
+}

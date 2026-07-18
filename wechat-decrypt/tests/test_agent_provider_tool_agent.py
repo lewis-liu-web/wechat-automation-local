@@ -1,6 +1,7 @@
 """Tests for strict Hermes provider prompts and AgentResult handling."""
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -106,27 +107,34 @@ def test_hermes_provider_run_rejects_legacy_display_text_and_tool_call_json():
 
 def test_hermes_provider_run_and_poll_produce_equivalent_agent_result():
     """The same strict contract fixture produces equivalent AgentResult via run and submit/poll."""
-    contract = _contract()
-    with tempfile.TemporaryDirectory() as tmp:
-        home = Path(tmp)
-        provider = ap.HermesProvider(cli_path="hermes-test", hermes_home=str(home))
-        with mock.patch("agent_provider.subprocess.run", return_value=_completed(contract)):
-            run_result = provider.run({"payload": {"prompt": "q"}}, timeout=5)
+    cases = [
+        ("reply", "answer", "answered", "low", "done"),
+        ("silent", "", "smalltalk", "low", "silent"),
+        ("escalate", "", "risk", "high", "escalated"),
+    ]
+    for action, reply_text, reason_code, risk_level, expected_status in cases:
+        contract = _contract(action, reply_text, reason_code, risk_level)
+        job = {"id": 2, "payload": {"prompt": "q"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            provider = ap.HermesProvider(cli_path="hermes-test", hermes_home=str(home))
+            with mock.patch("agent_provider.subprocess.run", return_value=_completed(contract)):
+                run_result = provider.run(job, timeout=5)
 
-        with mock.patch("agent_provider.subprocess.Popen") as mock_popen:
-            mock_popen.return_value = mock.Mock(pid=123)
-            sub = provider.submit({"id": 2, "payload": {"prompt": "q"}}, timeout=5)
-        session_dir = home / ".wechat_agent_jobs" / sub.raw["bridge_session_id"]
-        (session_dir / "result.json").write_text(
-            json.dumps({"rc": 0, "stdout": contract, "stderr": "", "latency": 0.1}),
-            encoding="utf-8",
-        )
-        poll_result = provider.poll(sub.raw["bridge_session_id"], 1)
+            with mock.patch("agent_provider.subprocess.Popen") as mock_popen:
+                mock_popen.return_value = mock.Mock(pid=123)
+                sub = provider.submit(job, timeout=5)
+            session_dir = home / ".wechat_agent_jobs" / sub.raw["bridge_session_id"]
+            (session_dir / "result.json").write_text(
+                json.dumps({"rc": 0, "stdout": contract, "stderr": "", "latency": 0.1}),
+                encoding="utf-8",
+            )
+            poll_result = provider.poll(sub.raw["bridge_session_id"], 1)
 
-    assert run_result.ok == poll_result.ok is True
-    assert run_result.status == poll_result.status == "done"
-    assert run_result.reply_text == poll_result.reply_text == "answer"
-    assert run_result.raw["agent_result"] == poll_result.raw["agent_result"]
+        assert run_result.ok == poll_result.ok is True, action
+        assert run_result.status == poll_result.status == expected_status, action
+        assert run_result.reply_text == poll_result.reply_text == reply_text, action
+        assert run_result.raw["agent_result"] == poll_result.raw["agent_result"], action
 
 
 def test_hermes_provider_submit_persists_strict_meta_always():
@@ -372,6 +380,158 @@ def test_build_prompt_path_hint_mentions_multimodal_and_decode_image_limits():
     assert "decode_image(image_path)" not in prompt
     assert "不能替代视觉理解" in prompt
     assert "不要编造图片内容" in prompt
+
+
+# Stage 3 MCP trace + knowledge facade prompt wiring.
+
+def test_prepare_model_job_passes_trace_env_to_subprocess():
+    """_prepare_model_job must forward the worker-provided trace env to the Hermes subprocess."""
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    job = {
+        "payload": {
+            "_knowledge_trace_id": "trace-123",
+            "_knowledge_trace_dir": "/tmp/traces",
+            "_config_path": "/tmp/cfg.json",
+            "_allowed_kb_ids": ["scene.a"],
+        }
+    }
+    _, env = provider._prepare_model_job(job)
+    assert env["WECHAT_MCP_TRACE_ID"] == "trace-123"
+    assert env["WECHAT_MCP_TRACE_DIR"] == "/tmp/traces"
+    assert env["WECHAT_MCP_ALLOWED_KB_IDS"] == json.dumps(["scene.a"])
+
+
+def test_prepare_model_job_requires_tool_call_for_grounded_authorized_kb():
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    _, env = provider._prepare_model_job({
+        "payload": {
+            "_allowed_kb_ids": ["scene.a"],
+            "target_policy": {"reply_policy": "knowledge_grounded"},
+        }
+    })
+    assert env["HERMES_TOOL_CHOICE_REQUIRED"] == "1"
+
+
+def test_prepare_model_job_does_not_require_tool_for_non_grounded_kb():
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    _, env = provider._prepare_model_job({
+        "payload": {
+            "_allowed_kb_ids": ["scene.a"],
+            "target_policy": {"reply_policy": "balanced"},
+        }
+    })
+    assert "HERMES_TOOL_CHOICE_REQUIRED" not in env
+
+
+def test_prepare_model_job_reads_trace_env_from_os_environ():
+    """_prepare_model_job falls back to os.environ for trace env when the payload does not set them."""
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    with mock.patch.dict(os.environ, {"WECHAT_MCP_TRACE_ID": "trace-999", "WECHAT_MCP_TRACE_DIR": "/var/traces"}):
+        _, env = provider._prepare_model_job({"payload": {}})
+    assert env["WECHAT_MCP_TRACE_ID"] == "trace-999"
+    assert env["WECHAT_MCP_TRACE_DIR"] == "/var/traces"
+
+
+def test_build_strict_agent_result_includes_trace_id():
+    """A strict AgentResult must carry the trace identifiers so the worker can correlate the MCP trace."""
+    if ap.AgentResultContract is None:
+        pytest.skip("reliable_pipeline not available")
+    with mock.patch.dict(os.environ, {"WECHAT_MCP_TRACE_ID": "trace-123", "WECHAT_MCP_TRACE_DIR": "/tmp/traces"}):
+        provider = ap.HermesProvider(cli_path="hermes-test")
+        contract = ap.AgentResultContract(action="reply", reply_text="hello", reason_code="answered", risk_level="low")
+        result = provider._build_strict_agent_result(contract, latency=0.1, extra_raw={})
+    assert result.raw["trace_id"] == "trace-123"
+    assert result.raw["trace_dir"] == "/tmp/traces"
+
+
+def test_strict_failed_result_includes_trace_id():
+    """Failure results also carry trace identifiers for correlation."""
+    with mock.patch.dict(os.environ, {"WECHAT_MCP_TRACE_ID": "trace-456", "WECHAT_MCP_TRACE_DIR": "/tmp/traces"}):
+        result = ap._strict_failed_result("err", latency=0.1, raw={"x": 1}, provider="hermes", worker_id="w")
+    assert result.raw["trace_id"] == "trace-456"
+    assert result.raw["trace_dir"] == "/tmp/traces"
+    assert result.raw["x"] == 1
+
+
+def test_strict_prompt_requires_facade_and_cites_provenance():
+    """The strict prompt must instruct the model to use the MCP knowledge facade and cite provenance."""
+    job = {
+        "payload": {
+            "prompt": "产品价格",
+            "reliable_result_contract": True,
+            "allowed_kb_ids": ["scene.a"],
+        }
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "mcp__wechat_kb_search__search_knowledge" in prompt
+    assert "provenance" in prompt
+    assert "ok/no_hit/provider_failure/invalid" in prompt
+    assert "不预取知识库片段" in prompt
+
+
+def test_strict_knowledge_grounded_prompt_requires_one_search_before_result():
+    job = {
+        "payload": {
+            "prompt": "产品价格",
+            "reliable_result_contract": True,
+            "allowed_kb_ids": ["scene.a"],
+            "target_policy": {"reply_policy": "knowledge_grounded"},
+        }
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "必须调用一次工具 mcp__wechat_kb_search__search_knowledge" in prompt
+    assert "reply、silent 或 escalate AgentResult 前" in prompt
+
+
+def test_strict_non_grounded_prompt_keeps_search_optional():
+    job = {
+        "payload": {
+            "prompt": "产品价格",
+            "reliable_result_contract": True,
+            "allowed_kb_ids": ["scene.a"],
+            "target_policy": {"reply_policy": "balanced"},
+        }
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "当需要基于知识库回答时" in prompt
+    assert "必须调用一次工具" not in prompt
+
+
+def test_strict_prompt_drops_prefetched_knowledge_hits():
+    """Strict mode must not leak pre-fetched knowledge_hits into the prompt."""
+    job = {
+        "payload": {
+            "prompt": "产品价格",
+            "reliable_result_contract": True,
+            "allowed_kb_ids": ["scene.a"],
+            "knowledge_hits": [{"content": "secret prefetched hit"}],
+        }
+    }
+    prompt = ap._build_wechat_deep_prompt(job)
+    assert "[知识库片段]" not in prompt
+    assert "secret prefetched hit" not in prompt
+    assert "不预取知识库片段" in prompt
+
+
+def test_hermes_provider_run_generic_exception_carries_stage_runner_error():
+    """A generic runtime exception in HermesProvider.run is tagged as runner_error."""
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    exc = TimeoutError()  # not TimeoutExpired, so falls to generic runner error
+    with mock.patch("agent_provider.subprocess.run", side_effect=exc):
+        result = provider.run({"payload": {"prompt": "q"}}, timeout=5)
+    assert result.ok is False
+    assert result.raw.get("stage") == "runner_error"
+
+
+def test_hermes_provider_run_subprocess_timeout_expired_carries_stage_timeout():
+    """A subprocess.TimeoutExpired in HermesProvider.run is tagged as timeout."""
+    import subprocess
+    provider = ap.HermesProvider(cli_path="hermes-test")
+    exc = subprocess.TimeoutExpired(cmd=["hermes-test"], timeout=5)
+    with mock.patch("agent_provider.subprocess.run", side_effect=exc):
+        result = provider.run({"payload": {"prompt": "q"}}, timeout=5)
+    assert result.ok is False
+    assert result.raw.get("stage") == "timeout"
 
 
 if __name__ == "__main__":

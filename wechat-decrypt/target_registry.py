@@ -124,7 +124,7 @@ def refresh_metadata_dbs(metadata_dbs=METADATA_DBS):
         cmd = [sys.executable, str(ROOT / "decrypt_db.py"), "--db", rel]
         try:
             r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=180,
-                               creationflags=_NO_WINDOW_FLAGS)
+                               creationflags=_NO_WINDOW_FLAGS, stdin=subprocess.DEVNULL)
             item["refreshed"] = (r.returncode == 0)
             item["ok"] = (r.returncode == 0)
             tail = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[-1000:]
@@ -1289,7 +1289,7 @@ def _resolve_getnote_kb_info(spec):
     try:
         proc = subprocess.run([exe, "kbs", "-o", "json"], capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=20,
-                              creationflags=_NO_WINDOW_FLAGS)
+                              creationflags=_NO_WINDOW_FLAGS, stdin=subprocess.DEVNULL)
     except Exception as e:
         out["online_error"] = "调用 getnote 失败: %s" % (e,)
         return out
@@ -1511,6 +1511,12 @@ def _leann_env(cfg=None, config_path=CONFIG_PATH):
         cfg = load_config(config_path)
     cache_root = Path(cfg.get("reply_engine", {}).get("leann", {}).get("cache_dir", r"D:\cache\leann"))
     env = dict(os.environ)
+    # LEANN runs under its own absolute Python interpreter. Hermes may inject
+    # PYTHONPATH/PYTHONHOME for its runtime, which makes that interpreter load
+    # incompatible stdlib/site-packages and stalls or fails semantic search.
+    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+        env.pop(key, None)
+    env["PYTHONNOUSERSITE"] = "1"
     env["HF_HOME"] = str(cache_root / "huggingface")
     env["SENTENCE_TRANSFORMERS_HOME"] = str(cache_root / "sentence_transformers")
     env["HF_HUB_OFFLINE"] = "1"
@@ -1664,9 +1670,10 @@ def search_leann_kb(spec, query, limit=5, config_path=CONFIG_PATH, cfg=None):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=max(1.0, float(spec.get("timeout") or 120)),
+            timeout=max(1.0, float(spec.get("timeout") or 240)),
             env=env,
             creationflags=_NO_WINDOW_FLAGS,
+            stdin=subprocess.DEVNULL,
         )
     except Exception as e:
         return {"hits": [], "matched_files": 0, "total_files": 0, "query": query, "error": str(e)}
@@ -1773,6 +1780,7 @@ def _run_leann_build_async(build_id, cmd, env, log_path, timeout=120, config_pat
                         errors="replace",
                         env=env,
                         creationflags=_NO_WINDOW_FLAGS,
+                        stdin=subprocess.DEVNULL,
                     )
                 except Exception as e:
                     err = "failed to start leann build: %s" % e
@@ -1942,7 +1950,7 @@ def _convert_file_to_markdown(path):
     try:
         proc = subprocess.run([markitdown_cmd, str(path)], capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=120,
-                              creationflags=_NO_WINDOW_FLAGS)
+                              creationflags=_NO_WINDOW_FLAGS, stdin=subprocess.DEVNULL)
         if proc.returncode == 0 and (proc.stdout or "").strip():
             return proc.stdout
         stderr_tail = ((proc.stderr or "").strip().splitlines() or [""])[-1][:400]

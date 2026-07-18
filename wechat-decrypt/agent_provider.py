@@ -180,8 +180,11 @@ _STRICT_AGENT_PROMPT_SUFFIX = (
     "2. schema_version 必须为 1；action 只接受 reply/silent/escalate 之一；仅允许上述 5 个字段。\n"
     "3. 任何不符合上述契约的输出（盒子、纯文本、工具调用提示、错误日志、Thinking 片段等）均视为失败。\n"
     "4. reply_text 在 silent/escalate 时必须留空字符串；reason_code 在 silent/escalate 时建议填写稳定短码。\n"
-    "5. 在生成回复前，如有需要请使用工具 mcp__wechat_kb_search__search_knowledge 查询已授权知识库；\n"
-    "   没有授权知识库或工具返回空时，基于已有上下文直接作答。\n"
+    "5. 在生成回复前，如有需要请使用工具 mcp__wechat_kb_search__search_knowledge(query, limit) 查询已授权知识库；\n"
+    "   该工具返回的结构化响应包含 status（ok/no_hit/provider_failure/invalid）、hits（命中文本片段）、\n"
+    "   provenance（来源信息）、error。status 为 ok 时，基于 hits 作答并在 reply_text 中引用来源；\n"
+    "   status 为 no_hit/provider_failure/invalid 时，基于已有上下文直接作答，不要编造。\n"
+    "6. 本任务不预取知识库片段；不要依赖任何预注入的知识库片段。\n"
     "请直接以 `{` 起首、JSON 对象结尾输出，不要包含前后叙述。"
 )
 
@@ -238,8 +241,11 @@ def _strict_failed_result(error: str, *, latency: float, raw: Dict[str, Any] | N
                           provider: str, worker_id: str,
                           status: str = "failed") -> "AgentResult":
     """Build a deterministic failure AgentResult for the strict path."""
+    merged_raw = dict(raw or {})
+    merged_raw["trace_id"] = os.environ.get("WECHAT_MCP_TRACE_ID") or ""
+    merged_raw["trace_dir"] = os.environ.get("WECHAT_MCP_TRACE_DIR") or ""
     return AgentResult(False, status, error=error, latency=latency,
-                       provider=provider, worker_id=worker_id, raw=raw)
+                       provider=provider, worker_id=worker_id, raw=merged_raw)
 
 
 @dataclass
@@ -395,12 +401,32 @@ def _build_wechat_deep_prompt(job: Dict[str, Any]) -> str:
     if _job_wants_strict(job):
         # Strict contract path: rely on the MCP ``search_knowledge`` tool the agent invokes.
         allowed_kb_ids = payload.get("allowed_kb_ids") or []
+        target_policy = payload.get("target_policy") or {}
+        knowledge_grounded = (
+            isinstance(target_policy, dict)
+            and target_policy.get("reply_policy") == "knowledge_grounded"
+        )
         if allowed_kb_ids:
+            invocation_rule = (
+                "在生成任何 reply、silent 或 escalate AgentResult 前，必须调用一次工具 "
+                "mcp__wechat_kb_search__search_knowledge(query, limit)。\n"
+                if knowledge_grounded
+                else "当需要基于知识库回答时，请调用工具 mcp__wechat_kb_search__search_knowledge(query, limit)。\n"
+            )
             kb_tool_instruction = (
                 f"\n\n[知识库工具]\n"
                 f"当前已授权知识库：{', '.join(str(k) for k in allowed_kb_ids)}。\n"
-                "当需要基于知识库回答时，请调用工具 mcp__wechat_kb_search__search_knowledge(query, limit)。\n"
-                "没有授权知识库或工具返回空时，基于已有上下文直接作答，不要编造。"
+                + invocation_rule
+                + "该工具返回的结构化响应包含 status（ok/no_hit/provider_failure/invalid）、\n"
+                "hits（命中文本片段）、provenance（来源信息）、error。\n"
+                "status 为 ok 时，基于 hits 作答并在 reply_text 中引用来源；\n"
+                "status 为 no_hit/provider_failure/invalid 时，基于已有上下文直接作答，不要编造。\n"
+                "本任务不预取知识库片段；不要依赖任何预注入的知识库片段。"
+            )
+        else:
+            kb_tool_instruction = (
+                "\n\n[知识库工具]\n"
+                "当前未授权任何知识库。请勿调用知识库工具，基于已有上下文直接作答，不要编造。"
             )
     elif is_tool_agent:
         max_tool_rounds = max(0, int(payload.get("max_tool_rounds") or 2))
@@ -562,8 +588,12 @@ class EchoAgentProvider:
         prompt = str(payload.get("prompt") or payload.get("clean_text") or payload.get("raw_text") or job.get("task_type") or "").strip()
         prefix = f"@{sender} " if sender else ""
         reply = postcheck(f"{prefix}已收到测试任务：{prompt[:80] or 'deep job'}")
+        raw: Dict[str, Any] = {}
+        if payload.get("reliable_result_contract"):
+            contract = AgentResultContract(action="reply", reply_text=reply, reason_code="echo", risk_level="low")
+            raw = {"agent_result": contract.to_dict()}
         return AgentResult(True, "done", reply_text=reply, latency=time.time() - t0,
-                           provider=self.name, worker_id=self.worker_id)
+                           provider=self.name, worker_id=self.worker_id, raw=raw)
 
     def submit(self, job: Dict[str, Any], timeout: float | None = None) -> AgentResult:
         """Echo provider: submit is a no-op, returns a fake session id."""
@@ -653,6 +683,16 @@ class HermesProvider:
             or ""
         )
         wiki_dir = inner_payload.get("wiki_dir")
+        trace_id = str(
+            inner_payload.get("_knowledge_trace_id")
+            or os.environ.get("WECHAT_MCP_TRACE_ID")
+            or ""
+        ).strip()
+        trace_dir = str(
+            inner_payload.get("_knowledge_trace_dir")
+            or os.environ.get("WECHAT_MCP_TRACE_DIR")
+            or ""
+        ).strip()
 
         model_payload = {
             k: _json_safe(v)
@@ -670,6 +710,9 @@ class HermesProvider:
             "WECHAT_MCP_ALLOWED_KB_IDS",
             "WECHAT_MCP_TARGET_ID",
             "WECHAT_MCP_WIKI_DIR",
+            "WECHAT_MCP_TRACE_ID",
+            "WECHAT_MCP_TRACE_DIR",
+            "HERMES_TOOL_CHOICE_REQUIRED",
         ):
             env.pop(key, None)
         env["WECHAT_MCP_ALLOWED_KB_IDS"] = json.dumps(list(allowed_kb_ids))
@@ -679,6 +722,17 @@ class HermesProvider:
             env["WECHAT_MCP_TARGET_ID"] = target_id
         if wiki_dir:
             env["WECHAT_MCP_WIKI_DIR"] = str(wiki_dir)
+        if trace_id:
+            env["WECHAT_MCP_TRACE_ID"] = trace_id
+        if trace_dir:
+            env["WECHAT_MCP_TRACE_DIR"] = trace_dir
+        target_policy = inner_payload.get("target_policy")
+        if (
+            allowed_kb_ids
+            and isinstance(target_policy, dict)
+            and target_policy.get("reply_policy") == "knowledge_grounded"
+        ):
+            env["HERMES_TOOL_CHOICE_REQUIRED"] = "1"
 
         return model_job, env
 
@@ -774,14 +828,15 @@ class HermesProvider:
                 "hermes chat timed out (strict mode)",
                 latency=time.time() - t0,
                 raw={"cli_path": self.cli_path, "timeout": True,
-                     "stdout": captured_stdout, "stderr": captured_stderr},
+                     "stdout": captured_stdout, "stderr": captured_stderr,
+                     "stage": "timeout"},
                 provider=self.name, worker_id=self.worker_id,
             )
         except Exception as e:
             return _strict_failed_result(
                 f"hermes runner error (strict mode): {e!r}",
                 latency=time.time() - t0,
-                raw={"error": repr(e)},
+                raw={"error": repr(e), "stage": "runner_error"},
                 provider=self.name, worker_id=self.worker_id,
             )
         finally:
@@ -870,6 +925,11 @@ class HermesProvider:
             # without re-parsing the prompt or stdout.
             "agent_result": contract_dict,
             "contract": contract_dict,
+            # Trace identifier for the MCP-side knowledge search provenance.
+            # True provenance lives in the trace file written by the MCP server;
+            # the worker aggregates it by trace_id.
+            "trace_id": os.environ.get("WECHAT_MCP_TRACE_ID") or "",
+            "trace_dir": os.environ.get("WECHAT_MCP_TRACE_DIR") or "",
         }
         if extra_raw:
             raw_payload.update({k: v for k, v in extra_raw.items() if k not in raw_payload})

@@ -6,6 +6,8 @@ through ``reliable_pipeline`` against a temp SQLite database and assert
 on the durable effects (job status, outbox rows, retry/dead-letter,
 test-mode gate, hard target precondition, strict contract parsing).
 """
+import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -132,17 +134,40 @@ def _pass_filter(text: str) -> str:
 # --- Fixtures ----------------------------------------------------------------
 
 class FakeProvider:
-    """Provider stand-in that returns a preset AgentResult or raises."""
+    """Provider stand-in that returns a preset AgentResult or raises.
+
+    If ``trace`` is provided, ``run`` writes it as the MCP trace artifact
+    at the worker-provided path before returning/raising, simulating the
+    MCP server writing the trace file.
+    """
 
     def __init__(self, *, result=None, raises: Exception = None,
-                 capture: list = None, name: str = "mock") -> None:
+                 capture: list = None, name: str = "mock",
+                 trace: dict = None, trace_id_override: str = None) -> None:
         self._result = result
         self._raises = raises
         self._capture = capture if capture is not None else []
         self.name = name
+        self._trace = trace
+        self._trace_id_override = trace_id_override
+        self._timeouts = []
 
     def run(self, job, timeout=None):
+        self._timeouts.append(timeout)
         self._capture.append(job)
+        if self._trace is not None:
+            payload = job.get("payload") or {}
+            trace_id = payload.get("_knowledge_trace_id")
+            trace_dir = payload.get("_knowledge_trace_dir")
+            if trace_id and trace_dir:
+                actual_trace_id = self._trace_id_override or trace_id
+                trace = dict(self._trace)
+                trace["trace_id"] = actual_trace_id
+                # Always write at the worker-expected path; a wrong trace_id
+                # inside the file is an out-of-scope artifact.
+                path = Path(trace_dir) / f"{trace_id}.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(trace), encoding="utf-8")
         if self._raises is not None:
             raise self._raises
         return self._result
@@ -248,7 +273,52 @@ def test_process_once_provider_ok_false_fails_job_with_no_outbox():
         assert out["job"]["status"] == pipeline.JOB_FAILED
         assert "SECRET_TOKEN" not in (out["job"]["error"] or "")
         assert "/secret/path" not in (out["job"]["error"] or "")
+        # Provider diagnostics must be a fixed safe schema with no secrets.
+        diag = out["job"].get("provider_diagnostics") or {}
+        assert diag == {"result_type": "SimpleNamespace", "ok": False, "status": "error", "stage": "unknown"}
+        assert "SECRET_TOKEN" not in str(diag)
+        assert "/secret/path" not in str(diag)
+        # Persisted JSON must also exclude secrets.
+        with pipeline._connect(db) as con:
+            raw = con.execute("SELECT provider_diagnostics_json FROM turn_jobs WHERE id=?", (out["job"]["id"],)).fetchone()[0]
+        assert "SECRET_TOKEN" not in raw
+        assert "/secret/path" not in raw
         assert pipeline.counts(db_path=db).get("send_outbox", {}) == {}
+
+
+def test_process_once_provider_failed_stage_persists_to_diagnostics_json():
+    """Strict provider failures that carry a whitelisted ``stage`` enum must
+    have that stage persisted into ``turn_jobs.provider_diagnostics_json``
+    without leaking any raw stdout or error text.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        provider = FakeProvider(
+            result=_agent_result(
+                ok=False,
+                status="failed",
+                raw={"stage": "contract_violation", "stdout": "rogue text"},
+            )
+        )
+        out = worker.process_once(provider, "worker", {},
+                                  final_filter=_pass_filter, db_path=db, now=10.0)
+        assert out["status"] == "failed"
+        assert out["outbox"] is None
+        assert out["job"]["status"] == pipeline.JOB_FAILED
+        diag = out["job"].get("provider_diagnostics") or {}
+        assert diag.get("stage") == "contract_violation"
+        assert diag.get("result_type") == "SimpleNamespace"
+        # No raw stdout or provider body may leak into the persisted column.
+        assert "rogue text" not in str(diag)
+        with pipeline._connect(db) as con:
+            raw = con.execute(
+                "SELECT provider_diagnostics_json FROM turn_jobs WHERE id=?",
+                (out["job"]["id"],),
+            ).fetchone()[0]
+        parsed = json.loads(raw)
+        assert parsed.get("stage") == "contract_violation"
+        assert "rogue text" not in raw
 
 
 def test_process_once_provider_timeout_marks_failed_with_no_outbox():
@@ -382,7 +452,8 @@ def test_process_once_factory_receives_bound_instance_id():
         ))
         out = worker.process_once(fallback, "worker", {},
                                   provider_factory=factory,
-                                  final_filter=_pass_filter, db_path=db, now=10.0)
+                                  final_filter=_pass_filter, db_path=db, now=10.0,
+                                  instance_id="hermes-worker-3")
         assert out["status"] == "applied"
         assert captured == ["hermes-worker-3"]
 
@@ -398,7 +469,8 @@ def test_process_once_factory_failure_falls_back_to_legacy_provider():
         ))
         out = worker.process_once(fallback, "worker", {},
                                   provider_factory=factory,
-                                  final_filter=_pass_filter, db_path=db, now=10.0)
+                                  final_filter=_pass_filter, db_path=db, now=10.0,
+                                  instance_id="hermes-worker-3")
         assert out["status"] == "applied"
 
 
@@ -1009,6 +1081,64 @@ def test_send_once_test_target_only_rejects_fuzzy_name_match():
             assert out["skipped"] and "test_mode_target_rejected" in out["skipped"][0]["error"], near_name
 
 
+def test_send_once_test_target_only_allows_configured_allowlist():
+    """A configured allowlist permits exactly the named targets."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db, target_id="family", group_key="family")
+        job = pipeline.claim_next_job(owner="worker", db_path=db, now=10.0)
+        applied = pipeline.apply_agent_result(
+            job_id=job["id"],
+            result=_contract_dict("reply", "ok", "ok"),
+            final_filter=_pass_filter,
+            db_path=db,
+            now=11.0,
+        )
+        outbox_id = applied["outbox"]["id"]
+        target = {"name": "family", "username": "family",
+                  "db": "message_0.db", "table": "Msg_family"}
+        cfg = {"targets": [target], "reliable_pipeline": {
+            "test_target_only": True,
+            "test_target_names": ["bot群聊测试", "family"],
+        }}
+        with mock.patch.object(worker, "send_reply_detailed",
+                               return_value=_fake_send_result(ok=True, reason="ok",
+                                                              confirmed=True)) as sender:
+            out = worker.send_once("sender", cfg, db_path=db, now=12.0)
+        sender.assert_called_once()
+        assert out["processed"] and out["processed"][0]["ok"] is True
+
+
+def test_send_once_test_target_only_rejects_unlisted_target_with_allowlist():
+    """A target not in the configured allowlist is rejected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db, target_id="other_group", group_key="other_group")
+        job = pipeline.claim_next_job(owner="worker", db_path=db, now=10.0)
+        applied = pipeline.apply_agent_result(
+            job_id=job["id"],
+            result=_contract_dict("reply", "ok", "ok"),
+            final_filter=_pass_filter,
+            db_path=db,
+            now=11.0,
+        )
+        outbox_id = applied["outbox"]["id"]
+        wrong = {"name": "other_group", "username": "other_group",
+                 "db": "message_0.db", "table": "Msg_other_group"}
+        cfg = {"targets": [wrong], "reliable_pipeline": {
+            "test_target_only": True,
+            "test_target_names": ["bot群聊测试", "family"],
+        }}
+        with mock.patch.object(worker, "send_reply_detailed") as sender:
+            out = worker.send_once("sender", cfg, db_path=db, now=12.0)
+        sender.assert_not_called()
+        assert out["skipped"] and "test_mode_target_rejected" in out["skipped"][0]["error"]
+        with pipeline._connect(db) as con:  # type: ignore[attr-defined]
+            row = con.execute("SELECT * FROM send_outbox WHERE id=?", (outbox_id,)).fetchone()
+        assert row["status"] == pipeline.OUTBOX_RETRY
+        assert "test_mode_target_rejected" in (row["error"] or "")
+
+
 def test_send_once_sender_exception_is_recorded_and_releases_lease():
     with tempfile.TemporaryDirectory() as tmp:
         db = Path(tmp) / "pipeline.sqlite"
@@ -1040,6 +1170,108 @@ def test_send_once_sender_exception_is_recorded_and_releases_lease():
         assert "sender crash" in (row["error"] or "")
         # Lease is cleared.
         assert row["lease_owner"] in (None, "")
+
+
+def test_send_once_marks_send_started_and_extends_lease_beyond_claim():
+    """The marker is persisted before the sender runs and extends the lease to
+    the configured send window, beyond a short claim lease."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        job = pipeline.claim_next_job(owner="worker", db_path=db, now=10.0)
+        applied = pipeline.apply_agent_result(
+            job_id=job["id"], result=_contract_dict("reply", "ok", "ok"),
+            final_filter=_pass_filter, db_path=db, now=11.0)
+        outbox_id = applied["outbox"]["id"]
+        target = {"name": "bot群聊测试", "username": "wxid_target",
+                  "db": "message_0.db", "table": "Msg_wxid_target"}
+        cfg = {"targets": [target], "reliable_pipeline": {"send_lease_seconds": 180.0}}
+        observed = {}
+
+        def _slow_send(*args, **kwargs):
+            with pipeline._connect(db) as con:
+                row = con.execute(
+                    "SELECT send_started_at, lease_until FROM send_outbox WHERE id=?",
+                    (outbox_id,)).fetchone()
+            observed["send_started_at"] = row["send_started_at"]
+            observed["lease_until"] = row["lease_until"]
+            return _fake_send_result(ok=True, reason="confirmed", attempted=["uia_send"], confirmed=True)
+
+        with mock.patch.object(worker, "send_reply_detailed", side_effect=_slow_send):
+            out = worker.send_once("sender", cfg, db_path=db, lease_seconds=5.0, now=100.0)
+        assert out["processed"][0]["ok"] is True
+        # Marker set at the fresh mark time (100) and lease extended to 100+180,
+        # far beyond the short 5s claim lease (which would have expired at 105).
+        assert observed["send_started_at"] == 100.0
+        assert observed["lease_until"] == 280.0
+
+
+def test_send_once_send_lease_undersized_config_falls_back_to_claim_lease():
+    """A send_lease_seconds smaller than the claim lease must not shrink the
+    in-flight window below the claim lease."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        job = pipeline.claim_next_job(owner="worker", db_path=db, now=10.0)
+        applied = pipeline.apply_agent_result(
+            job_id=job["id"], result=_contract_dict("reply", "ok", "ok"),
+            final_filter=_pass_filter, db_path=db, now=11.0)
+        outbox_id = applied["outbox"]["id"]
+        target = {"name": "bot群聊测试", "username": "wxid_target",
+                  "db": "message_0.db", "table": "Msg_wxid_target"}
+        # send_lease_seconds=2.0 < default claim lease 45.0 -> max() picks 45.
+        cfg = {"targets": [target], "reliable_pipeline": {"send_lease_seconds": 2.0}}
+        observed = {}
+
+        def _slow_send(*args, **kwargs):
+            with pipeline._connect(db) as con:
+                row = con.execute("SELECT lease_until FROM send_outbox WHERE id=?", (outbox_id,)).fetchone()
+            observed["lease_until"] = row["lease_until"]
+            return _fake_send_result(ok=True, reason="confirmed", attempted=["uia_send"], confirmed=True)
+
+        with mock.patch.object(worker, "send_reply_detailed", side_effect=_slow_send):
+            worker.send_once("sender", cfg, db_path=db, now=100.0)
+        assert observed["lease_until"] == 145.0  # 100 + 45 (claim lease), not 102
+
+
+def test_send_once_gate_rejection_leaves_send_started_null():
+    """A gate-rejected row never reaches the marker, so send_started_at stays NULL."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        job = pipeline.claim_next_job(owner="worker", db_path=db, now=10.0)
+        applied = pipeline.apply_agent_result(
+            job_id=job["id"], result=_contract_dict("reply", "ok", "ok"),
+            final_filter=_pass_filter, db_path=db, now=11.0)
+        outbox_id = applied["outbox"]["id"]
+        cfg = {"targets": []}  # target not configured -> pre-send gate rejection
+        with mock.patch.object(worker, "send_reply_detailed") as sender:
+            out = worker.send_once("sender", cfg, db_path=db, now=12.0)
+        sender.assert_not_called()
+        assert len(out["skipped"]) == 1
+        with pipeline._connect(db) as con:
+            row = con.execute("SELECT send_started_at FROM send_outbox WHERE id=?", (outbox_id,)).fetchone()
+        assert row["send_started_at"] is None
+
+
+def test_send_once_aborts_when_lease_lost_before_send():
+    """If the lease is reclaimed before the marker, the sender is not invoked."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn(db)
+        job = pipeline.claim_next_job(owner="worker", db_path=db, now=10.0)
+        applied = pipeline.apply_agent_result(
+            job_id=job["id"], result=_contract_dict("reply", "ok", "ok"),
+            final_filter=_pass_filter, db_path=db, now=11.0)
+        target = {"name": "bot群聊测试", "username": "wxid_target",
+                  "db": "message_0.db", "table": "Msg_wxid_target"}
+        cfg = {"targets": [target]}
+        with mock.patch.object(pipeline, "record_send_started", return_value=False), \
+                mock.patch.object(worker, "send_reply_detailed") as sender:
+            out = worker.send_once("sender", cfg, db_path=db, now=12.0)
+        sender.assert_not_called()
+        assert len(out["skipped"]) == 1
+        assert "lease lost" in out["skipped"][0]["error"]
 
 
 # --- Normalizer regression tests --------------------------------------------
@@ -1372,3 +1604,386 @@ def test_normalize_turn_payload_flat_row_backward_compatible():
     normalized = worker._normalize_turn_payload(payload)
     assert normalized["prompt"] == "Sender: hi"
     assert "_normalization_error" not in normalized
+
+
+# --- Knowledge-search trace provenance (Stage 3) ----------------------------
+
+def _provenance(db: Path, job_id: int) -> dict:
+    """Read the parsed provenance_json for a job row."""
+    with pipeline._connect(db) as con:
+        row = con.execute("SELECT provenance_json FROM turn_jobs WHERE id=?", (job_id,)).fetchone()
+    return json.loads(row["provenance_json"] or "{}")
+
+
+def test_process_once_attaches_valid_provenance_to_job():
+    """A valid MCP trace artifact is loaded, validated, and persisted as a
+    structured provenance summary alongside the durable job result.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            trace = {
+                "status": "ok",
+                "provenance": [{"kb_id": "kb1", "source": "scene", "content": "answer"}],
+                "no_source_reason": "",
+            }
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace=trace,
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            job = out["job"]
+            prov = _provenance(db, job["id"])
+            assert prov["status"] == "ok"
+            assert prov["provenance"] == trace["provenance"]
+            assert prov["no_source_reason"] == ""
+            assert "trace_id" in prov
+            assert prov["trace_id"] == provider._capture[0]["payload"][worker.TRACE_PAYLOAD_ID]
+            # The trace file must be cleaned up after reading.
+            assert not Path(provider._capture[0]["payload"][worker.TRACE_PAYLOAD_DIR]).exists()
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_missing_trace_is_no_tool_call():
+    """When the MCP server writes no trace artifact, the worker records an
+    explicit ``no_tool_call`` provenance status.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            prov = _provenance(db, out["job"]["id"])
+            assert prov["status"] == "no_tool_call"
+            assert prov["provenance"] == []
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def _grounded_event_payload(local_id: int = 1, reply_policy: str = "knowledge_grounded") -> dict:
+    return {
+        "message": _event(local_id),
+        "target": {"name": "bot群聊测试", "username": "wxid_target"},
+        "target_policy": {"reply_policy": reply_policy},
+        "_allowed_kb_ids": ["scene.a"],
+        "schema_version": 1,
+    }
+
+
+def test_process_once_grounded_target_without_trace_fails_without_outbox():
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn_with_payload(db, _grounded_event_payload())
+            provider = FakeProvider(result=_agent_result(
+                reply_text="reply",
+                raw={"agent_result": _contract_dict("reply", "reply")},
+            ))
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "failed"
+            assert out["outbox"] is None
+            assert out["job"]["error"] == "required knowledge search was not invoked"
+            assert _provenance(db, out["job"]["id"])["status"] == "no_tool_call"
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_grounded_target_uses_extended_provider_timeout():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "pipeline.sqlite"
+        _seed_turn_with_payload(db, _grounded_event_payload())
+        provider = FakeProvider(result=_agent_result(
+            reply_text="reply",
+            raw={"agent_result": _contract_dict("reply", "reply")},
+        ))
+        worker.process_once(provider, "worker", {}, final_filter=_pass_filter, db_path=db)
+        assert provider._timeouts == [worker.DEFAULT_KNOWLEDGE_PROVIDER_TIMEOUT]
+
+
+
+def test_process_once_grounded_target_rejects_unauthorized_trace_kb():
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn_with_payload(db, _grounded_event_payload())
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace={
+                    "status": "ok",
+                    "provenance": [{"kb_id": "scene.forbidden", "content": "secret"}],
+                    "no_source_reason": "",
+                },
+            )
+            out = worker.process_once(provider, "worker", {}, final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "failed"
+            assert out["outbox"] is None
+            assert out["job"]["error"] == "invalid knowledge search trace"
+            assert _provenance(db, out["job"]["id"])["status"] == "invalid"
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+def test_process_once_non_grounded_target_without_trace_still_applies():
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn_with_payload(db, _grounded_event_payload(reply_policy="balanced"))
+            provider = FakeProvider(result=_agent_result(
+                reply_text="reply",
+                raw={"agent_result": _contract_dict("reply", "reply")},
+            ))
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            assert out["outbox"] is not None
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_grounded_target_with_no_hit_trace_still_applies():
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn_with_payload(db, _grounded_event_payload())
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace={"status": "no_hit", "provenance": [], "no_source_reason": "no kb match"},
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            assert out["outbox"] is not None
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_no_hit_trace_is_no_hit():
+    """An attempted search with no hits is recorded as ``no_hit`` and keeps
+    the no-source reason from the MCP artifact.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace={"status": "no_hit", "provenance": [], "no_source_reason": "no kb match"},
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            prov = _provenance(db, out["job"]["id"])
+            assert prov["status"] == "no_hit"
+            assert prov["no_source_reason"] == "no kb match"
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_provider_failure_trace_is_provider_failure():
+    """When the MCP search tool reports a provider-level failure, the worker
+    records ``provider_failure`` status and preserves the no-source reason so
+    it is not confused with ``invalid`` or ``no_hit``.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace={"status": "provider_failure", "provenance": [],
+                       "no_source_reason": "leann server unreachable"},
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            prov = _provenance(db, out["job"]["id"])
+            assert prov["status"] == "provider_failure"
+            assert prov["no_source_reason"] == "leann server unreachable"
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_malformed_trace_is_marked_invalid():
+    """A trace artifact that is not valid JSON or does not match the expected
+    schema is safely ignored and marked ``invalid``.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace={"invalid": "schema"},
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            prov = _provenance(db, out["job"]["id"])
+            assert prov["status"] == "invalid"
+            assert "error" in prov
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_out_of_scope_trace_id_is_invalid():
+    """A trace artifact whose trace_id does not match the worker-generated id
+    for this job is rejected as ``invalid``; the worker never trusts an
+    agent-provided or arbitrary path.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+                trace={"status": "ok", "provenance": [{"kb_id": "kb1"}],
+                       "no_source_reason": ""},
+                trace_id_override="wrong-agent-id",
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            prov = _provenance(db, out["job"]["id"])
+            assert prov["status"] == "invalid"
+            assert "trace_id mismatch" in prov.get("error", "")
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+def test_process_once_trace_path_is_worker_controlled():
+    """The trace directory is generated by the worker under the configured
+    base dir and is never derived from provider payload or model content.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            _seed_turn(db)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+            )
+            worker.process_once(provider, "worker", {},
+                                final_filter=_pass_filter, db_path=db)
+            payload = provider._capture[0]["payload"]
+            trace_dir = Path(payload[worker.TRACE_PAYLOAD_DIR])
+            trace_id = payload[worker.TRACE_PAYLOAD_ID]
+            assert trace_dir.is_absolute()
+            assert trace_dir.parent == trace_base
+            assert trace_dir.name.startswith("job_")
+            assert trace_id in trace_dir.name
+            # The internal payload keys are never sent to the model; the
+            # worker-provided id is the only trace identifier exposed.
+            assert worker.TRACE_PAYLOAD_DIR.startswith("_")
+            assert worker.TRACE_PAYLOAD_ID.startswith("_")
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)
+
+
+# --- Shadow mode: full worker path, never a sendable outbox (Stage 4) -------
+
+def test_process_once_shadow_job_completes_without_outbox():
+    """A shadow turn job runs the full worker decision path and is marked
+    done, but never creates a sendable outbox row; the would-be reply is
+    recorded in ``turn_jobs.shadow_json``.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        trace_base = Path(tmp) / "traces"
+        trace_base.mkdir()
+        os.environ[worker.TRACE_ENV_DIR] = str(trace_base)
+        try:
+            db = Path(tmp) / "pipeline.sqlite"
+            payload = _event(1)
+            payload["target"] = {"username": "wxid_target", "reliable_pipeline_shadow": True}
+            _seed_turn_with_payload(db, payload)
+            provider = FakeProvider(
+                result=_agent_result(
+                    reply_text="reply",
+                    raw={"agent_result": _contract_dict("reply", "reply")},
+                ),
+            )
+            out = worker.process_once(provider, "worker", {},
+                                      final_filter=_pass_filter, db_path=db)
+            assert out["status"] == "applied"
+            assert out["outbox"] is None
+            assert out["job"]["status"] == pipeline.JOB_DONE
+            with pipeline._connect(db) as con:
+                rows = con.execute("SELECT COUNT(*) AS n FROM send_outbox WHERE job_id=?",
+                                   (out["job"]["id"],)).fetchone()
+                record = con.execute("SELECT shadow_json FROM turn_jobs WHERE id=?",
+                                     (out["job"]["id"],)).fetchone()
+            assert rows["n"] == 0
+            shadow = json.loads(record["shadow_json"])
+            assert shadow["shadow"] is True
+            assert shadow["would_send"] is True
+            assert shadow["reply_text"] == "reply"
+            assert shadow["reply_chars"] == len("reply")
+        finally:
+            os.environ.pop(worker.TRACE_ENV_DIR, None)

@@ -278,7 +278,103 @@ def test_worker_exception_still_runs_sender_and_continues(monkeypatch, tmp_path)
     assert "RuntimeError" not in body
 
 
-# --- Quarantine -------------------------------------------------------------
+def test_scheduler_runs_general_then_healthy_on_duty_instances(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, enabled=True)
+    calls = []
+
+    def fake_worker(body):
+        calls.append(dict(body))
+        return {"action": "processed"}
+
+    monkeypatch.setattr(control_api, "_reliable_worker_run_once", fake_worker)
+    monkeypatch.setattr(control_api, "_reliable_sender_run_once", lambda body: {"action": "processed"})
+    monkeypatch.setattr(
+        control_api, "_agent_pool_status",
+        lambda: {
+            "instances": [
+                {"id": "hermes-wechat-bot-worker3", "on_duty": True, "health": {"ok": True, "ready": True}},
+            ]
+        },
+    )
+
+    control_api._reliable_scheduler_tick()
+    assert len(calls) == 2
+    assert calls[0] == {}
+    assert calls[1] == {"instance_id": "hermes-wechat-bot-worker3"}
+
+
+def test_scheduler_skips_available_but_not_on_duty_instance(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, enabled=True)
+    calls = []
+
+    def fake_worker(body):
+        calls.append(dict(body))
+        return {"action": "processed"}
+
+    monkeypatch.setattr(control_api, "_reliable_worker_run_once", fake_worker)
+    monkeypatch.setattr(control_api, "_reliable_sender_run_once", lambda body: {"action": "processed"})
+    monkeypatch.setattr(
+        control_api, "_agent_pool_status",
+        lambda: {
+            "instances": [
+                # Healthy but not on-duty should be skipped.
+                {"id": "hermes-wechat-bot-worker3", "on_duty": False, "health": {"ok": True, "ready": True}},
+            ]
+        },
+    )
+
+    control_api._reliable_scheduler_tick()
+    # Only the general run; not-on-duty instance is not invoked.
+    assert calls == [{}]
+
+
+def test_scheduler_skips_unhealthy_on_duty_instance(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, enabled=True)
+    calls = []
+
+    def fake_worker(body):
+        calls.append(dict(body))
+        return {"action": "processed"}
+
+    monkeypatch.setattr(control_api, "_reliable_worker_run_once", fake_worker)
+    monkeypatch.setattr(control_api, "_reliable_sender_run_once", lambda body: {"action": "processed"})
+    monkeypatch.setattr(
+        control_api, "_agent_pool_status",
+        lambda: {
+            "instances": [
+                {"id": "hermes-wechat-bot-worker3", "on_duty": True, "health": {"ok": False, "ready": False}},
+            ]
+        },
+    )
+
+    control_api._reliable_scheduler_tick()
+    # Only the general run; no dedicated call for unhealthy worker3.
+    assert calls == [{}]
+
+
+    _patch_config(monkeypatch, enabled=True)
+    calls = []
+
+    def fake_worker(body):
+        calls.append(dict(body))
+        return {"action": "processed"}
+
+    monkeypatch.setattr(control_api, "_reliable_worker_run_once", fake_worker)
+    monkeypatch.setattr(control_api, "_reliable_sender_run_once", lambda body: {"action": "processed"})
+    monkeypatch.setattr(
+        control_api, "_agent_pool_status",
+        lambda: {
+            "instances": [
+                {"id": "hermes-wechat-bot-worker3", "on_duty": True, "health": {"ok": False, "ready": False}},
+            ]
+        },
+    )
+
+    control_api._reliable_scheduler_tick()
+    # Only the general run; no dedicated call for unhealthy worker3.
+    assert calls == [{}]
+
+
 
 
 def test_quarantine_queued_turn_job(monkeypatch, tmp_path):
@@ -362,3 +458,211 @@ def test_quarantine_does_not_invoke_sender(monkeypatch, tmp_path):
 
     _route("POST", "/reliable-pipeline/turn-jobs/%d/quarantine" % job["id"], {})
     sender.assert_not_called()
+
+
+# --- Outbox dead-letter requeue endpoint (safe path only) --------------------
+
+def _make_dead_outbox(db_path, *, send_started_at, error="test_mode_target_rejected: x",
+                      result=None):
+    """Create a reply outbox and force it to dead_letter with the given marker."""
+    job = _make_queued_turn_job(db_path)
+    applied = pipeline.apply_agent_result(
+        job_id=job["id"],
+        result={"schema_version": 1, "action": "reply", "reply_text": "hi",
+                "reason_code": "ok", "risk_level": "low"},
+        final_filter=lambda t: t,
+        db_path=db_path,
+        now=11.0,
+    )
+    outbox_id = applied["outbox"]["id"]
+    with pipeline._connect(db_path) as con:
+        con.execute(
+            "UPDATE send_outbox SET status=?, attempts=5, error=?, result_json=?, "
+            "send_started_at=?, dead_at=50.0, lease_owner=NULL, lease_until=NULL WHERE id=?",
+            (pipeline.OUTBOX_DEAD, error, json.dumps(result) if result is not None else None,
+             send_started_at, outbox_id),
+        )
+    return outbox_id
+
+
+def test_requeue_outbox_recovers_never_sent_dead_letter(monkeypatch, tmp_path):
+    db_path = tmp_path / "rp.sqlite"
+    _patch_config(monkeypatch, enabled=True, db_path=str(db_path))
+    outbox_id = _make_dead_outbox(db_path, send_started_at=None,
+                                  result={"skipped": True, "reason": "x"})
+    status, resp = _route("POST", "/reliable-pipeline/outbox/%d/requeue" % outbox_id,
+                          {"reason": "gate rejection, never sent"})
+    assert status == 200
+    assert resp["ok"] is True
+    assert resp["action"] == "requeued"
+    assert resp["status"] == pipeline.OUTBOX_RETRY
+    assert resp["requeue_count"] == 1
+    with pipeline._connect(db_path) as con:
+        row = con.execute("SELECT status, attempts, send_started_at FROM send_outbox WHERE id=?",
+                          (outbox_id,)).fetchone()
+        audit = con.execute("SELECT actor, legacy_override FROM send_outbox_recovery_audit WHERE outbox_id=?",
+                            (outbox_id,)).fetchone()
+    assert row["status"] == pipeline.OUTBOX_RETRY
+    assert row["attempts"] == 0
+    assert row["send_started_at"] is None
+    assert audit["actor"] == "control_api"
+    assert audit["legacy_override"] == 0
+
+
+def test_requeue_outbox_rejects_legacy_sentinel_row(monkeypatch, tmp_path):
+    """A pre-tracking (non-NULL send_started_at) dead letter is refused over HTTP."""
+    db_path = tmp_path / "rp.sqlite"
+    _patch_config(monkeypatch, enabled=True, db_path=str(db_path))
+    outbox_id = _make_dead_outbox(db_path, send_started_at=42.0, result={"skipped": True})
+    status, resp = _route("POST", "/reliable-pipeline/outbox/%d/requeue" % outbox_id,
+                          {"reason": "attempt legacy recovery"})
+    assert status == 200
+    assert resp["ok"] is False
+    assert resp["action"] == "error"
+    with pipeline._connect(db_path) as con:
+        row = con.execute("SELECT status FROM send_outbox WHERE id=?", (outbox_id,)).fetchone()
+        n = con.execute("SELECT COUNT(*) AS c FROM send_outbox_recovery_audit WHERE outbox_id=?",
+                        (outbox_id,)).fetchone()["c"]
+    assert row["status"] == pipeline.OUTBOX_DEAD  # unchanged
+    assert n == 0  # no audit written on rejection
+
+
+def test_requeue_outbox_rejects_non_dead_letter(monkeypatch, tmp_path):
+    db_path = tmp_path / "rp.sqlite"
+    _patch_config(monkeypatch, enabled=True, db_path=str(db_path))
+    job = _make_queued_turn_job(db_path)
+    applied = pipeline.apply_agent_result(
+        job_id=job["id"],
+        result={"schema_version": 1, "action": "reply", "reply_text": "hi",
+                "reason_code": "ok", "risk_level": "low"},
+        final_filter=lambda t: t, db_path=db_path, now=11.0,
+    )
+    outbox_id = applied["outbox"]["id"]  # pending, not dead_letter
+    status, resp = _route("POST", "/reliable-pipeline/outbox/%d/requeue" % outbox_id,
+                          {"reason": "not dead"})
+    assert status == 200
+    assert resp["ok"] is False
+    assert resp["action"] == "error"
+
+
+def test_requeue_outbox_requires_reason(monkeypatch, tmp_path):
+    db_path = tmp_path / "rp.sqlite"
+    _patch_config(monkeypatch, enabled=True, db_path=str(db_path))
+    outbox_id = _make_dead_outbox(db_path, send_started_at=None, result={"skipped": True})
+    for body in ({}, {"reason": "   "}):
+        status, resp = _route("POST", "/reliable-pipeline/outbox/%d/requeue" % outbox_id, body)
+        assert status == 200
+        assert resp["ok"] is False
+        assert resp["action"] == "error"
+
+
+def test_requeue_outbox_rejects_non_object_body(monkeypatch, tmp_path):
+    db_path = tmp_path / "rp.sqlite"
+    _patch_config(monkeypatch, enabled=True, db_path=str(db_path))
+    outbox_id = _make_dead_outbox(db_path, send_started_at=None, result={"skipped": True})
+    status, resp = _route("POST", "/reliable-pipeline/outbox/%d/requeue" % outbox_id, [1, 2])
+    assert status == 200
+    assert resp["ok"] is False
+    assert resp["action"] == "error"
+
+
+def test_requeue_outbox_invalid_id(monkeypatch, tmp_path):
+    _patch_config(monkeypatch, enabled=True)
+    for bad_id in ("abc", "0", "-1"):
+        status, resp = _route("POST", "/reliable-pipeline/outbox/%s/requeue" % bad_id,
+                              {"reason": "x"})
+        assert status == 200, bad_id
+        assert resp["ok"] is False, bad_id
+        assert resp["action"] == "error", bad_id
+
+
+def test_active_on_duty_instance_ids_picks_persistent_config_flag(monkeypatch):
+    """Instances with ``reliable_on_duty: true`` are active across control_api restarts
+    only when they are also healthy in the pool status."""
+    monkeypatch.setattr(control_api, "_agent_pool_status", lambda: {"instances": [
+        {"id": "hermes-a", "on_duty": False, "health": {"ok": True}},
+        {"id": "hermes-b", "on_duty": False, "health": {"ok": True}},
+        {"id": "hermes-c", "on_duty": False, "health": {"ok": False}},
+    ]})
+    cfg = {
+        "targets": [],
+        "agent_provider": {
+            "instances": [
+                {"id": "hermes-b", "reliable_on_duty": True},
+                {"id": "hermes-c", "reliable_on_duty": True},
+            ]
+        },
+    }
+    monkeypatch.setattr(control_api.reg, "load_config", lambda *a, **k: cfg)
+    ids = control_api._active_on_duty_instance_ids()
+    assert ids == ["hermes-b"]
+
+
+def test_active_on_duty_instance_ids_merges_runtime_and_persistent(monkeypatch):
+    """Runtime on-duty instances and persistent config flags are merged; health is required."""
+    monkeypatch.setattr(control_api, "_agent_pool_status", lambda: {"instances": [
+        {"id": "hermes-a", "on_duty": True, "health": {"ok": True}},
+        {"id": "hermes-b", "on_duty": False, "health": {"ok": True}},
+    ]})
+    cfg = {
+        "targets": [],
+        "agent_provider": {
+            "instances": [{"id": "hermes-b", "reliable_on_duty": True}]
+        },
+    }
+    monkeypatch.setattr(control_api.reg, "load_config", lambda *a, **k: cfg)
+    ids = sorted(control_api._active_on_duty_instance_ids())
+    assert ids == ["hermes-a", "hermes-b"]
+
+
+def test_scheduler_routes_persistent_on_duty_after_restart(monkeypatch, tmp_path):
+    """Restart-level: after a full scheduler state reset + startup, the reliable
+    scheduler routes dedicated jobs to a healthy instance flagged in config,
+    independent of the M5 async-loop."""
+    _patch_config(monkeypatch, enabled=True)
+    control_api._reliable_scheduler_stop()
+
+    # Dormant Thread fake: lets _reliable_scheduler_start initialize state
+    # without a real background loop running, so assertions are deterministic.
+    class FakeThread:
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+            self._alive = False
+        def start(self):
+            self._alive = True
+        def is_alive(self):
+            return self._alive
+        def join(self, timeout=None):
+            self._alive = False
+    monkeypatch.setattr(control_api.threading, "Thread", FakeThread)
+
+    monkeypatch.setattr(
+        control_api, "_agent_pool_status",
+        lambda: {
+            "instances": [
+                # M5 async-loop is off-duty, but health is good.
+                {"id": "hermes-wechat-bot-worker3", "on_duty": False, "health": {"ok": True, "ready": True}},
+            ]
+        },
+    )
+    cfg = control_api.reg.load_config()
+    cfg["agent_provider"] = {
+        "instances": [{"id": "hermes-wechat-bot-worker3", "reliable_on_duty": True}]
+    }
+    monkeypatch.setattr(control_api.reg, "load_config", lambda *a, **k: cfg)
+
+    calls = []
+    def fake_worker(body):
+        calls.append(dict(body))
+        return {"action": "processed"}
+    monkeypatch.setattr(control_api, "_reliable_worker_run_once", fake_worker)
+    monkeypatch.setattr(control_api, "_reliable_sender_run_once", lambda body: {"action": "processed"})
+
+    # Simulate startup auto-start.
+    start_result = control_api._reliable_scheduler_start({})
+    assert start_result["action"] == "started"
+    assert control_api._reliable_scheduler_status()["running"] is True
+    # Drive one deterministic tick; the only calls come from this tick.
+    control_api._reliable_scheduler_tick()
+    assert len(calls) == 2
+    assert calls[0] == {}
+    assert calls[1] == {"instance_id": "hermes-wechat-bot-worker3"}

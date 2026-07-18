@@ -98,7 +98,7 @@ def test_restart_after_hermes_result_before_send_claim_recovers_pending_outbox_o
         # Simulated restart: sender sees exactly the durable pending row.
         after_restart = pipeline.claim_sendable(owner="sender", now=12, db_path=db)
         assert [row["id"] for row in after_restart] == [outbox_id]
-        sent = pipeline.record_send_result(outbox_id=outbox_id, confirmed=True, detail={"confirmed": True}, now=13, db_path=db)
+        sent = pipeline.record_send_result(outbox_id=outbox_id, owner="sender", lease_id=after_restart[0]["lease_id"], confirmed=True, detail={"confirmed": True}, now=13, db_path=db)
         assert sent["status"] == pipeline.OUTBOX_SENT
         assert pipeline.claim_sendable(owner="other-sender", now=14, db_path=db) == []
 
@@ -114,13 +114,13 @@ def test_restart_after_cua_attempt_without_db_confirmation_retries_then_confirms
         first = pipeline.claim_sendable(owner="sender", now=11, db_path=db)
         assert [row["id"] for row in first] == [outbox_id]
         retry = pipeline.record_send_result(
-            outbox_id=outbox_id, confirmed=False, detail={"cua_clicked": True, "db_confirmed": False},
+            outbox_id=outbox_id, owner="sender", lease_id=first[0]["lease_id"], confirmed=False, detail={"cua_clicked": True, "db_confirmed": False},
             error="db confirmation timeout", now=12, db_path=db,
         )
         assert retry["status"] == pipeline.OUTBOX_RETRY
         assert pipeline.claim_sendable(owner="sender", now=16, db_path=db) == []
         second = pipeline.claim_sendable(owner="sender", now=17, db_path=db)
         assert [row["id"] for row in second] == [outbox_id]
-        sent = pipeline.record_send_result(outbox_id=outbox_id, confirmed=True, detail={"db_confirmed": True}, now=18, db_path=db)
+        sent = pipeline.record_send_result(outbox_id=outbox_id, owner="sender", lease_id=second[0]["lease_id"], confirmed=True, detail={"db_confirmed": True}, now=18, db_path=db)
         assert sent["status"] == pipeline.OUTBOX_SENT
         assert pipeline.claim_sendable(owner="sender", now=19, db_path=db) == []

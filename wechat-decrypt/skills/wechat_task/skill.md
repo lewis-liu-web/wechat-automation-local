@@ -10,7 +10,7 @@ Return exactly one short Chinese reply that can be sent directly to the WeChat g
 
 When you need product, policy, or group-specific information, call the real tool:
 
-- `mcp__wechat_kb_search__search_knowledge(query, limit)` – search the authorized knowledge bases. The tool returns relevant text fragments; use them to answer. If the tool is unavailable or returns empty, answer based on the conversation context only and do not fabricate.
+- `mcp__wechat_kb_search__search_knowledge(query, limit)` – search the authorized knowledge bases. The tool returns a structured response with `status` (`ok`/`no_hit`/`provider_failure`/`invalid`), `hits` (relevant text fragments), `provenance` (source metadata), and `error`. If `status` is `ok`, base your answer on the `hits` and cite the provenance (e.g., `来源：...`) in your reply. If `status` is `no_hit`, `provider_failure`, or `invalid`, or the tool is unavailable, answer based on the conversation context only and do not fabricate.
 
 Do not output tool calls or reasoning steps. Incorporate the tool result into the final reply.
 
@@ -29,6 +29,8 @@ Do not output tool calls or reasoning steps. Incorporate the tool result into th
 User request: {{user_request}}
 
 {{mode_instruction}}
+
+{{knowledge_hits}}
 
 ## Output Format
 

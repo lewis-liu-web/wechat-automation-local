@@ -20,6 +20,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from file_lock import InterProcessLock, lock_path_for_db
+
+
+def _db_lock(db_path):
+    """Return an InterProcessLock for a decrypted message DB path."""
+    return InterProcessLock(str(lock_path_for_db(Path(db_path))), timeout=30.0)
+
 try:
     import zstandard as _zstd
     _ZSTD_DCTX = _zstd.ZstdDecompressor()
@@ -59,6 +66,127 @@ def _record_event(kind, target=None, sender=None, payload=None):
         pass
 
 
+
+
+_PER_MESSAGE_REASONS = {
+    'durable_ingress',
+    'self_sent_skip',
+    'admin_command',
+    'target_muted_skip',
+    'reliable_pipeline_sender_not_allowed',
+    'precheck_boundary',
+}
+
+
+def _advance_cursor(t, new_cursor, branch_name=None):
+    """Advance target cursor and record a per-reason coverage trace.
+
+    reason (branch_name) describes why the cursor advanced (e.g.
+    admin_command, self_sent_skip, durable_ingress, thin_monitor,
+    deferred_flush).  The trace is consumed by _audit_cursor_coverage after a
+    successful save_config to verify that every local_id between the previously
+    saved cursor and the new cursor has been accounted for.
+
+    Per-message reasons (durable_ingress, self_sent_skip, admin_command,
+    target_muted_skip, reliable_pipeline_sender_not_allowed, precheck_boundary)
+    are expected to advance exactly one local_id at a time because they correspond
+    to a single fetched message.  Aggregation reasons (startup_advance,
+    runtime_min_sync, aggregator_*, deferred_flush, thin_monitor,
+    image_only_no_task, decision_skip) may advance over a range of local_ids that
+    have been aggregated or buffered.  An unexpected per-message jump records only
+    the single expected local_id so that the gap audit reports the skipped IDs.
+    """
+    old = int(t.get('last_local_id') or 0)
+    new = int(new_cursor)
+    if new > old:
+        key = _target_key(t)
+        state = _CURSOR_AUDIT.setdefault(key, {'prev': 0, 'trace': []})
+        trace = state['trace']
+        if branch_name in _PER_MESSAGE_REASONS and new != old + 1:
+            log('cursor_coverage_unexpected_jump target=%s reason=%s old=%s new=%s expected=%s' % (
+                t.get('name'), branch_name, old, new, old + 1))
+            # Do not record a coverage trace for an unexpected per-message
+            # jump; the whole skipped range will be reported as a coverage gap
+            # during audit.
+        else:
+            trace_start = old + 1
+            trace_end = new
+            if trace and trace[-1][2] == branch_name and trace[-1][1] + 1 == trace_start:
+                trace[-1][1] = trace_end
+            else:
+                trace.append([trace_start, trace_end, branch_name])
+        t['last_local_id'] = new
+        log('cursor_transition target=%s target_key=%s local_id=%s from=%s to=%s reason=%s' % (
+            t.get('name'), key, new, old, new, branch_name or 'unknown'))
+        return True
+    return False
+
+
+_CURSOR_AUDIT = {}
+
+
+def _target_key(t):
+    return '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
+
+
+def _init_cursor_baseline(t):
+    """Set the audit baseline to the target's current cursor so that coverage
+    auditing only concerns cursor movement that happens in this process.
+    Existing historical cursor positions are accepted without requiring a trace.
+    """
+    state = _CURSOR_AUDIT.setdefault(_target_key(t), {'prev': 0, 'trace': []})
+    state['prev'] = int(t.get('last_local_id') or 0)
+
+
+def _audit_cursor_coverage(targets, *, consume=False):
+    """Verify that every local_id between the previous saved cursor and the
+    current cursor is covered by a recorded branch trace.  Logs a warning with a
+    bounded sample when gaps are found.  Never includes message content in the
+    log; only cursor ranges and a bounded sample of up to 50 local_ids are emitted.
+
+    When consume=True the trace is cleared and the baseline is advanced to the
+    current cursor; this must be called only after a successful save_config.  When
+    consume=False the audit is logged but the trace and baseline are preserved so
+    that no-save-state cycles do not lose coverage state.
+    """
+    for t in targets:
+        key = _target_key(t)
+        state = _CURSOR_AUDIT.setdefault(key, {'prev': 0, 'trace': []})
+        cur = int(t.get('last_local_id') or 0)
+        prev = state['prev']
+        if cur <= prev:
+            continue
+        trace = sorted(state['trace'])
+        missing_intervals = []
+        pos = prev + 1
+        for start, end, branch in trace:
+            if end < pos:
+                continue
+            if start > pos:
+                gap_end = min(start - 1, cur)
+                if gap_end >= pos:
+                    missing_intervals.append((pos, gap_end))
+                pos = gap_end + 1
+            if pos > cur:
+                break
+            pos = end + 1
+        if pos <= cur:
+            missing_intervals.append((pos, cur))
+        missing_count = sum(e - s + 1 for s, e in missing_intervals)
+        sample = []
+        for s, e in missing_intervals:
+            for lid in range(s, e + 1):
+                if len(sample) >= 50:
+                    break
+                sample.append(lid)
+            if len(sample) >= 50:
+                break
+        if missing_count:
+            log('cursor_coverage_gap target=%s before=%s after=%s missing_count=%s sample=%s' % (
+                t.get('name'), prev, cur, missing_count, ','.join(str(x) for x in sample)))
+        if consume:
+            state['prev'] = cur
+            state['trace'] = []
 def _decrypt_image_for_message(m, t, cfg):
     """Decrypt an image message and attach its local path.
 
@@ -141,7 +269,7 @@ def _advance_startup_cursors(targets, cfg):
         current_id = int(t.get('last_local_id') or 0)
         if advance and latest_id > current_id:
             log('startup cursor advance target=%s from %s to %s (skip history while stopped)' % (t.get('name'), current_id, latest_id))
-            t['last_local_id'] = latest_id
+            _advance_cursor(t, latest_id, 'startup_advance')
         target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
         runtime_min[target_key] = int(t.get('last_local_id') or 0)
         log('baseline target=%s db=%s table=%s last_local_id=%s latest=%s' % (
@@ -188,7 +316,7 @@ def _handle_thin_monitor_target(t, m, cfg, *, config_path, args, contact_names, 
 
     gen_t0 = time.time()
     try:
-        decision = generate_reply(agg_msg, t, cfg)
+        decision = generate_reply(agg_msg, t, cfg, config_path=config_path)
     except Exception as exc:
         log('thin_generate_reply_error target=%s local_id=%s error=%r' % (t.get('name'), turn.end_local_id, exc))
         _record_event(
@@ -749,36 +877,37 @@ def fetch_new_for_db(db_name, targets):
     if not db_path.exists():
         log('warn db missing %s' % db_path)
         return []
-    con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
-    con.row_factory = sqlite3.Row
-    out = []
-    try:
-        for t in targets:
-            table = t.get('table')
-            if not table:
-                log('warn target missing table name=%r username=%r' % (t.get('name'), t.get('username')))
-                continue
-            if not table_exists(con, table):
-                log('warn table missing db=%s target=%s table=%s' % (db_name, t.get('name'), table))
-                continue
-            last_id = int(t.get('last_local_id') or 0)
-            sql = f'''select local_id, server_id, local_type, sort_seq, real_sender_id,
-                             create_time, status, message_content, source, packed_info_data,
-                             WCDB_CT_message_content
-                      from "{table}"
-                      where local_id > ?
-                      order by local_id asc
-                      limit 50'''
-            for row in con.execute(sql, (last_id,)):
-                d = row_to_dict(row)
-                # Keep packed_info_data as raw bytes for image MD5 extraction
-                raw_val = row['packed_info_data']
-                if raw_val is not None:
-                    d['packed_info_data'] = raw_val
-                out.append((t, d))
-    finally:
-        con.close()
-    return out
+    with _db_lock(db_path):
+        con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
+        con.row_factory = sqlite3.Row
+        out = []
+        try:
+            for t in targets:
+                table = t.get('table')
+                if not table:
+                    log('warn target missing table name=%r username=%r' % (t.get('name'), t.get('username')))
+                    continue
+                if not table_exists(con, table):
+                    log('warn table missing db=%s target=%s table=%s' % (db_name, t.get('name'), table))
+                    continue
+                last_id = int(t.get('last_local_id') or 0)
+                sql = f'''select local_id, server_id, local_type, sort_seq, real_sender_id,
+                                 create_time, status, message_content, source, packed_info_data,
+                                 WCDB_CT_message_content
+                          from "{table}"
+                          where local_id > ?
+                          order by local_id asc
+                          limit 50'''
+                for row in con.execute(sql, (last_id,)):
+                    d = row_to_dict(row)
+                    # Keep packed_info_data as raw bytes for image MD5 extraction
+                    raw_val = row['packed_info_data']
+                    if raw_val is not None:
+                        d['packed_info_data'] = raw_val
+                    out.append((t, d))
+        finally:
+            con.close()
+        return out
 
 
 def fetch_latest_for_target(t):
@@ -786,15 +915,16 @@ def fetch_latest_for_target(t):
     table = t.get('table')
     if not db_path.exists() or not table:
         return None
-    con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
-    con.row_factory = sqlite3.Row
-    try:
-        if not table_exists(con, table):
-            return None
-        row = con.execute(f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data, WCDB_CT_message_content from "{table}" order by local_id desc limit 1').fetchone()
-        return row_to_dict(row) if row else None
-    finally:
-        con.close()
+    with _db_lock(db_path):
+        con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            if not table_exists(con, table):
+                return None
+            row = con.execute(f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data, WCDB_CT_message_content from "{table}" order by local_id desc limit 1').fetchone()
+            return row_to_dict(row) if row else None
+        finally:
+            con.close()
 
 
 def latest_local_id_for_target(t):
@@ -811,24 +941,25 @@ def has_self_sent_after(t, after_local_id, text_hint=None):
     table = t.get('table')
     if not db_path.exists() or not table:
         return None
-    con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
-    con.row_factory = sqlite3.Row
-    try:
-        if not table_exists(con, table):
-            return None
-        rows = con.execute(
-            f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data, WCDB_CT_message_content from "{table}" where local_id > ? and status = 2 order by local_id asc limit 8',
-            (int(after_local_id or 0),)
-        ).fetchall()
-        hint = (text_hint or '').strip()
-        for row in rows:
-            d = row_to_dict(row)
-            content = str(d.get('message_content') or '')
-            if not hint or content == hint or hint[:20] in content:
-                return d
-        return row_to_dict(rows[-1]) if rows else None
-    finally:
-        con.close()
+    with _db_lock(db_path):
+        con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            if not table_exists(con, table):
+                return None
+            rows = con.execute(
+                f'select local_id, server_id, local_type, sort_seq, real_sender_id, create_time, status, message_content, source, packed_info_data, WCDB_CT_message_content from "{table}" where local_id > ? and status = 2 order by local_id asc limit 8',
+                (int(after_local_id or 0),)
+            ).fetchall()
+            hint = (text_hint or '').strip()
+            for row in rows:
+                d = row_to_dict(row)
+                content = str(d.get('message_content') or '')
+                if not hint or content == hint or hint[:20] in content:
+                    return d
+            return row_to_dict(rows[-1]) if rows else None
+        finally:
+            con.close()
 
 
 def _target_raw_db_path(t, cfg) -> Optional[Path]:
@@ -871,8 +1002,6 @@ def _read_db_dir() -> Optional[str]:
         return db_dir if isinstance(db_dir, str) and db_dir else None
     except Exception:
         return None
-
-
 
 
 
@@ -941,34 +1070,35 @@ def fetch_context_for_target(t, upto_local_id=None, limit=12):
     table = t.get('table')
     if not db_path.exists() or not table:
         return []
-    con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
-    con.row_factory = sqlite3.Row
-    try:
-        if not table_exists(con, table):
-            return []
-        params = []
-        where = ''
-        if upto_local_id is not None:
-            where = 'where local_id <= ?'
-            params.append(int(upto_local_id))
-        sql = 'select local_id, real_sender_id, create_time, status, message_content, packed_info_data, WCDB_CT_message_content from "%s" %s order by local_id desc limit ?' % (table, where)
-        params.append(max(1, int(limit)))
-        rows = [row_to_dict(r) for r in con.execute(sql, params)]
-        out = []
-        for r in reversed(rows):
-            txt = r.get('message_content')
-            if not isinstance(txt, str) or not txt.strip():
-                continue
-            txt = txt.replace('\r\n', '\n').strip()
-            # Group messages often look like "wxid_xxx:\ncontent"; keep both
-            # sender id and content so the LLM can resolve short references.
-            if len(txt) > 500:
-                txt = txt[:500] + '…'
-            r['message_content'] = txt
-            out.append(r)
-        return out
-    finally:
-        con.close()
+    with _db_lock(db_path):
+        con = sqlite3.connect('file:%s?mode=ro' % db_path.as_posix(), uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            if not table_exists(con, table):
+                return []
+            params = []
+            where = ''
+            if upto_local_id is not None:
+                where = 'where local_id <= ?'
+                params.append(int(upto_local_id))
+            sql = 'select local_id, real_sender_id, create_time, status, message_content, packed_info_data, WCDB_CT_message_content from "%s" %s order by local_id desc limit ?' % (table, where)
+            params.append(max(1, int(limit)))
+            rows = [row_to_dict(r) for r in con.execute(sql, params)]
+            out = []
+            for r in reversed(rows):
+                txt = r.get('message_content')
+                if not isinstance(txt, str) or not txt.strip():
+                    continue
+                txt = txt.replace('\r\n', '\n').strip()
+                # Group messages often look like "wxid_xxx:\ncontent"; keep both
+                # sender id and content so the LLM can resolve short references.
+                if len(txt) > 500:
+                    txt = txt[:500] + '…'
+                r['message_content'] = txt
+                out.append(r)
+            return out
+        finally:
+            con.close()
 
 
 def build_event_context(t, trigger_msg, cfg, limit=None):
@@ -1162,9 +1292,10 @@ def _try_handle_admin_command(m, t, cfg, config_path, dry_run=False, contact_nam
         sender=sender,
         payload={'local_id': lid, 'action': result.action, 'log_reason': result.log_reason},
     )
+    _advance_cursor(t, lid, 'admin_command')
     if result.save_config:
         save_config(cfg, config_path)
-    t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+        _audit_cursor_coverage([t], consume=True)
     return True
 
 
@@ -1509,7 +1640,6 @@ def main():
     ap.add_argument('--interval', type=float, default=None)
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--baseline-only', action='store_true')
     ap.add_argument('--no-save-state', action='store_true', help='do not write last_local_id back to config')
     ap.add_argument('--sync-on-start', action='store_true', help='run decrypt once before baseline; heavier but refreshes DB')
     ap.add_argument('--sync-each-cycle', action='store_true', help='HEAVY: run decrypt every poll cycle; not recommended')
@@ -1522,6 +1652,8 @@ def main():
     _apply_decrypted_dirs(cfg)
     interval = float(args.interval if args.interval is not None else cfg.get('poll_interval', 3))
     targets = enabled_targets(cfg)
+    for t in targets:
+        _init_cursor_baseline(t)
     log('monitor start targets=%d dbs=%s interval=%.1fs dry_run=%s sync_on_start=%s sync_each_cycle=%s fast_refresh=%s' % (
         len(targets), sorted(group_targets_by_db(targets).keys()), interval, args.dry_run, args.sync_on_start, args.sync_each_cycle, not args.no_fast_refresh))
 
@@ -1541,8 +1673,7 @@ def main():
     runtime_min_last_local_id = _advance_startup_cursors(targets, cfg)
     if not args.no_save_state:
         save_config(cfg, config_path)
-    if args.baseline_only:
-        return 0
+        _audit_cursor_coverage(targets, consume=True)
 
     stop_path = Path(cfg.get('stop_file') or STOP_FILE)
     if stop_path.exists():
@@ -1581,13 +1712,16 @@ def main():
         contact_names = load_contact_name_map()
         targets = enabled_targets(cfg)
         for t in targets:
+            if _target_key(t) not in _CURSOR_AUDIT:
+                _init_cursor_baseline(t)
+        for t in targets:
             target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
             file_last_id = int(t.get('last_local_id') or 0)
             runtime_last_id = int(runtime_min_last_local_id.get(target_key, 0) or 0)
             if file_last_id < runtime_last_id:
                 log('warn config cursor regressed target=%s file_last_local_id=%s runtime_last_local_id=%s; using runtime value to avoid replay' % (
                     t.get('name'), file_last_id, runtime_last_id))
-                t['last_local_id'] = runtime_last_id
+                _advance_cursor(t, runtime_last_id, 'runtime_min_sync')
             else:
                 runtime_min_last_local_id[target_key] = file_last_id
         new_count = 0
@@ -1659,15 +1793,18 @@ def main():
                 # Skip messages sent by the bot itself to prevent self-reply loops.
                 if int(m.get('status') or 0) == 2:
                     log('self_sent_skip target=%s local_id=%s' % (t.get('name'), lid))
+                    _record_event('self_sent_skip', target=t.get('name'),
+                                  sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                                  payload={'local_id': lid})
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                        _advance_cursor(t, lid, 'self_sent_skip')
                     continue
                 sender = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
                 if t.get('admin_muted'):
                     log('target_muted target=%s local_id=%s' % (t.get('name'), lid))
                     _record_event('target_muted_skip', target=t.get('name'), sender=sender, payload={'local_id': lid})
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                        _advance_cursor(t, lid, 'target_muted_skip')
                     continue
                 # --- thin-monitor durable ingress ---------------------------------
 
@@ -1687,14 +1824,30 @@ def main():
                                       payload={'local_id': lid, 'sender_username': m.get('sender_username'),
                                                'real_sender_id': m.get('real_sender_id'), 'sender': m.get('sender')})
                         if advance_state:
-                            t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                            _advance_cursor(t, lid, 'reliable_pipeline_sender_not_allowed')
                         continue
                     _rl_db_path = ((cfg.get('reliable_pipeline') or {}).get('db_path')
                                    or str(ROOT / 'temp' / 'reliable_pipeline.sqlite'))
                     _rl_db = Path(_rl_db_path)
+                    # Compute trigger/session state so the worker can see why the
+                    # event was admitted, even though the durable path owns the
+                    # final action decision.
+                    _clear_expired_sessions(cfg)
+                    _rl_triggered = bool(is_trigger(cfg, t, m))
+                    _rl_in_session = False
+                    if _rl_triggered:
+                        _activate_session(t, m, cfg)
+                    elif _is_in_session(t, m, cfg):
+                        _rl_in_session = True
+                        log('reliable_pipeline session_trigger target=%s local_id=%s' % (t.get('name'), lid))
+                    _rl_sess_key = _session_key(t, m)
+                    _rl_sess_entry = _active_sessions.get(_rl_sess_key) or {}
                     _rl_event_context = {
-                        'trigger_matched': False,
-                        'in_session': False,
+                        'trigger_matched': _rl_triggered,
+                        'in_session': _rl_in_session,
+                        'session_active': bool(_rl_sess_entry),
+                        'session_state': 'active' if _rl_sess_entry else 'idle',
+                        'session_turns': int(_rl_sess_entry.get('turns') or 0),
                         'sender': sender,
                         'sender_username': m.get('sender_username') or '',
                         'sender_display_name': m.get('sender_display_name') or '',
@@ -1709,7 +1862,7 @@ def main():
                         target_policy=_rl_policy,
                     )
                     if _rl_result['advanced']:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                        _advance_cursor(t, lid, 'durable_ingress')
                     else:
                         # Refuse to advance on persist/window-attach/drain
                         # failure AND fence this target for the rest of the
@@ -1731,7 +1884,7 @@ def main():
                         lid=lid,
                     )
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), new_lid)
+                        _advance_cursor(t, new_lid, 'thin_monitor')
                     continue
                 # --- session-based trigger handling ---
                 _clear_expired_sessions(cfg)
@@ -1821,7 +1974,7 @@ def main():
                         payload={'local_id': lid},
                     )
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                        _advance_cursor(t, lid, 'aggregator_buffered')
                     continue
 
                 if not should_process:
@@ -1832,7 +1985,7 @@ def main():
                         payload={'local_id': lid},
                     )
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                        _advance_cursor(t, turn.end_local_id, 'aggregator_dropped')
                     continue
 
                 # High-risk requests should get an immediate safety boundary reply.
@@ -1851,7 +2004,7 @@ def main():
                             payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True},
                         )
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), lid)
+                        _advance_cursor(t, lid, 'precheck_boundary')
                     continue
 
                 # Window closed – we have an aggregated turn.  Proceed to reply.
@@ -1865,7 +2018,7 @@ def main():
                 if turn.image_paths and not turn.has_image_task_description() and not (turn.trigger_matched or turn.in_session):
                     _send_image_task_missing_guide(turn, cfg, config_path=config_path, dry_run=args.dry_run)
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                        _advance_cursor(t, turn.end_local_id, 'image_only_no_task')
                     continue
 
                 agg_msg = turn.to_generate_reply_message()
@@ -1903,12 +2056,12 @@ def main():
                 if not decision_plan.should_reply:
                     _maybe_expire_session_on_close_cue(t, agg_msg, decision_plan, event_context)
                     if advance_state:
-                        t['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                        _advance_cursor(t, turn.end_local_id, 'decision_skip')
                     continue
 
                 gen_t0 = time.time()
                 try:
-                    decision = generate_reply(agg_msg, t, cfg)
+                    decision = generate_reply(agg_msg, t, cfg, config_path=config_path)
                     gen_dt = time.time() - gen_t0
                     text = decision.reply_text
                     ctx_len = len(agg_msg.get('context_messages') or [])
@@ -1993,19 +2146,19 @@ def main():
             if turn.target.get('admin_muted'):
                 for tt in targets:
                     if tt.get('username') == turn.chat_id:
-                        tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
+                        _advance_cursor(tt, turn.end_local_id, 'deferred_flush')
                         break
                 continue
             if turn.image_paths and not turn.has_image_task_description() and not (turn.trigger_matched or turn.in_session):
                 _send_image_task_missing_guide(turn, turn_cfg, config_path=config_path, dry_run=args.dry_run)
                 for tt in targets:
                     if tt.get('username') == turn.chat_id:
-                        tt['last_local_id'] = max(int(t.get('last_local_id') or 0), turn.end_local_id)
+                        _advance_cursor(tt, turn.end_local_id, 'deferred_flush')
                         break
                 continue
             try:
                 agg_msg = turn.to_generate_reply_message()
-                decision = generate_reply(agg_msg, turn_target, turn_cfg)
+                decision = generate_reply(agg_msg, turn_target, turn_cfg, config_path=config_path)
                 text = decision.reply_text
                 log('aggregator_flush_due target=%s local_id=%s intent=%s reason=%s reply=%r' % (
                     turn_target.get('name'), turn.end_local_id, decision.intent, decision.reason, text))
@@ -2014,13 +2167,16 @@ def main():
                                mention_name=(turn.event_context or {}).get('mention_name') or (turn.event_context or {}).get('sender_display_name') or (turn.event_context or {}).get('sender_name') or (turn.event_context or {}).get('from_display_name'))
                 for tt in targets:
                     if tt.get('username') == turn.chat_id:
-                        tt['last_local_id'] = max(int(tt.get('last_local_id') or 0), turn.end_local_id)
+                        _advance_cursor(tt, turn.end_local_id, 'aggregator_flush')
                         break
             except Exception as e:
                 log('aggregator_flush_due_exception target=%s local_id=%s error=%r' % (
                     turn_target.get('name'), turn.end_local_id, e))
         if (new_count or flushed_turns) and not args.no_save_state:
             save_config(cfg, config_path)
+            _audit_cursor_coverage(targets, consume=True)
+        else:
+            _audit_cursor_coverage(targets, consume=False)
         mode = 'sync-each-cycle' if args.sync_each_cycle else ('read-only' if args.no_fast_refresh else 'fast-refresh')
         log('cycle done mode=%s sync=%.3fs total=%.3fs targets=%d new=%d hits=%d refresh_changed=%d refresh_failed=%d' % (
             mode, sync_dt, time.time() - cycle_t0, len(targets), new_count, hit_count, refresh_changed, refresh_failed))
