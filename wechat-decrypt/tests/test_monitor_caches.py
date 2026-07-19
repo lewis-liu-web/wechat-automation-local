@@ -197,7 +197,7 @@ class SessionCloseModeTests(unittest.TestCase):
     def _make_target(self, mode="group_assistant"):
         return {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "db": "message_0.db",
             "table": "Msg_abc",
             "mode": mode,
@@ -205,15 +205,15 @@ class SessionCloseModeTests(unittest.TestCase):
 
     def _make_msg(self, text, sender_id=7):
         return {
-            "message_content": "lewis4438136:\n%s" % text,
+            "message_content": "wxid_sender_test:\n%s" % text,
             "real_sender_id": sender_id,
-            "sender_username": "lewis4438136",
+            "sender_username": "wxid_sender_test",
         }
 
     def test_legacy_personal_mode_normalizes_to_balanced_session_close(self):
         cfg = {"targets": [self._make_target("personal_assistant")]}
         t = cfg["targets"][0]
-        msg = self._make_msg("@飞扬的跟屁虫 聊聊天")
+        msg = self._make_msg("@测试助手 聊聊天")
         monitor._activate_session(t, msg, cfg)
         key = monitor._session_key(t, msg)
         self.assertIn(key, monitor._active_sessions)
@@ -224,7 +224,7 @@ class SessionCloseModeTests(unittest.TestCase):
     def test_balanced_mode_closes_session_on_close_keyword(self):
         cfg = {"targets": [self._make_target("group_assistant")]}
         t = cfg["targets"][0]
-        msg = self._make_msg("@飞扬的跟屁虫 介绍一下")
+        msg = self._make_msg("@测试助手 介绍一下")
         monitor._activate_session(t, msg, cfg)
         key = monitor._session_key(t, msg)
         self.assertIn(key, monitor._active_sessions)
@@ -235,7 +235,7 @@ class SessionCloseModeTests(unittest.TestCase):
     def test_customer_service_mode_closes_session_on_close_keyword(self):
         cfg = {"targets": [self._make_target("customer_service")]}
         t = cfg["targets"][0]
-        msg = self._make_msg("@飞扬的跟屁虫 介绍一下")
+        msg = self._make_msg("@测试助手 介绍一下")
         monitor._activate_session(t, msg, cfg)
         key = monitor._session_key(t, msg)
         self.assertIn(key, monitor._active_sessions)

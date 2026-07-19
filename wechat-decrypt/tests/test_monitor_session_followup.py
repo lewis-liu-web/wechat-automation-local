@@ -30,7 +30,7 @@ class SessionFollowupTests(unittest.TestCase):
         policy = session_policy or {}
         return {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "db": "message_0.db",
             "table": "Msg_abc",
             "mode": mode,
@@ -39,9 +39,9 @@ class SessionFollowupTests(unittest.TestCase):
 
     def _make_msg(self, text, sender_id=7, image_path=None):
         msg = {
-            "message_content": "lewis4438136:\n%s" % text,
+            "message_content": "wxid_sender_test:\n%s" % text,
             "real_sender_id": sender_id,
-            "sender_username": "lewis4438136",
+            "sender_username": "wxid_sender_test",
         }
         if image_path:
             msg["image_path"] = image_path
@@ -53,7 +53,7 @@ class SessionFollowupTests(unittest.TestCase):
     def test_bare_statement_is_followup(self):
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         key = monitor._session_key(t, trigger)
         followup = self._make_msg("公交卡充值失败")
@@ -62,7 +62,7 @@ class SessionFollowupTests(unittest.TestCase):
     def test_ack_only_stays_in_session(self):
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         for text in ("好的", "嗯嗯", "OK", "👌"):
             with self.subTest(text=text):
                 monitor._active_sessions.clear()
@@ -75,7 +75,7 @@ class SessionFollowupTests(unittest.TestCase):
     def test_close_hint_expires_session(self):
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         for text in ("谢谢", "好了", "没事了", "不需要", "算了"):
             with self.subTest(text=text):
                 monitor._active_sessions.clear()
@@ -89,7 +89,7 @@ class SessionFollowupTests(unittest.TestCase):
         """Regression: cues recognized by reply_decision must also expire the monitor session."""
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         for text in ("不需要", "算了"):
             with self.subTest(text=text):
                 monitor._active_sessions.clear()
@@ -102,7 +102,7 @@ class SessionFollowupTests(unittest.TestCase):
     def test_image_only_is_followup(self):
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 看下这张图")
+        trigger = self._make_msg("@测试助手 看下这张图")
         monitor._activate_session(t, trigger, cfg)
         key = monitor._session_key(t, trigger)
         followup = self._make_msg("", image_path="/tmp/screen.png")
@@ -112,19 +112,19 @@ class SessionFollowupTests(unittest.TestCase):
     def test_empty_text_not_a_followup(self):
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         key = monitor._session_key(t, trigger)
         followup = {
             "message_content": "",
             "real_sender_id": 7,
-            "sender_username": "lewis4438136",
+            "sender_username": "wxid_sender_test",
         }
         self.assertFalse(monitor._is_in_session(t, followup, cfg))
         self.assertIn(key, monitor._active_sessions)
         t = self._make_target(session_policy={"require_followup_intent": False})
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         followup = self._make_msg("公交卡充值失败")
         self.assertFalse(monitor._is_in_session(t, followup, cfg))
@@ -136,7 +136,7 @@ class SessionFollowupTests(unittest.TestCase):
         import reply_decision
         t = self._make_target(mode="customer_service")
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         followup = self._make_msg("公交卡充值失败")
         self.assertTrue(monitor._is_in_session(t, followup, cfg))
@@ -155,7 +155,7 @@ class SessionFollowupTests(unittest.TestCase):
         """
         t = self._make_target(session_policy={"timeout_seconds": 120, "max_turns": 2})
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         key = monitor._session_key(t, trigger)
         followup1 = self._make_msg("公交卡充值失败")
@@ -168,7 +168,7 @@ class SessionFollowupTests(unittest.TestCase):
         """A message that matches a trigger AND is a close cue must close the session."""
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         key = monitor._session_key(t, trigger)
         close_msg = self._make_msg("好的，谢谢")
@@ -180,7 +180,7 @@ class SessionFollowupTests(unittest.TestCase):
         """A pure ack that happens to match a trigger should not expire the session."""
         t = self._make_target()
         cfg = self._cfg(t)
-        trigger = self._make_msg("@飞扬的跟屁虫 怎么退押金")
+        trigger = self._make_msg("@测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         key = monitor._session_key(t, trigger)
         ack_msg = self._make_msg("好的")

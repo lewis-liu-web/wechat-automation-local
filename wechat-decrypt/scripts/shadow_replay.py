@@ -47,7 +47,7 @@ RUNTIME_BUS_INDEX = CD_ONLY / ".leann" / "indexes" / "work_kb_bus"
 
 TARGET_NAME = "shadow-replay-target"
 TARGET_USERNAME = "shadowreplay@chatroom"
-TRIGGER = "飞扬的跟屁虫"
+TRIGGER = "测试助手"
 INSTANCE_ID = "hermes-wechat-bot-worker3"
 # runtime `agent_provider.instances` 中 worker3 实例原样复制（仅非敏感字段；
 # 不添加 synthetic hermes_home，保持 profile/工具可用性与生产一致）。

@@ -614,7 +614,7 @@ def main(argv=None):
                 else:
                     safe_print("缺少群名或微信ID。用法：")
                     safe_print("  python manage_targets.py on \"群名\"")
-                    safe_print("  python manage_targets.py on \"45915981826@chatroom\"")
+                    safe_print("  python manage_targets.py on \"100003@chatroom\"")
                     safe_print("\n可启用/重新启用的群：")
                     rows = reg.list_groups()
                     rows = [r for r in rows if r.get("status") in ("pending", "disabled") or not r.get("listen_enabled")]

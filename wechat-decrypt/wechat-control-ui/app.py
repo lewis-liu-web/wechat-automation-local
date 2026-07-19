@@ -995,7 +995,7 @@ def _page_triggers():
     st.markdown("**新增单个触发词**")
     c1, c2 = st.columns([4, 1])
     with c1:
-        new_word = st.text_input("触发词内容", placeholder="例如：@飞扬的跟屁虫")
+        new_word = st.text_input("触发词内容", placeholder="例如：@测试助手")
     with c2:
         st.write("")
         add_btn = st.button("添加", use_container_width=True, key="trigger_add_btn")

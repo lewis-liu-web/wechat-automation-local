@@ -28,7 +28,7 @@ def test_raw_agent_enqueue_carries_skill_and_knowledge_fields():
         db = Path(tmpdir) / "agent_jobs.sqlite"
         target = {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "table": "Msg_abc",
             "triggers": ["@小助理"],
             "knowledge_bases": ["desktop_pdf"],
@@ -82,7 +82,7 @@ def test_aggregated_prompt_prefix_and_summary():
         db = Path(tmpdir) / "agent_jobs.sqlite"
         target = {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "table": "Msg_abc",
             "triggers": ["@小助理"],
             "knowledge_bases": ["desktop_pdf"],
@@ -138,7 +138,7 @@ def test_legacy_personal_mode_normalizes_to_balanced_agent_payload():
     """legacy personal_assistant target mode must be normalized to group_assistant in agent payload."""
     target = {
         "name": "bot群聊测试",
-        "username": "47965620946@chatroom",
+        "username": "100001@chatroom",
         "table": "Msg_abc",
         "triggers": ["@小助理"],
         "mode": "personal_assistant",
@@ -183,7 +183,7 @@ def test_balanced_mode_smalltalk_enqueues_agent_without_local_fallback():
     """平衡模式下普通闲聊应进入 agent 队列，不再使用本地 fallback。"""
     target = {
         "name": "bot群聊测试",
-        "username": "47965620946@chatroom",
+        "username": "100001@chatroom",
         "table": "Msg_abc",
         "triggers": ["@小助理"],
         "mode": "group_assistant",
@@ -230,7 +230,7 @@ def test_customer_service_mode_returns_immediate_ack():
         db = Path(tmpdir) / "agent_jobs.sqlite"
         target = {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "table": "Msg_abc",
             "triggers": ["@小助理"],
             "knowledge_bases": ["desktop_pdf"],
@@ -274,7 +274,7 @@ def test_balanced_mode_question_does_not_return_ack():
     """平衡模式(group_assistant)下 agent 入队不应返回立即确认回复。"""
     target = {
         "name": "bot群聊测试",
-        "username": "47965620946@chatroom",
+        "username": "100001@chatroom",
         "table": "Msg_abc",
         "triggers": ["@小助理"],
         "mode": "group_assistant",
@@ -328,7 +328,7 @@ def test_raw_agent_enqueue_payload_knowledge_hits_not_empty():
         db = Path(tmpdir) / "agent_jobs.sqlite"
         target = {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "table": "Msg_abc",
             "triggers": ["@小助理"],
             "knowledge_bases": ["desktop_pdf"],
@@ -382,7 +382,7 @@ def test_customer_service_no_kb_hit_is_enqueued_as_standard_trigger():
         db = Path(tmpdir) / "agent_jobs.sqlite"
         target = {
             "name": "bot群聊测试",
-            "username": "47965620946@chatroom",
+            "username": "100001@chatroom",
             "table": "Msg_abc",
             "triggers": ["@小助理"],
             "knowledge_bases": ["desktop_pdf"],

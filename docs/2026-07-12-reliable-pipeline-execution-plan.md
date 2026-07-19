@@ -349,7 +349,7 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
   - 零静默丢失：窗口内 inbound_events 全部 `turned` 且 `turn_id` 非空；turns 与 turn_jobs 1:1；turn_jobs 全部处于终态集合 `done/failed/timeout/escalated`；send_outbox 全部处于终态集合 `sent/dead_letter`。非终态行按**各自调度时刻 + 宽限期**（`--grace-seconds`，默认 900s）判定 stuck：outbox `sending` 看 `lease_until`、`retry/pending` 看 `next_attempt_at`（仅 outbox 概念），job `running` 看 `min(lease_until, deadline_at)`，其余看 `created_at`；宽限内的合法 in-flight 行只计数（events/turns/jobs/outbox 四类）不判 FAIL。failed/timeout jobs 与 dead letters 属终态可审计记录，以错误指纹单列展示。
   - 零未确认重复发送：同一 job 不得有多于 1 条 `sent` outbox；所有 `sent` 行 `result_json.confirmed=true`。
   - 零未授权 KB 访问（fail-closed）：窗口内每个 job 必须可验证——provenance_json 缺失/损坏、缺 `provenance` 键、条目非 dict 或 `kb_id` 非非空字符串、事件非 dict、无 worker-valid snapshot、末个 valid snapshot（与 worker `_normalize_turn_payload` 完全同一选择规则）缺 `_allowed_kb_ids` 或含非字符串项，一律计入 `unverifiable_jobs` 并判 FAIL；可验证 job 的 provenance 命中（strip 后比较）必须是**末个 valid snapshot** 的入队 allowlist（`build_event_payload` 写入、`_close_window_tx` 原样保留、worker `_normalize_turn_payload` 提升——端到端已有测试 `test_process_once_multi_event_aggregates_text_and_uses_last_auth` 覆盖）的子集。
-  - 正式命令：`python scripts/canary_audit.py --db <pipeline.sqlite> --target-id 47965620946@chatroom --target-id 56467477042@chatroom --since 1783958400`。
+  - 正式命令：`python scripts/canary_audit.py --db <pipeline.sqlite> --target-id 100001@chatroom --target-id 100002@chatroom --since 1783958400`。
   - 首轮基线（runtime DB `temp/reliable_pipeline_e2e_20260712_125228.sqlite`）：**三项全部 PASS**。窗口内 11 events / 11 turns / 11 jobs / 9 outbox；sent 4 条全 confirmed；9 个 KB 命中 job 全部命中授权内 `leann.bus`；family 授权为空且 0 命中；窗口内 failed job 27（provider_failed）与 dead-letter 11-14（confirm_error/cua_timeout）均为终态有记录；in_flight 四类全 0；历史 out_of_window 17 jobs 不参与判定。
 - **Stage 4 rollback 小节：target-scoped 回滚流程（2026-07-16 定义/测试）**
   - **适用场景**：新 pipeline 在某 target 上出现阻塞性回归，需退回 legacy 路径，且不影响其他 target。
@@ -362,7 +362,7 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
   - **自动化测试**：`tests/test_rollback_runbook.py` 4 条通过——quarantine 仅 drain 目标 target（其他 target queued 不受影响且下一个被 claim）、opt-out 后 pending outbox 仍正常 `sent`（drain-to-send）、回滚期间其他 target 完整 claim→outbox→sent 流转、ingress flag 开→关→开序列（opt-out 拒绝不持久化、恢复后继续持久化）。
   - **旧 E2E 演练（`bot群聊测试`，2026-07-16，历史记录——其 live 切换步骤已废止）**：以下演练按当时的热切换流程执行；**该热切换流程已被同日证实的 live JSON 竞态废止，不再有效**，保留仅为机制证据与竞态发现来源。现行流程见上方 runbook（停机切换），停机版演练见本节末尾。
     1. 原子 JSON 更新关闭 flag（临时文件 + `os.replace`）；12s 后生效，无需重启。
-    2. CUA 发送方窗口（`微信机器人测试`，备注隔离）后台发送 `E2E rollback legacy test 2026-07-16 unique-alpha 飞扬的跟屁虫`（含 trigger 词）。结果：pipeline DB 计数全程 31/31/31/20 不变（durable 未接管）；event_log 出现 `thin_monitor_buffered`（legacy 接管证据）。non-terminal jobs/outbox 为 0，无需 quarantine 步骤（第 2/3 步空转）。
+    2. CUA 发送方窗口（`微信机器人测试`，备注隔离）后台发送 `E2E rollback legacy test 2026-07-16 unique-alpha 测试助手`（含 trigger 词）。结果：pipeline DB 计数全程 31/31/31/20 不变（durable 未接管）；event_log 出现 `thin_monitor_buffered`（legacy 接管证据）。non-terminal jobs/outbox 为 0，无需 quarantine 步骤（第 2/3 步空转）。
     3. family 隔离：演练期间 family flag 保持 `true`，最新 family job 仍为 28 无新增，cursor 26 = db max 26。
     4. 原子恢复 flag=true（恢复函数先 dry-run 验证 + 读回断言后才进入演练）。
     5. CUA 发送 `E2E rollback restore test 2026-07-16 unique-beta`：inbound 32 → turn 32 → job 32 `done` → outbox 21 `sent`/`confirmed=true`/`attempts=1`。roll-forward 全链恢复。

@@ -33,23 +33,23 @@ class ImageTaskDescriptionTests(unittest.TestCase):
         )
 
     def test_trigger_matched_with_any_text_counts_as_task(self):
-        turn = self._turn(['lewis4438136:\n@飞扬的跟屁虫 这是你的头像，你觉得怎么样'], trigger_matched=True)
+        turn = self._turn(['wxid_sender_test:\n@测试助手 这是你的头像，你觉得怎么样'], trigger_matched=True)
         self.assertTrue(turn.has_image_task_description())
 
     def test_in_session_with_any_text_counts_as_task(self):
-        turn = self._turn(['lewis4438136:\n@飞扬的跟屁虫 这是你的头像，你觉得怎么样'], in_session=True)
+        turn = self._turn(['wxid_sender_test:\n@测试助手 这是你的头像，你觉得怎么样'], in_session=True)
         self.assertTrue(turn.has_image_task_description())
 
     def test_event_context_trigger_matched_counts_as_task(self):
         turn = self._turn(
-            ['lewis4438136:\n@飞扬的跟屁虫 这是你的头像，你觉得怎么样'],
+            ['wxid_sender_test:\n@测试助手 这是你的头像，你觉得怎么样'],
             trigger_matched=False,
             event_context={'trigger_matched': True},
         )
         self.assertTrue(turn.has_image_task_description())
 
     def test_plain_question_without_trigger_still_detected(self):
-        turn = self._turn(['lewis4438136:\n这是你的头像，你觉得怎么样'], trigger_matched=False, in_session=False)
+        turn = self._turn(['wxid_sender_test:\n这是你的头像，你觉得怎么样'], trigger_matched=False, in_session=False)
         self.assertTrue(turn.has_image_task_description())
 
     def test_no_text_no_trigger_no_marker_returns_false(self):
@@ -57,19 +57,19 @@ class ImageTaskDescriptionTests(unittest.TestCase):
         self.assertFalse(turn.has_image_task_description())
 
     def test_marker_analysis_still_works(self):
-        turn = self._turn(['lewis4438136:\n分析一下这张图'], trigger_matched=False, in_session=False)
+        turn = self._turn(['wxid_sender_test:\n分析一下这张图'], trigger_matched=False, in_session=False)
         self.assertTrue(turn.has_image_task_description())
 
     def test_custom_image_task_markers_via_target_policy(self):
         turn = self._turn(
-            ['lewis4438136:\n请修复这张图'],
+            ['wxid_sender_test:\n请修复这张图'],
             target={'policy': {'image_task_markers': ['修复']}},
         )
         self.assertTrue(turn.has_image_task_description())
 
     def test_custom_image_task_markers_via_config(self):
         turn = self._turn(
-            ['lewis4438136:\n请调色这张图'],
+            ['wxid_sender_test:\n请调色这张图'],
             config={'image_task_markers': ['调色']},
         )
         self.assertTrue(turn.has_image_task_description())
@@ -205,7 +205,7 @@ class AggregationPipelineTests(unittest.TestCase):
 
 
     def test_to_generate_reply_message_copies_mention_name_from_event_context(self):
-        event_context = {"sender_display_name": "飞扬的跟屁虫"}
+        event_context = {"sender_display_name": "测试助手"}
         config = {"max_aggregated_messages": 1}
         turn = agg.ingest_event(
             self._event(1, content="hello"),
@@ -214,8 +214,8 @@ class AggregationPipelineTests(unittest.TestCase):
         )
         self.assertIsNotNone(turn)
         msg = turn.to_generate_reply_message()
-        self.assertEqual(msg["mention_name"], "飞扬的跟屁虫")
-        self.assertEqual(msg["sender_display_name"], "飞扬的跟屁虫")
+        self.assertEqual(msg["mention_name"], "测试助手")
+        self.assertEqual(msg["sender_display_name"], "测试助手")
 
     def test_to_generate_reply_message_preserves_aggregator_context(self):
         """Regression: context_messages must come from the aggregated window,

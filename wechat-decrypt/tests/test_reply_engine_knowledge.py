@@ -168,7 +168,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         self.addCleanup(td.cleanup)
         (root/'scenes'/'a'/'body_only.md').write_text('工作号真实号用于号码认证场景。', encoding='utf-8')
         from knowledge_retrieval import _retrieve_local_kb_fts, _clean_query_for_fts
-        raw = 'lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢'
+        raw = 'wxid_sender_test:\n@测试助手\u2005简单介绍一下工作号真实号产品呢'
         cleaned = _clean_query_for_fts(raw)
         self.assertIn('工作号真实号', cleaned)
         hits=_retrieve_local_kb_fts(cleaned, root, {'id':'scene.a','type':'local','path':str(root/'scenes'/'a'),'scope':'scene'}, 5)
@@ -204,7 +204,7 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         cfg={'wiki_dir': str(root), 'knowledge_bases': {
             'scene.a': {'type':'local','path':'scenes/a'},
         }}
-        hits=kr.retrieve_knowledge('lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢', cfg, {'knowledge_bases':['scene.a']})
+        hits=kr.retrieve_knowledge('wxid_sender_test:\n@测试助手\u2005简单介绍一下工作号真实号产品呢', cfg, {'knowledge_bases':['scene.a']})
         contents='\n'.join(h.content for h in hits)
         self.assertIn('工作号真实号', contents)
     def test_ima_without_key_is_safe_no_hit(self):
@@ -295,15 +295,15 @@ class KnowledgeArchitectureTests(unittest.TestCase):
         cfg={'wiki_dir': str(root), 'knowledge_bases': {'online.ima.x': {
             'type':'ima', 'knowledge_base_id':'kb123', 'folder_id':'f1', 'client_id_env':'TEST_IMA_CLIENT', 'api_key_env':'TEST_IMA_KEY', 'timeout':3
         }}}
-        q='lewis4438136:\n@飞扬的跟屁虫\u2005简单介绍一下工作号真实号产品呢'
+        q='wxid_sender_test:\n@测试助手\u2005简单介绍一下工作号真实号产品呢'
         with mock.patch.dict(os.environ, {'TEST_IMA_CLIENT':'cid', 'TEST_IMA_KEY':'akey'}), \
              mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
             hits=kr.retrieve_knowledge(q, cfg, {'knowledge_bases':['online.ima.x']})
         ima_hits=[h for h in hits if h.source == 'ima']
         self.assertTrue(any('工作号真实号用于号码认证场景' in h.content for h in ima_hits))
         self.assertGreaterEqual(len(calls), 2)
-        self.assertIn('lewis4438136:', calls[0])
-        self.assertIn('@飞扬的跟屁虫', calls[0])
+        self.assertIn('wxid_sender_test:', calls[0])
+        self.assertIn('@测试助手', calls[0])
         self.assertTrue(any('@' not in c and '工作号' in c and '真实号' in c for c in calls[1:]))
         self.assertNotIn('m-other', '\n'.join(h.label for h in ima_hits))
 

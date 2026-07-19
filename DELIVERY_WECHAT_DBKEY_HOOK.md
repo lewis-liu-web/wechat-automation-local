@@ -110,7 +110,7 @@ python wechat-decrypt/monitor_web.py
 ### 当前结果文件示例
 ```json
 {
-  "_db_dir": "E:\document\wechat\xwechat_files\lewis4438136_3297\db_storage",
+  "_db_dir": "E:\document\wechat\xwechat_files\wxid_account_test\db_storage",
   "_candidate_key_count": 3,
   "_matched_salt_count": 0,
   "_note": "未能从任何微信进程中提取到密钥"

@@ -30,19 +30,19 @@ def test_is_admin_sender_true_when_whitelist_contains_sender_case_insensitive():
         "name": "ops",
         "username": "wxid_ops",
         "category": "admin",
-        "admin_senders": ["wxid_alice", "wxid_bob", "飞扬的跟屁虫"],
+        "admin_senders": ["wxid_alice", "wxid_bob", "测试助手"],
     }
     assert reg.is_admin_sender(target, "WXID_Alice") is True
     assert reg.is_admin_sender(target, "wxid_BOB") is True
-    assert reg.is_admin_sender(target, "wxid_other", sender_display_name="飞扬的跟屁虫") is True
-    assert reg.is_admin_sender(target, "wxid_other", sender_display_name="  飞扬的跟屁虫  ") is True
+    assert reg.is_admin_sender(target, "wxid_other", sender_display_name="测试助手") is True
+    assert reg.is_admin_sender(target, "wxid_other", sender_display_name="  测试助手  ") is True
 
 def test_is_admin_sender_false_when_whitelist_excludes_sender():
     target = {
         "name": "ops",
         "username": "wxid_ops",
         "category": "admin",
-        "admin_senders": ["wxid_alice", "飞扬的跟屁虫"],
+        "admin_senders": ["wxid_alice", "测试助手"],
     }
     assert reg.is_admin_sender(target, "wxid_eve", sender_display_name="陌生人") is False
 

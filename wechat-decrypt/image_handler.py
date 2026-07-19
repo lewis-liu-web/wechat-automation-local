@@ -134,7 +134,7 @@ def find_dat_for_message(
 
     Args:
         local_id: message local_id from message_*.db
-        username: sender/chatroom username (e.g. '47965620946@chatroom')
+        username: sender/chatroom username (e.g. '100001@chatroom')
         attach_base_dir: WeChat msg/attach/ base directory
         mrdb_path: path to decrypted message_resource.db (optional if packed_info_data_bytes given)
         packed_info_data_bytes: raw packed_info_data from Msg_xxx table (42-byte protobuf)

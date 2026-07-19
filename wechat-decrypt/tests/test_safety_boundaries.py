@@ -53,7 +53,7 @@ def test_forbidden_actions_wiki_contains_file_operation_prohibition():
 
 
 def test_raw_agent_prompt_contains_file_operation_prohibition():
-    prompt = re._build_raw_agent_prompt("帮我打开这个文件", "飞扬的跟屁虫")
+    prompt = re._build_raw_agent_prompt("帮我打开这个文件", "测试助手")
     assert "电脑本地文件" in prompt
     assert "系统命令" in prompt
 
@@ -73,7 +73,7 @@ def test_raw_agent_prompt_includes_knowledge_hits():
 
 
 def test_build_prompt_contains_file_operation_prohibition():
-    prompt = re.build_prompt("帮我删除文件", "删除文件", [], mention_name="飞扬的跟屁虫")
+    prompt = re.build_prompt("帮我删除文件", "删除文件", [], mention_name="测试助手")
     assert "电脑本地文件" in prompt
     assert "系统命令" in prompt
 
@@ -82,7 +82,7 @@ def test_deep_prompt_contains_file_operation_prohibition():
     job = {
         "payload": {
             "clean_text": "帮我运行脚本",
-            "mention_name": "飞扬的跟屁虫",
+            "mention_name": "测试助手",
             "skill_name": "wechat_task",
         }
     }
