@@ -422,10 +422,10 @@ def _sidebar():
                 st.success("%d 个" % enabled_n)
             else:
                 st.warning("0 个 — monitor 运行中但没有任何目标被监听")
-            # Stage 5: durable pipeline health (single-durable monitor)
+            # Auto-reply pipeline health (receive → decide → send with crash recovery)
             rp = st.session_state.get("reliable_pipeline_result") or {}
             sch = st.session_state.get("reliable_scheduler_result") or {}
-            st.markdown("**可靠管线**")
+            st.markdown("**自动回复后台**")
             if rp.get("enabled"):
                 sch_ok = bool(sch.get("running") or sch.get("thread_alive"))
                 dl_n = 0
@@ -433,26 +433,26 @@ def _sidebar():
                     dl_n = int(((rp.get("counts") or {}).get("send_outbox") or {}).get("dead_letter") or 0)
                 except (TypeError, ValueError):
                     dl_n = len(rp.get("dead_letters") or [])
-                allow = "仅白名单发送" if rp.get("test_target_only") else "全目标可发送"
-                line = "已启用 · 调度%s · 死信 %d · %s" % (
-                    "运行中" if sch_ok else "已停",
+                allow = "仅白名单群可真发" if rp.get("test_target_only") else "所有开启群可真发"
+                line = "后台已开 · 处理%s · 失败待处理 %d · %s" % (
+                    "中" if sch_ok else "已停",
                     dl_n,
                     allow,
                 )
                 if sch_ok:
                     st.success(line)
                 else:
-                    st.warning(line)
+                    st.warning(line + "（需到「可靠管线」页启动处理）")
             elif rp:
-                st.caption("可靠管线：全局未启用（config.reliable_pipeline.enabled）")
+                st.caption("自动回复后台：全局关闭（config 里 reliable_pipeline.enabled）")
             else:
-                st.caption("可靠管线状态读取失败")
+                st.caption("自动回复后台状态读取失败")
         else:
             st.warning("状态读取失败")
         if st.button("🔄 刷新数据", use_container_width=True):
             _clear_data_cache()
             st.rerun()
-        st.caption("Stage 4+ · 单 durable 热路径 · UI 经 control_api")
+        st.caption("收消息 → 写库 → 想回复 → 发微信（崩溃可恢复）")
 
 
 def _kv_table(rows, headers):
@@ -672,11 +672,16 @@ def _page_targets():
                 ))
                 durable_on = t.get("reliable_pipeline_target") is True
                 shadow_on = bool(t.get("reliable_pipeline_shadow"))
+                if durable_on and shadow_on:
+                    pipe_state = "自动回复开（只演练不真发）"
+                elif durable_on:
+                    pipe_state = "自动回复开"
+                else:
+                    pipe_state = "自动回复关（消息跳过）"
                 st.caption(
-                    "可靠管线：%s%s · 专用实例：%s"
+                    "%s · 专用 Agent：%s"
                     % (
-                        "已 opt-in（durable）" if durable_on else "未 opt-in（回滚/跳过推进）",
-                        " · shadow" if shadow_on else "",
+                        pipe_state,
                         (t.get("dedicated_agent_instance_id") or "通用池") or "通用池",
                     )
                 )
@@ -698,7 +703,7 @@ def _page_targets():
                 mc[0].metric("已读到ID", t.get("last_local_id") or 0)
                 mc[1].metric("触发词", len(t.get("triggers") or []))
                 mc[2].metric("知识库", len(t.get("knowledge_bases") or []))
-                mc[3].metric("Durable", "ON" if durable_on else "OFF")
+                mc[3].metric("自动回复", "开" if durable_on else "关")
                 # Response-mode / session-policy editor; only meaningful once the target is enabled.
                 if t.get("enabled"):
                     with st.expander("响应模式 / 会话策略", expanded=False):
@@ -821,43 +826,45 @@ def _page_targets():
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
-                    with st.expander("可靠管线 opt-in / 回滚", expanded=False):
+                    with st.expander("这个群要不要自动回复", expanded=False):
                         st.caption(
-                            "Stage 4 后 monitor 仅走 durable 热路径。"
-                            "reliable_pipeline_target=True 时入站写入可靠管线；"
-                            "False 时 skip+advance（无 legacy fall-through），用于单目标回滚。"
-                            "多 target 本就支持：bot群聊测试 / family 等可同时 opt-in。"
+                            "打开后：群消息会进入自动回复后台（写库 → 想回复 → 发微信）。"
+                            "关闭后：仍继续监听并推进已读位置，但**不会**自动回。"
+                            "多个群可以同时打开（例如 bot群聊测试、family）。"
                         )
                         durable_toggle = st.toggle(
-                            "启用可靠管线（durable opt-in）",
+                            "开启本群自动回复",
                             value=bool(t.get("reliable_pipeline_target") is True),
                             key="rpl_target_%s" % widget_key,
+                            help="关掉 = 暂停该群自动回，不是切回旧版双路径。",
                         )
                         shadow_toggle = st.toggle(
-                            "Shadow（跑管线但不发微信）",
+                            "只演练，不真发到微信",
                             value=bool(t.get("reliable_pipeline_shadow")),
                             key="rpl_shadow_%s" % widget_key,
-                            help="仅在 opt-in 时生效。",
+                            help="后台照常跑，但不会把回复发到微信。需先开启本群自动回复。",
                         )
-                        if st.button("保存可靠管线开关", key="save_rpl_%s" % widget_key, use_container_width=False):
+                        if st.button("保存自动回复开关", key="save_rpl_%s" % widget_key, use_container_width=False):
                             try:
                                 set_target_field(action_key, "reliable_pipeline_target", bool(durable_toggle), base_url=base)
                                 set_target_field(action_key, "reliable_pipeline_shadow", bool(shadow_toggle), base_url=base)
-                                st.success("已保存 durable=%s shadow=%s" % (durable_toggle, shadow_toggle))
+                                st.success(
+                                    "已保存：自动回复=%s · 只演练=%s"
+                                    % ("开" if durable_toggle else "关", "开" if shadow_toggle else "关")
+                                )
                                 _clear_data_cache()
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
                     with st.expander("已废弃字段（勿用于生产）", expanded=False):
                         st.info(
-                            "生产热路径：durable 入站 → 可靠管线 → Hermes worker。"
-                            "下面配置**不会**改变群聊 live 回复行为。"
+                            "现在自动回复走：监听收消息 → 后台写库 → Agent 想回复 → 发微信。"
+                            "下面字段**不会**改变群聊是否自动回。"
                         )
                         st.markdown(
-                            "- **真正有用的**：可靠管线 opt-in / shadow、响应模式、回复策略、"
-                            "触发词、知识库、专用 Agent、CUA 窗口标题、管理员设置。\n"
-                            "- **agent_mode / thin_monitor**：仅 shadow_replay 与历史 "
-                            "`generate_reply` 离线路径；monitor 已不读取。"
+                            "- **真正要改的**：上面「这个群要不要自动回复」、响应模式、回复策略、"
+                            "触发词、知识库、专用 Agent、CUA 窗口标题、管理员。\n"
+                            "- **agent_mode / thin_monitor**：旧离线脚本用，monitor 已不读。"
                         )
                         stored_mode = str(t.get("agent_mode") or "").strip() or "（未设置，历史默认 standard）"
                         st.caption("当前配置中的 agent_mode 只读值：**%s**" % stored_mode)
@@ -2190,14 +2197,15 @@ def _page_agent_jobs():
 
 
 def _page_reliable_pipeline():
-    """Stage 5: reliable pipeline ops — counts, scheduler, dead-letter archive."""
-    st.header("可靠管线")
-    st.caption(
-        "Stage 4 单 durable 热路径。死信默认归档：仅当 send_started_at 为空时可安全 requeue "
-        "（否则有重复发送风险）。多 target 已支持：bot群聊测试 / family 等可同时 opt-in。"
+    """Ops page for the auto-reply backend (receive → decide → send)."""
+    st.header("可靠管线（自动回复后台）")
+    st.markdown(
+        "这里管的是**现有自动回复怎么可靠跑**，不是第二种机器人。\n\n"
+        "流程：**收到消息 → 先记到库 → Agent 想回复 → 排队发微信**。"
+        "进程挂了也能从库接着处理；失败的发送会记成「失败待处理」。"
     )
     base = st.session_state.base_url
-    if st.button("刷新管线状态", key="rpl_refresh"):
+    if st.button("刷新状态", key="rpl_refresh"):
         try:
             st.session_state.reliable_pipeline_result = reliable_pipeline_status(base_url=base)
             st.session_state.reliable_scheduler_result = reliable_scheduler_status(base_url=base)
@@ -2212,42 +2220,81 @@ def _page_reliable_pipeline():
             rp = reliable_pipeline_status(base_url=base)
             st.session_state.reliable_pipeline_result = rp
         except ControlAPIError as e:
-            st.error("管线状态不可用：%s" % (e,))
+            st.error("后台状态不可用：%s" % (e,))
             rp = {}
     if sch is None:
         try:
             sch = reliable_scheduler_status(base_url=base)
             st.session_state.reliable_scheduler_result = sch
         except ControlAPIError as e:
-            st.warning("调度状态不可用：%s" % (e,))
+            st.warning("处理循环状态不可用：%s" % (e,))
             sch = {}
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("管线启用", "是" if rp.get("enabled") else "否")
-    c2.metric("发送白名单", "开" if rp.get("test_target_only") else "关")
-    c3.metric("DB", rp.get("db_status") or "?")
-    c4.metric("调度", "运行" if (sch.get("running") or sch.get("thread_alive")) else "停止")
+    c1.metric("后台总开关", "开" if rp.get("enabled") else "关")
+    c2.metric("发送范围", "仅白名单群" if rp.get("test_target_only") else "全部开启群")
+    c3.metric("任务库", rp.get("db_status") or "?")
+    c4.metric("持续处理", "运行中" if (sch.get("running") or sch.get("thread_alive")) else "已停止")
 
     if rp.get("test_target_only"):
-        st.info("test_target_only=开：仅白名单目标可实际发送。当前常见白名单含 bot群聊测试、family。")
+        names = rp.get("test_target_names") or ["bot群聊测试", "family"]
+        if isinstance(names, str):
+            names = [names]
+        st.info(
+            "当前开了发送白名单：只有名单里的群会真发到微信。"
+            "常见名单：%s。其它群即使开了自动回复，也只跑后台不投递。"
+            % ("、".join(str(x) for x in names) if names else "（见 config）")
+        )
 
     counts = rp.get("counts") or {}
-    st.subheader("计数")
+    st.subheader("积压一览")
+    st.caption("数字变大说明某一步卡住了：消息入库 / 想回复 / 待发送 / 失败待处理。")
     rows = []
+    _table_cn = {
+        "inbound_events": "收到的消息",
+        "turn_windows": "聚合窗口",
+        "turns": "对话回合",
+        "turn_jobs": "想回复任务",
+        "send_outbox": "发件箱",
+    }
+    _status_cn = {
+        "pending": "待处理",
+        "open": "进行中",
+        "closed": "已关闭",
+        "materialized": "已生成任务",
+        "claimed": "处理中",
+        "done": "完成",
+        "failed": "失败",
+        "queued": "排队",
+        "sending": "发送中",
+        "sent": "已发送",
+        "confirmed": "已确认发出",
+        "dead_letter": "失败待处理",
+        "cancelled": "已取消",
+    }
     for table, bag in sorted(counts.items()):
+        t_label = _table_cn.get(table, table)
         if isinstance(bag, dict):
             for status_name, n in sorted(bag.items()):
-                rows.append({"表": table, "状态": status_name, "数量": n})
+                rows.append({
+                    "环节": t_label,
+                    "状态": _status_cn.get(status_name, status_name),
+                    "数量": n,
+                })
         else:
-            rows.append({"表": table, "状态": "", "数量": bag})
+            rows.append({"环节": t_label, "状态": "", "数量": bag})
     if rows:
         st.table(rows)
     else:
-        st.caption("无计数（DB 不可用或空）。")
+        st.caption("暂无计数（任务库不可用或为空）。")
 
-    st.subheader("调度器")
+    st.subheader("持续处理（调度）")
+    st.caption(
+        "调度开着，后台才会不断「把排队任务交给 Agent」和「把回复发到微信」。"
+        "关掉后新消息可能只堆在库里。"
+    )
     sc1, sc2 = st.columns(2)
-    if sc1.button("启动调度", key="rpl_sch_start"):
+    if sc1.button("开始处理", key="rpl_sch_start"):
         try:
             res = reliable_scheduler_start(base_url=base)
             st.success(str(res.get("action") or res))
@@ -2255,7 +2302,7 @@ def _page_reliable_pipeline():
             st.rerun()
         except ControlAPIError as e:
             st.error("启动失败：%s" % (e,))
-    if sc2.button("停止调度", key="rpl_sch_stop"):
+    if sc2.button("停止处理", key="rpl_sch_stop"):
         try:
             res = reliable_scheduler_stop(base_url=base)
             st.success(str(res.get("action") or res))
@@ -2263,67 +2310,73 @@ def _page_reliable_pipeline():
             st.rerun()
         except ControlAPIError as e:
             st.error("停止失败：%s" % (e,))
-    st.json({
-        "running": sch.get("running"),
-        "thread_alive": sch.get("thread_alive"),
-        "iterations": sch.get("iterations"),
-        "interval": sch.get("interval"),
-        "last_error": sch.get("last_error") or "",
-        "last_worker": sch.get("last_worker"),
-        "last_sender": sch.get("last_sender"),
-    })
+    with st.expander("处理循环技术细节", expanded=False):
+        st.json({
+            "running": sch.get("running"),
+            "thread_alive": sch.get("thread_alive"),
+            "iterations": sch.get("iterations"),
+            "interval": sch.get("interval"),
+            "last_error": sch.get("last_error") or "",
+            "last_worker": sch.get("last_worker"),
+            "last_sender": sch.get("last_sender"),
+        })
 
-    st.subheader("死信归档（只读为主）")
+    st.subheader("发送失败记录")
     st.caption(
-        "历史 dead_letter 在 send_started_at 非空时只能归档，不可安全 requeue。"
-        "控制台仅对 requeue_safe=true 的行显示 requeue 按钮。"
+        "多次发失败会记在这里。"
+        "**从未开始发**的可以再试一次；**已经点过发送**的只能当历史看，"
+        "再试可能把同一条再发到群里。"
     )
     dls = rp.get("dead_letters") or []
     if not dls:
-        st.success("当前无死信。")
+        st.success("当前没有发送失败记录。")
     else:
         table = []
         for d in dls:
             table.append({
-                "outbox_id": d.get("id"),
-                "job_id": d.get("job_id"),
-                "target_id": d.get("target_id"),
-                "attempts": "%s/%s" % (d.get("attempts"), d.get("max_attempts")),
-                "requeue_safe": "是" if d.get("requeue_safe") else "否（归档）",
-                "created_at": d.get("created_at"),
-                "dead_at": d.get("dead_at"),
+                "发件ID": d.get("id"),
+                "任务ID": d.get("job_id"),
+                "目标": d.get("target_id"),
+                "尝试": "%s/%s" % (d.get("attempts"), d.get("max_attempts")),
+                "可否再试": "可以" if d.get("requeue_safe") else "否（防重复发）",
+                "创建": d.get("created_at"),
+                "失败时间": d.get("dead_at"),
             })
         st.table(table)
         safe_ids = [d.get("id") for d in dls if d.get("requeue_safe") and d.get("id") is not None]
         if not safe_ids:
-            st.warning("本页所有死信均为 post-send-start 归档，已禁用 requeue。")
+            st.warning("本页失败记录都已开过发送，禁止再试，避免重复发到微信。")
         else:
-            pick = st.selectbox("可安全 requeue 的 outbox", options=safe_ids, key="rpl_safe_pick")
-            reason = st.text_input("requeue 原因（必填）", key="rpl_requeue_reason", placeholder="ops recovery after pre-send failure")
-            if st.button("安全 requeue", key="rpl_do_requeue"):
+            pick = st.selectbox("选择可再试的发件ID", options=safe_ids, key="rpl_safe_pick")
+            reason = st.text_input(
+                "再试原因（必填，方便事后查）",
+                key="rpl_requeue_reason",
+                placeholder="例如：发送前临时故障已恢复",
+            )
+            if st.button("再试一次发送", key="rpl_do_requeue"):
                 if not (reason or "").strip():
-                    st.error("原因必填")
+                    st.error("请填写原因")
                 else:
                     try:
                         res = requeue_reliable_outbox(int(pick), reason.strip(), base_url=base)
-                        st.success("已 requeue：%s" % (res,))
+                        st.success("已重新排队：%s" % (res,))
                         st.session_state.reliable_pipeline_result = reliable_pipeline_status(base_url=base)
                         st.rerun()
                     except ControlAPIError as e:
-                        st.error("requeue 拒绝/失败：%s" % (e,))
+                        st.error("再试被拒绝或失败：%s" % (e,))
 
-    st.subheader("已 opt-in 的监听目标")
+    st.subheader("已打开自动回复的群")
     targets = [t for t in (st.session_state.get("targets_all") or []) if t.get("reliable_pipeline_target") is True]
     if not targets:
-        st.caption("没有 reliable_pipeline_target=True 的目标。")
+        st.caption("还没有群打开自动回复。到「监听目标」里给某个群打开即可。")
     else:
         st.table([
             {
-                "name": t.get("name"),
-                "enabled": bool(t.get("enabled")),
-                "shadow": bool(t.get("reliable_pipeline_shadow")),
-                "dedicated": t.get("dedicated_agent_instance_id") or "",
-                "last_local_id": t.get("last_local_id"),
+                "群名": t.get("name"),
+                "监听中": "是" if t.get("enabled") else "否",
+                "只演练": "是" if t.get("reliable_pipeline_shadow") else "否",
+                "专用 Agent": t.get("dedicated_agent_instance_id") or "通用池",
+                "已读到ID": t.get("last_local_id"),
             }
             for t in targets
         ])
