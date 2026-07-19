@@ -46,7 +46,7 @@
       "reliable_pipeline_target": false,
       "reliable_pipeline_shadow": false,
       "dedicated_agent_instance_id": "",
-      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding. reliable_pipeline_shadow only takes effect when reliable_pipeline_target is true: shadow jobs run the full pipeline and record their decision and provenance, but never create a sendable outbox row and never send a WeChat message.",
+      "_reliable_pipeline_comment": "Stage 4 single-durable: monitor only uses durable_ingress. Set reliable_pipeline_target is True to opt this target in; false means skip+advance with no legacy fall-through (rollback switch). reliable_pipeline_shadow only takes effect when opted in: full pipeline runs and records decision/provenance but never creates a sendable outbox row.",
       "_knowledge_bases_comment": "Each target can bind at most ONE knowledge-base alias (local or online). Remove the second alias if you want online retrieval."
     },
     {
@@ -89,7 +89,7 @@
       "reliable_pipeline_target": false,
       "reliable_pipeline_shadow": false,
       "dedicated_agent_instance_id": "",
-      "_reliable_pipeline_comment": "Set reliable_pipeline_target to true and dedicated_agent_instance_id to a registered hermes instance id to opt this target into the reliable pipeline. Empty string means no dedicated binding. reliable_pipeline_shadow only takes effect when reliable_pipeline_target is true: shadow jobs run the full pipeline and record their decision and provenance, but never create a sendable outbox row and never send a WeChat message."
+      "_reliable_pipeline_comment": "Stage 4 single-durable: monitor only uses durable_ingress. Set reliable_pipeline_target is True to opt this target in; false means skip+advance with no legacy fall-through (rollback switch). reliable_pipeline_shadow only takes effect when opted in: full pipeline runs and records decision/provenance but never creates a sendable outbox row.",
     }
   ],
   "wiki_dir": "./wiki",

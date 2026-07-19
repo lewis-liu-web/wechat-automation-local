@@ -2,8 +2,9 @@
 
 Rollback procedure (per target, existing mechanisms only):
   1. Disable new durable ingress: set ``reliable_pipeline_target=False`` in the
-     target config. The monitor reloads config every cycle, so new messages
-     fall through to the legacy path from the next cycle.
+     target config (stop monitor first — live rewrite races with cursor save).
+     After Stage 4 there is no legacy fall-through; opted-out targets advance
+     the cursor without persisting durable events.
   2. Drain in-flight decisions: quarantine each non-terminal ``turn_jobs``
      row via the control-plane API (terminal ``failed``, audited).
   3. Drain-to-send: decided ``send_outbox`` rows keep flowing to ``sent``.
@@ -230,7 +231,7 @@ def test_ingress_toggle_sequence_opt_out_and_roll_forward(tmp_path):
     assert out1["error"] == ""
     assert out1["persisted"] is True
 
-    # Roll back: durable fence refuses; the monitor falls through to legacy.
+    # Roll back: durable fence refuses; Stage 4 has no legacy fall-through.
     t["reliable_pipeline_target"] = False
     out2 = monitor.durable_ingress_event(t, _event(2), cfg=cfg, db_path=db, now=2.0)
     assert out2["error"] == "target not opted into reliable pipeline"

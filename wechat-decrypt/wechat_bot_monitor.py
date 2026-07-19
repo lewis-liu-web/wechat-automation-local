@@ -34,17 +34,8 @@ except Exception:  # pragma: no cover
     _zstd = None
     _ZSTD_DCTX = None
 
-from reply_engine import DEFAULT_TRIGGERS, generate_reply, precheck, postcheck, _thin_monitor_enabled, resolve_target_kb_ids
-from reply_decision import decide as reply_decision_decide
+from reply_engine import DEFAULT_TRIGGERS, precheck, postcheck, resolve_target_kb_ids
 from wechat_sender import send_reply_detailed
-from message_aggregator import (
-    ingest_event,
-    event_from_monitor_message,
-    flush_all_pending,
-    flush_due,
-    has_open_window,
-    AggregatedTurn,
-)
 import admin_commands as _admin_commands
 try:
     import reliable_pipeline as _pipeline
@@ -218,42 +209,6 @@ def _decrypt_image_for_message(m, t, cfg):
     return None
 
 
-def _build_thin_monitor_aggregated_message(t, m, cfg):
-    """Build an aggregated message + event_context for the thin-monitor path."""
-    event = event_from_monitor_message(m, t)
-    policy = resolve_target_policy(cfg, t)
-    ctx_policy = policy.get('context_policy') or {}
-    context_limit = int(ctx_policy.get('max_messages') or cfg.get('context_limit') or 30)
-    ctx, event_context = build_event_context(t, m, cfg, limit=context_limit)
-    event_context['target_policy'] = policy
-    event_context['trigger_matched'] = False
-    event_context['in_session'] = False
-    event_context['sender'] = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
-    event_context['sender_username'] = m.get('sender_username') or ''
-    event_context['sender_display_name'] = m.get('sender_display_name') or ''
-    event_context['mention_name'] = m.get('mention_name') or m.get('sender_display_name') or ''
-    # Thin-monitor does not manage sessions; keep the event_context schema
-    # compatible with downstream consumers while reporting a fixed idle state.
-    event_context['session_active'] = False
-    event_context['session_state'] = 'idle'
-    event_context['session_turns'] = 0
-
-    turn = ingest_event(
-        event,
-        trigger_matched=False,
-        in_session=False,
-        event_context=event_context,
-        target=t,
-        config=cfg,
-    )
-    if turn is None:
-        return None, event_context, None
-
-    agg_msg = turn.to_generate_reply_message()
-    agg_msg['target_policy'] = policy
-    agg_msg['event_context'] = event_context
-    return agg_msg, event_context, turn
-
 
 def _advance_startup_cursors(targets, cfg):
     """Advance target cursors to the current DB max on startup.
@@ -261,6 +216,12 @@ def _advance_startup_cursors(targets, cfg):
     Mutates targets in place and returns a dict mapping target_key -> last_local_id.
     Controlled by ``monitor.advance_cursor_on_start`` (default True).
     """
+    # Global-disabled fail-closed: do NOT advance startup cursors when the scheduler
+    # is disabled; otherwise restart silently skips messages before the per-message
+    # guard can record them.
+    if not _reliable_pipeline_globally_enabled(cfg):
+        return {}
+
     advance = bool((cfg or {}).get('monitor', {}).get('advance_cursor_on_start', True))
     runtime_min = {}
     for t in targets:
@@ -276,88 +237,6 @@ def _advance_startup_cursors(targets, cfg):
             t.get('name'), t.get('db'), t.get('table'), t.get('last_local_id'), json.dumps(latest, ensure_ascii=False)))
     return runtime_min
 
-
-def _handle_thin_monitor_target(t, m, cfg, *, config_path, args, contact_names, lid):
-    """Thin-monitor target: decrypt image, aggregate, enqueue to agent, send ack.
-
-    The monitor does not run trigger matching, session management, or the local
-    reply decision layer.  Everything except listen/send is delegated to the
-    agent side.
-    """
-    _decrypt_image_for_message(m, t, cfg)
-    log('new msg thin target=%s local_id=%s content=%r image=%s' % (
-        t.get('name'), lid, m.get('message_content'), m.get('image_path', '')))
-
-    agg_msg, event_context, turn = _build_thin_monitor_aggregated_message(t, m, cfg)
-    if turn is None:
-        _record_event(
-            'thin_monitor_buffered',
-            target=t.get('name'),
-            sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-            payload={'local_id': lid},
-        )
-        return lid
-
-    # High-risk requests still get an immediate safety boundary reply locally.
-    boundary = precheck(str(m.get('message_content') or ''))
-    if boundary and boundary.risk_level == 'high':
-        text = _ensure_sender_mention(postcheck(boundary.reply_text), m, contact_names)
-        if text and not args.dry_run:
-            ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
-            log('thin_pre_boundary_immediate target=%s local_id=%s ok=%s reason=%s' % (
-                t.get('name'), lid, ok, boundary.reason))
-            _record_event(
-                'send_ok' if ok else 'send_failed',
-                target=t.get('name'),
-                sender=event_context.get('sender'),
-                payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True, 'thin_monitor': True},
-            )
-        return turn.end_local_id
-
-    gen_t0 = time.time()
-    try:
-        decision = generate_reply(agg_msg, t, cfg, config_path=config_path)
-    except Exception as exc:
-        log('thin_generate_reply_error target=%s local_id=%s error=%r' % (t.get('name'), turn.end_local_id, exc))
-        _record_event(
-            'thin_monitor_generate_error',
-            target=t.get('name'),
-            sender=event_context.get('sender'),
-            payload={'local_id': turn.end_local_id, 'error': repr(exc)},
-        )
-        return turn.end_local_id
-
-    gen_dt = time.time() - gen_t0
-    text = decision.reply_text
-    ctx_len = len(agg_msg.get('context_messages') or [])
-    log('thin_monitor_enqueued target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
-        t.get('name'), turn.end_local_id, ctx_len, gen_dt, decision.intent, decision.risk_level,
-        decision.need_human, decision.reason, text))
-    _record_event(
-        'thin_monitor_enqueued',
-        target=t.get('name'),
-        sender=event_context.get('sender'),
-        payload={
-            'local_id': turn.end_local_id,
-            'intent': decision.intent,
-            'risk_level': decision.risk_level,
-            'reason': decision.reason,
-            'has_reply_text': bool(text),
-        },
-    )
-    if decision.should_reply and text and not args.dry_run:
-        # For thin-monitor the agent_worker sends the final reply.  The monitor
-        # only sends an immediate ack if one was generated (e.g., customer_service mode).
-        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=turn.end_local_id, cfg=cfg,
-                        config_path=config_path, mention_name=event_context.get('mention_name') or event_context.get('sender_display_name') or event_context.get('sender'))
-        log('thin_monitor_ack_sent target=%s local_id=%s ok=%s' % (t.get('name'), turn.end_local_id, ok))
-        _record_event(
-            'send_ok' if ok else 'send_failed',
-            target=t.get('name'),
-            sender=event_context.get('sender'),
-            payload={'local_id': turn.end_local_id, 'thin_monitor': True, 'ack': True},
-        )
-    return turn.end_local_id
 
 
 def _ensure_sender_mention(text, msg, contact_names=None):
@@ -1273,6 +1152,15 @@ def _try_handle_admin_command(m, t, cfg, config_path, dry_run=False, contact_nam
         return False
     if not result.handled:
         return False
+    # Disabled-aware short-circuit: command recognized (handler ran) but no t.update,
+    # no send_reply, no cursor advance, no config save. The message replays on
+    # next cycle once re-enabled so the mutation applies exactly once.
+    if not _reliable_pipeline_globally_enabled(cfg):
+        lid = int(m.get('local_id') or 0)
+        _record_event('admin_command_recognized_globally_disabled',
+                      target=t.get('name'), sender=sender,
+                      payload={'local_id': lid, 'action': getattr(result, 'action', '')})
+        return True
     lid = int(m.get('local_id') or 0)
     if result.target_updates:
         t.update(result.target_updates)
@@ -1308,29 +1196,6 @@ def _try_handle_admin_command(m, t, cfg, config_path, dry_run=False, contact_nam
 # Test-friendly alias: tests patch ``monitor.pipeline.persist_inbound_event``.
 pipeline = _pipeline
 
-
-def _is_reliable_pipeline_target(t, cfg):
-    """Return True iff the target is opted into the durable thin-monitor path.
-
-    Activation requires BOTH a global flag and a per-target opt-in so the legacy
-    aggregator path stays untouched when this feature is disabled. The per-target
-    opt-in can be expressed three ways for forward compatibility:
-
-      * ``target['reliable_pipeline_target'] == True`` (explicit boolean)
-      * ``target.get('mode') == 'thin_monitor'``
-      * ``target.get('type') == 'thin-monitor'``
-    """
-    if not (cfg or {}).get('reliable_pipeline', {}).get('enabled'):
-        return False
-    if not isinstance(t, dict):
-        return False
-    if t.get('reliable_pipeline_target') is True:
-        return True
-    if str(t.get('mode') or '').lower() == 'thin_monitor':
-        return True
-    if str(t.get('type') or '') == 'thin-monitor':
-        return True
-    return False
 
 
 def _is_allowed_pipeline_sender(t, m, cfg):
@@ -1474,6 +1339,16 @@ def _event_already_in_open_window(event_id, target_id, sender_id, db_path):
         return False
 
 
+def _reliable_pipeline_globally_enabled(cfg):
+    """Strict-is-True enabled check matching control_api._reliable_pipeline_enabled.
+
+    Plain truthiness lets the monitor persist jobs for non-bool config values
+    (e.g. ``1``, ``"yes"``) the scheduler rejects. Keep these in lock-step.
+    """
+    section = (cfg or {}).get('reliable_pipeline') or {}
+    return section.get('enabled') is True
+
+
 def durable_ingress_event(t, m, *, cfg=None, config_path=None, db_path, now=None, event_context=None,
                           target_policy=None):
     """Persist + window-attach + per-cycle drain for one inbound event.
@@ -1489,6 +1364,21 @@ def durable_ingress_event(t, m, *, cfg=None, config_path=None, db_path, now=None
     ``{'advanced': False, 'error': '...'}`` so a transient storage failure
     cannot corrupt the monitor cursor.
     """
+    if not _reliable_pipeline_globally_enabled(cfg):
+        return {'advanced': False, 'persisted': False, 'inserted': False,
+                'window_attached': False, 'local_id': 0, 'event_id': '',
+                'closed_turns': 0, 'created_jobs': 0,
+                'error': 'reliable_pipeline globally disabled'}
+    # Per-target opt-in remains the Stage-4 rollback switch.  Full cutover
+    # deleted the dual-path gate function; this field is the only way to take
+    # one target off durable ingress without disabling the global pipeline.
+    if not (isinstance(t, dict) and t.get('reliable_pipeline_target') is True):
+        return {'advanced': False, 'persisted': False, 'inserted': False,
+                'window_attached': False, 'local_id': 0, 'event_id': '',
+                'closed_turns': 0, 'created_jobs': 0,
+                'error': 'target not opted into reliable pipeline'}
+
+
     result = {
         'advanced': False,
         'persisted': False,
@@ -1502,9 +1392,6 @@ def durable_ingress_event(t, m, *, cfg=None, config_path=None, db_path, now=None
     }
     if _pipeline is None:
         result['error'] = 'reliable_pipeline module unavailable'
-        return result
-    if not _is_reliable_pipeline_target(t, cfg):
-        result['error'] = 'target not opted into reliable pipeline'
         return result
     ident = _resolve_pipeline_identifiers(t, m)
     if not ident:
@@ -1612,6 +1499,9 @@ def drain_due_pipeline(*, cfg, db_path, now=None):
     debounce timer long expired, and this is the only place that closes it
     without a new message arriving.
     """
+    if not _reliable_pipeline_globally_enabled(cfg):
+        return {'materialized_jobs': 0, 'closed_windows': 0, 'error': 'globally disabled'}
+
     summary = {
         'closed_turns': 0,
         'created_jobs': 0,
@@ -1619,8 +1509,6 @@ def drain_due_pipeline(*, cfg, db_path, now=None):
     }
     if _pipeline is None:
         summary['error'] = 'reliable_pipeline module unavailable'
-        return summary
-    if not (cfg or {}).get('reliable_pipeline', {}).get('enabled'):
         return summary
     try:
         turns = _pipeline.close_due_windows(now=now, db_path=db_path)
@@ -1731,448 +1619,107 @@ def main():
         # the failed one — otherwise a later success could mask the failure
         # and replay the failed row out-of-order on the next cycle.
         _rl_failed_targets = set()
+        _rl_db_path = Path(((cfg.get('reliable_pipeline') or {}).get('db_path')
+                           or str(ROOT / 'temp' / 'reliable_pipeline.sqlite')))
         for db_name, db_targets in group_targets_by_db(targets).items():
             for t, m in fetch_new_for_db(db_name, db_targets):
                 enrich_sender_display_name(m, contact_names)
                 new_count += 1
                 lid = int(m.get('local_id') or 0)
-                advance_state = True
-                # Thin-target fence: when the durable path failed earlier in
-                # this cycle for a thin-monitor target, we MUST NOT touch
-                # last_local_id past the failed row. The preserved admin,
-                # self-sent, and admin_muted branches still run — they just
-                # log / record their decision without advancing the cursor.
-                # Image-decrypt, durable ingress, and legacy session logic
-                # are skipped entirely so a later row cannot cursor-past the
-                # failure.
                 _rl_target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
-                fenced = (_rl_target_key in _rl_failed_targets
-                          and _is_reliable_pipeline_target(t, cfg))
+                fenced = _rl_target_key in _rl_failed_targets
                 if fenced:
-                    advance_state = False
                     log('reliable_pipeline fenced target=%s local_id=%s reason=cycle_failure' % (
                         t.get('name'), lid))
                     continue
-                # Image message: decrypt and attach image_path for vision processing in reply_engine.
-                # Thin-monitor targets do not run local vision/pending-image logic; the agent
-                # handles images via its own multimodal provider or the decode_image MCP tool.
-                # The thin-monitor / durable path deliberately skips the
-                # legacy _pending_images dict (no memory aggregation); the
-                # image_path on the message itself stays so the worker can
-                # pick it up via the durable payload.
-                if not _thin_monitor_enabled(cfg, t) and int(m.get('local_type') or 0) == 3:
-                    try:
-                        from image_handler import process_image_message
-                        img_path = process_image_message(
-                            m, t, cfg,
-                            packed_info_data_bytes=m.get('packed_info_data'),
-                        )
-                        if img_path:
-                            m['image_path'] = img_path
-                            log('image decrypted target=%s local_id=%s path=%s' % (t.get('name'), lid, img_path))
-                            if not _is_reliable_pipeline_target(t, cfg):
-                                # Store image path for this sender so a follow-up
-                                # text query can reference it (legacy path only).
-                                key = _session_key(t, m)
-                                _pending_images.setdefault(key, []).append({'path': img_path, 'time': time.time()})
-                                # Keep only the most recent 5 images per sender to avoid unbounded growth
-                                _pending_images[key] = _pending_images[key][-5:]
-                                log('pending_images stored key=%s sender=%s count=%d' % (key, m.get('real_sender_id') or m.get('sender') or '', len(_pending_images[key])))
-                        else:
-                            log('image decrypt failed target=%s local_id=%s' % (t.get('name'), lid))
-                    except Exception as e:
-                        log('image decrypt exception target=%s local_id=%s error=%r' % (t.get('name'), lid, e))
-                # --- legacy pre-routing branches (preserved) ----------------------
-                # Admin commands short-circuit BEFORE durable routing so that
-                # administrative intent never becomes an ingress event.
-                # advance_state gates the cursor write inside
-                # _try_handle_admin_command so fenced thin targets can still
-                # apply admin updates without advancing past a durable failure.
-                if _try_handle_admin_command(m, t, cfg, config_path, dry_run=args.dry_run, contact_names=contact_names):
+                if _try_handle_admin_command(m, t, cfg, config_path,
+                                            dry_run=args.dry_run, contact_names=contact_names):
                     continue
-                # Skip messages sent by the bot itself to prevent self-reply loops.
+                # --- per-message reliable_pipeline.enabled guard (fail-closed) ---
+                # When the scheduler is disabled, skip + no-advance + no outbound.
+                if not _reliable_pipeline_globally_enabled(cfg):
+                    log('reliable_pipeline globally disabled target=%s local_id=%s; skip + no-advance' % (
+                        t.get('name'), lid))
+                    _record_event(
+                        'reliable_pipeline_globally_disabled',
+                        target=t.get('name'),
+                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
+                        payload={'local_id': lid},
+                    )
+                    continue
+                # Image message: decrypt and attach image_path for durable worker.
+                if int(m.get('local_type') or 0) == 3:
+                    _decrypt_image_for_message(m, t, cfg)
                 if int(m.get('status') or 0) == 2:
                     log('self_sent_skip target=%s local_id=%s' % (t.get('name'), lid))
                     _record_event('self_sent_skip', target=t.get('name'),
                                   sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
                                   payload={'local_id': lid})
-                    if advance_state:
-                        _advance_cursor(t, lid, 'self_sent_skip')
+                    _advance_cursor(t, lid, 'self_sent_skip')
                     continue
                 sender = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
                 if t.get('admin_muted'):
                     log('target_muted target=%s local_id=%s' % (t.get('name'), lid))
                     _record_event('target_muted_skip', target=t.get('name'), sender=sender, payload={'local_id': lid})
-                    if advance_state:
-                        _advance_cursor(t, lid, 'target_muted_skip')
+                    _advance_cursor(t, lid, 'target_muted_skip')
                     continue
-                # --- thin-monitor durable ingress ---------------------------------
-
-                # When the global flag is on and this target opted in to the
-                # durable pipeline, hand the event to the durable worker and
-                # skip every legacy step below: aggregator, session/trigger
-                # handling, decision, reply_engine are all owned by the
-                # worker, not the monitor.  The early fence (right after
-                # lid/advance_state) already short-circuited fenced thin
-                # targets, so this branch only runs for non-fenced eligible
-                # rows.
-                if _is_reliable_pipeline_target(t, cfg):
-                    if not _is_allowed_pipeline_sender(t, m, cfg):
-                        log('reliable_pipeline sender_not_allowed target=%s local_id=%s sender=%s' % (
-                            t.get('name'), lid, m.get('sender_username') or m.get('real_sender_id') or m.get('sender')))
-                        _record_event('reliable_pipeline_sender_not_allowed', target=t.get('name'), sender=sender,
-                                      payload={'local_id': lid, 'sender_username': m.get('sender_username'),
-                                               'real_sender_id': m.get('real_sender_id'), 'sender': m.get('sender')})
-                        if advance_state:
-                            _advance_cursor(t, lid, 'reliable_pipeline_sender_not_allowed')
-                        continue
-                    _rl_db_path = ((cfg.get('reliable_pipeline') or {}).get('db_path')
-                                   or str(ROOT / 'temp' / 'reliable_pipeline.sqlite'))
-                    _rl_db = Path(_rl_db_path)
-                    # Compute trigger/session state so the worker can see why the
-                    # event was admitted, even though the durable path owns the
-                    # final action decision.
-                    _clear_expired_sessions(cfg)
-                    _rl_triggered = bool(is_trigger(cfg, t, m))
-                    _rl_in_session = False
-                    if _rl_triggered:
-                        _activate_session(t, m, cfg)
-                    elif _is_in_session(t, m, cfg):
-                        _rl_in_session = True
-                        log('reliable_pipeline session_trigger target=%s local_id=%s' % (t.get('name'), lid))
-                    _rl_sess_key = _session_key(t, m)
-                    _rl_sess_entry = _active_sessions.get(_rl_sess_key) or {}
-                    _rl_event_context = {
-                        'trigger_matched': _rl_triggered,
-                        'in_session': _rl_in_session,
-                        'session_active': bool(_rl_sess_entry),
-                        'session_state': 'active' if _rl_sess_entry else 'idle',
-                        'session_turns': int(_rl_sess_entry.get('turns') or 0),
-                        'sender': sender,
-                        'sender_username': m.get('sender_username') or '',
-                        'sender_display_name': m.get('sender_display_name') or '',
-                        'mention_name': m.get('mention_name') or m.get('sender_display_name') or '',
-                        'local_id': lid,
-                        'mode': 'thin_monitor',
-                    }
-                    _rl_policy = resolve_target_policy(cfg, t)
-                    _rl_result = durable_ingress_event(
-                        t, m, cfg=cfg, config_path=config_path, db_path=_rl_db, now=time.time(),
-                        event_context=_rl_event_context,
-                        target_policy=_rl_policy,
-                    )
-                    if _rl_result['advanced']:
-                        _advance_cursor(t, lid, 'durable_ingress')
-                    else:
-                        # Refuse to advance on persist/window-attach/drain
-                        # failure AND fence this target for the rest of the
-                        # cycle so a later success in this cycle cannot
-                        # cursor-past the failed row.
-                        advance_state = False
-                        _rl_failed_targets.add(_rl_target_key)
-                        log('reliable_pipeline failure_fence target=%s local_id=%s error=%s' % (
-                            t.get('name'), lid, _rl_result.get('error', '')))
+                if not _is_allowed_pipeline_sender(t, m, cfg):
+                    log('reliable_pipeline sender_not_allowed target=%s local_id=%s sender=%s' % (
+                        t.get('name'), lid, sender))
+                    _record_event('reliable_pipeline_sender_not_allowed', target=t.get('name'),
+                                      sender=sender,
+                                      payload={'local_id': lid})
+                    _advance_cursor(t, lid, 'reliable_pipeline_sender_not_allowed')
                     continue
-                # Thin-monitor path (non-pipeline): delegate trigger/session/
-                # decision/reply to the agent via the legacy handle.
-                if _thin_monitor_enabled(cfg, t):
-                    new_lid = _handle_thin_monitor_target(
-                        t, m, cfg,
-                        config_path=config_path,
-                        args=args,
-                        contact_names=contact_names,
-                        lid=lid,
-                    )
-                    if advance_state:
-                        _advance_cursor(t, new_lid, 'thin_monitor')
-                    continue
-                # --- session-based trigger handling ---
-                _clear_expired_sessions(cfg)
-                triggered = bool(is_trigger(cfg, t, m))
-                in_session = False
-                if triggered:
-                    _activate_session(t, m, cfg)
-                    _record_event(
-                        'trigger_matched',
-                        target=t.get('name'),
-                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-                        payload={'local_id': lid, 'reason': 'trigger'},
-                    )
-                elif _is_in_session(t, m, cfg):
-                    log('session_trigger target=%s local_id=%s' % (t.get('name'), lid))
-                    in_session = True
-                    _record_event(
-                        'trigger_matched',
-                        target=t.get('name'),
-                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-                        payload={'local_id': lid, 'reason': 'session'},
-                    )
-                should_process = triggered or in_session
-                if not should_process:
-                    current_event = event_from_monitor_message(m, t)
-                    if has_open_window(current_event.chat_id, current_event.sender_id):
-                        log('aggregator_open_window_append target=%s local_id=%s chat=%s sender=%s' % (
-                            t.get('name'), lid, current_event.chat_id, current_event.sender_id))
-                        should_process = True
-                        in_session = True
-                if not should_process:
-                    key = _session_key(t, m)
-                    text_for_pending = str(m.get('message_content') or '')
-                    triggers_for_pending = t.get('triggers')
-                    if triggers_for_pending is None:
-                        triggers_for_pending = cfg.get('default_triggers', [])
-                    pending_trigger = any((trig and trig in text_for_pending) for trig in triggers_for_pending)
-                    if pending_trigger and _pending_images.get(key):
-                        log('pending_image_trigger_fallback target=%s local_id=%s key=%s' % (t.get('name'), lid, key))
-                        triggered = True
-                        should_process = True
-                if should_process:
-                    key = _session_key(t, m)
-                    pending = _pending_images.pop(key, None)
-                    log('pending_images lookup key=%s sender=%s found=%s' % (key, m.get('real_sender_id') or m.get('sender') or '', bool(pending)))
-                    if pending:
-                        policy_for_pending = resolve_target_policy(cfg, t)
-                        image_policy = policy_for_pending.get('image_policy') or {}
-                        window = float(image_policy.get('bind_window_seconds') or cfg.get('session_window') or SESSION_WINDOW_DEFAULT)
-                        now = time.time()
-                        fresh_paths = [item['path'] for item in pending if now - item.get('time', 0) <= window]
-                        log('pending_images fresh_paths=%d total=%d window=%.0fs' % (len(fresh_paths), len(pending), window))
-                        if fresh_paths:
-                            m['session_image_paths'] = fresh_paths
-                event = event_from_monitor_message(m, t)
-                # Build minimal event_context for the aggregated turn
-                policy = resolve_target_policy(cfg, t)
-                ctx_policy = policy.get('context_policy') or {}
-                context_limit = int(ctx_policy.get('max_messages') or cfg.get('context_limit') or 30)
-                ctx, event_context = build_event_context(t, m, cfg, limit=context_limit)
-                event_context['target_policy'] = policy
-                event_context['trigger_matched'] = bool(triggered)
-                event_context['in_session'] = bool(in_session)
-                event_context['sender'] = m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or ''
-                event_context['sender_username'] = m.get('sender_username') or ''
-                event_context['sender_display_name'] = m.get('sender_display_name') or ''
-                event_context['mention_name'] = m.get('mention_name') or m.get('sender_display_name') or ''
-                sess_entry = _active_sessions.get(_session_key(t, m)) or {}
-                event_context['session_active'] = bool(sess_entry)
-                event_context['session_state'] = 'active' if sess_entry else 'idle'
-                event_context['session_turns'] = int(sess_entry.get('turns') or 0)
-
-                turn = ingest_event(
-                    event,
-                    trigger_matched=triggered,
-                    in_session=in_session,
-                    event_context=event_context,
-                    target=t,
-                    config=cfg,
-                )
-
-                if turn is None:
-                    _record_event(
-                        'aggregator_buffered',
-                        target=t.get('name'),
-                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-                        payload={'local_id': lid},
-                    )
-                    if advance_state:
-                        _advance_cursor(t, lid, 'aggregator_buffered')
-                    continue
-
-                if not should_process:
-                    _record_event(
-                        'aggregator_dropped',
-                        target=t.get('name'),
-                        sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-                        payload={'local_id': lid},
-                    )
-                    if advance_state:
-                        _advance_cursor(t, turn.end_local_id, 'aggregator_dropped')
-                    continue
-
-                # High-risk requests should get an immediate safety boundary reply.
-                # This avoids losing the response if a debounce window is interrupted.
+                # --- precheck boundary (local deterministic safety; high-risk routed immediately) ---
                 boundary = precheck(str(m.get('message_content') or ''))
-                if boundary and boundary.risk_level == 'high':
+                if boundary and getattr(boundary, 'risk_level', '') == 'high':
                     text = _ensure_sender_mention(postcheck(boundary.reply_text), m, contact_names)
                     if text and not args.dry_run:
-                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=lid, cfg=cfg, config_path=config_path)
-                        log('pre_boundary_immediate target=%s local_id=%s ok=%s reason=%s' % (
-                            t.get('name'), lid, ok, boundary.reason))
-                        _record_event(
-                            'send_ok' if ok else 'send_failed',
-                            target=t.get('name'),
-                            sender=m.get('sender_username') or m.get('real_sender_id') or m.get('sender') or '',
-                            payload={'local_id': lid, 'reason': boundary.reason, 'immediate_boundary': True},
-                        )
-                    if advance_state:
-                        _advance_cursor(t, lid, 'precheck_boundary')
+                        ok = send_reply(text, cfg.get('send_mode'), target=t,
+                                       before_local_id=lid, cfg=cfg, config_path=config_path)
+                        _record_event('send_ok' if ok else 'send_failed',
+                                      target=t.get('name'), sender=sender,
+                                      payload={'local_id': lid, 'reason': getattr(boundary, 'reason', ''),
+                                               'precheck_boundary': True})
+                    _advance_cursor(t, lid, 'precheck_boundary')
                     continue
-
-                # Window closed – we have an aggregated turn.  Proceed to reply.
-                hit_count += 1
-
-                # Image-only without task description: guide the user instead of
-                # dispatching an agent job that has nothing to analyze.
-                # Exception: if the user explicitly triggered the bot or is in an
-                # active session, let the image through so reply_engine can run VLM
-                # and KB retrieval on it.
-                if turn.image_paths and not turn.has_image_task_description() and not (turn.trigger_matched or turn.in_session):
-                    _send_image_task_missing_guide(turn, cfg, config_path=config_path, dry_run=args.dry_run)
-                    if advance_state:
-                        _advance_cursor(t, turn.end_local_id, 'image_only_no_task')
-                    continue
-
-                agg_msg = turn.to_generate_reply_message()
-                # Keep the aggregated window's own context_messages; the flat
-                # historical rows from build_event_context live in event_context.
-                # Carry forward the original message's metadata for reply_engine
-                agg_msg['target_policy'] = policy
-                agg_msg['event_context'] = event_context
-
-                # Trigger-only reply decision layer (on the *aggregated* message)
-                decision_plan = reply_decision_decide(t, agg_msg, event_context)
-                log('decision target=%s local_id=%s should_trigger=%s reason=%s mode=%s risk=%s confidence=%.2f' % (
-                    t.get('name'), turn.end_local_id, decision_plan.should_reply, decision_plan.reason,
-                    decision_plan.reply_mode, decision_plan.risk_level, decision_plan.confidence))
-                _record_event(
-                    'decision',
-                    target=t.get('name'),
-                    sender=event_context.get('sender'),
-                    payload={
-                        'local_id': turn.end_local_id,
-                        'should_reply': decision_plan.should_reply,
-                        'reason': decision_plan.reason,
-                        'reply_mode': decision_plan.reply_mode,
-                        'risk_level': decision_plan.risk_level,
-                        'confidence': decision_plan.confidence,
-                    },
+                # --- durable ingress (single path; survives monitor restarts) ---
+                _rl_event_context = {
+                    'mode': 'durable_ingress',
+                    'local_id': lid,
+                    'sender': sender,
+                }
+                _rl_result = durable_ingress_event(
+                    t, m, cfg=cfg, config_path=config_path, db_path=_rl_db_path,
+                    now=time.time(), event_context=_rl_event_context,
+                    target_policy=resolve_target_policy(cfg, t),
                 )
-                if decision_plan.reply_mode == 'handoff' or decision_plan.risk_level == 'high':
-                    _record_event(
-                        'risk_detected',
-                        target=t.get('name'),
-                        sender=event_context.get('sender'),
-                        payload={'local_id': turn.end_local_id, 'reason': decision_plan.reason},
-                    )
-                if not decision_plan.should_reply:
-                    _maybe_expire_session_on_close_cue(t, agg_msg, decision_plan, event_context)
-                    if advance_state:
-                        _advance_cursor(t, turn.end_local_id, 'decision_skip')
-                    continue
-
-                gen_t0 = time.time()
-                try:
-                    decision = generate_reply(agg_msg, t, cfg, config_path=config_path)
-                    gen_dt = time.time() - gen_t0
-                    text = decision.reply_text
-                    ctx_len = len(agg_msg.get('context_messages') or [])
-                    log('trigger hit target=%s local_id=%s ctx=%d gen=%.3fs intent=%s risk=%s need_human=%s reason=%s reply=%r' % (
-                        t.get('name'), turn.end_local_id, ctx_len, gen_dt, decision.intent, decision.risk_level, decision.need_human, decision.reason, text))
-                    try:
-                        detail = decision.to_dict()
-                        detail['target'] = t.get('name')
-                        detail['local_id'] = turn.end_local_id
-                        detail['context_count'] = ctx_len
-                        detail['generate_seconds'] = round(gen_dt, 3)
-                        detail['reply_preview'] = (text or '')[:200]
-                        log('decision_detail %s' % json.dumps(detail, ensure_ascii=False, default=str))
-                    except Exception as e:
-                        log('decision_detail_error target=%s local_id=%s error=%r' % (t.get('name'), turn.end_local_id, e))
-                    if not decision.should_reply or not text:
-                        log('decision: skip send')
+                if not _rl_result or not _rl_result.get('advanced'):
+                    err = (_rl_result or {}).get('error', '')
+                    if err == 'target not opted into reliable pipeline':
+                        # Target rolled back off durable: no legacy path remains
+                        # after Stage 4. Advance so the cursor does not freeze,
+                        # but do not fence the cycle (other rows may still run).
+                        log('reliable_pipeline target_opted_out target=%s local_id=%s; skip + advance' % (
+                            t.get('name'), lid))
                         _record_event(
-                            'reply_skipped',
-                            target=t.get('name'),
-                            sender=event_context.get('sender'),
-                            payload={
-                                'local_id': turn.end_local_id,
-                                'reason': decision.reason,
-                                'intent': decision.intent,
-                                'risk_level': decision.risk_level,
-                            },
+                            'reliable_pipeline_target_opted_out',
+                            target=t.get('name'), sender=sender,
+                            payload={'local_id': lid},
                         )
-                    elif args.dry_run:
-                        log('dry-run: skip send')
+                        _advance_cursor(t, lid, 'reliable_pipeline_target_opted_out')
                     else:
-                        t0 = time.time()
-                        ok = send_reply(text, cfg.get('send_mode'), target=t, before_local_id=turn.end_local_id, cfg=cfg, config_path=config_path,
-                                        mention_name=event_context.get('mention_name') or event_context.get('sender_display_name') or event_context.get('sender_name') or event_context.get('from_display_name'))
-                        cost = time.time() - t0
-                        log('reply send attempted ok=%s cost=%.3fs' % (ok, cost))
-                        _record_event(
-                            'send_ok' if ok else 'send_failed',
-                            target=t.get('name'),
-                            sender=event_context.get('sender'),
-                            payload={'local_id': turn.end_local_id, 'latency': round(cost, 3)},
-                        )
-                        if not ok:
-                            t['last_send_failed_local_id'] = turn.end_local_id
-                            t['last_send_failed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                            if not cfg.get('advance_on_send_failure', True):
-                                advance_state = False
-                                log('send failed; state NOT advanced due advance_on_send_failure=false')
-                            else:
-                                log('send failed; state advanced but failure recorded')
-                        else:
-                            t.pop('last_send_failed_local_id', None)
-                            t.pop('last_send_failed_at', None)
-                except Exception as e:
-                    import traceback as _tb
-                    tb_text = _tb.format_exc().replace('\n', ' | ')[:1200]
-                    log('reply_pipeline_exception target=%s local_id=%s error=%r traceback=%s' % (
-                        t.get('name'), turn.end_local_id, e, tb_text))
-                    try:
-                        _record_event(
-                            'reply_pipeline_exception',
-                            target=t.get('name'),
-                            sender=event_context.get('sender'),
-                            payload={'local_id': turn.end_local_id, 'error': repr(e)[:300]},
-                        )
-                    except Exception:
-                        pass
-        # Close conversation windows whose debounce timer elapsed even when no
-        # new message arrives.  Without this, a single image + wake word can sit
-        # in memory forever waiting for another message to trigger the flush.
-        flushed_turns = flush_due()
-        # Reliable pipeline per-cycle drain: any open window whose debounce
-        # has expired must materialize a turn_job even on idle cycles, so a
-        # crash-recovered open window doesn't sit in the DB forever.
-        if (cfg or {}).get('reliable_pipeline', {}).get('enabled'):
-            _rl_db_path = ((cfg.get('reliable_pipeline') or {}).get('db_path')
-                           or str(ROOT / 'temp' / 'reliable_pipeline.sqlite'))
-            drain_due_pipeline(cfg=cfg, db_path=Path(_rl_db_path), now=time.time())
-        for turn in flushed_turns:
-            turn_cfg = turn.config or cfg
-            turn_target = turn.target or {}
-            if turn.target.get('admin_muted'):
-                for tt in targets:
-                    if tt.get('username') == turn.chat_id:
-                        _advance_cursor(tt, turn.end_local_id, 'deferred_flush')
-                        break
-                continue
-            if turn.image_paths and not turn.has_image_task_description() and not (turn.trigger_matched or turn.in_session):
-                _send_image_task_missing_guide(turn, turn_cfg, config_path=config_path, dry_run=args.dry_run)
-                for tt in targets:
-                    if tt.get('username') == turn.chat_id:
-                        _advance_cursor(tt, turn.end_local_id, 'deferred_flush')
-                        break
-                continue
-            try:
-                agg_msg = turn.to_generate_reply_message()
-                decision = generate_reply(agg_msg, turn_target, turn_cfg, config_path=config_path)
-                text = decision.reply_text
-                log('aggregator_flush_due target=%s local_id=%s intent=%s reason=%s reply=%r' % (
-                    turn_target.get('name'), turn.end_local_id, decision.intent, decision.reason, text))
-                if decision.should_reply and text and not args.dry_run:
-                    send_reply(text, turn_cfg.get('send_mode'), target=turn_target, before_local_id=turn.end_local_id, cfg=turn_cfg, config_path=config_path,
-                               mention_name=(turn.event_context or {}).get('mention_name') or (turn.event_context or {}).get('sender_display_name') or (turn.event_context or {}).get('sender_name') or (turn.event_context or {}).get('from_display_name'))
-                for tt in targets:
-                    if tt.get('username') == turn.chat_id:
-                        _advance_cursor(tt, turn.end_local_id, 'aggregator_flush')
-                        break
-            except Exception as e:
-                log('aggregator_flush_due_exception target=%s local_id=%s error=%r' % (
-                    turn_target.get('name'), turn.end_local_id, e))
-        if (new_count or flushed_turns) and not args.no_save_state:
+                        _rl_failed_targets.add(_rl_target_key)
+                        log('reliable_pipeline ingress_failure target=%s local_id=%s error=%s' % (
+                            t.get('name'), lid, err))
+                else:
+                    _advance_cursor(t, lid, 'durable_ingress')
+
+        # Reliable pipeline per-cycle drain
+        if _reliable_pipeline_globally_enabled(cfg):
+            drain_due_pipeline(cfg=cfg, db_path=_rl_db_path, now=time.time())
+        if new_count and not args.no_save_state:
             save_config(cfg, config_path)
             _audit_cursor_coverage(targets, consume=True)
         else:

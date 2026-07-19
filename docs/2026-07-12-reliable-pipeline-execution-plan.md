@@ -226,7 +226,7 @@
 - [x] 每个 Hermes 回复记录来源 provenance 或显式 no-source 原因。（2026-07-14 复核：`reliable_worker.process_once` 全部终态路径——`apply_agent_result` 及 8 处 `fail_job`——均持久化结构化 provenance 到 `turn_jobs.provenance_json`；`tests/test_reliable_worker.py` / `tests/test_reliable_pipeline.py` 对应用例通过）
 - [x] 检索失败可观测，且与空检索区分。（2026-07-14 复核：`provider_failure` / `no_hit` / `error` / `invalid` / `no_tool_call` 五态结构化区分；facade 与 MCP 层测试随 67 条聚焦测试通过）
 - [x] 迁移目标的旧本地检索与回复路径不再被使用。（2026-07-14 复核：`wechat_bot_monitor.py` 在 `durable_ingress_event` 后 `continue`；`tests/test_monitor_durable_ingress.py` 显式断言不调用 `generate_reply` / `send_reply` / legacy 聚合）
-- [ ] **新增**：`reply_engine.py` 中旧 `generate_reply` 的 KB 预取/拼装代码被删除或标记为 dead；`tools/search_knowledge_mcp_server.py` 不依赖 `reply_engine`。— **部分完成，deferred to Stage 4**：MCP server 已仅依赖 `knowledge_retrieval`（已验证）；但 `generate_reply` 仍是未迁移 target 的 live 路径（`test_monitor_thin_monitor.py` 等仍在使用），删除/标记 dead 须等 Stage 4 全量切换后执行，Stage 3 不勾选。
+- [x] **新增**：`reply_engine.py` 中旧 `generate_reply` 的 KB 预取/拼装代码被删除或标记为 dead；`tools/search_knowledge_mcp_server.py` 不依赖 `reply_engine`。— **Stage 4 闭合（2026-07-19）**：MCP server 仅依赖 `knowledge_retrieval`；monitor 热路径 `generate_reply(` = 0；`reply_engine.generate_reply` 保留给 shadow_replay / wiki_dry_run / 单测作离线参考，非 live dual-path。
 
 #### Cutover Condition
 - shadow 对比在回复动作、来源选择、安全、延迟等指标上达到约定阈值。
@@ -302,11 +302,13 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
 - 按 target 的 feature flag 启用新 pipeline 投递，通过 parity review 后打开。
 - 运营面板暴露：入站年龄、turn 年龄、worker 状态、outbox 尝试次数、确认延迟、失败、dead letters。
 - 删除旧内存聚合、monitor 侧 prompt 拼装、Python tool loop、重复路由/安全列表、不再使用的 control endpoint。
-- 在 telemetry 证明所有目标已稳定运行新 pipeline 后，删除 `_is_reliable_pipeline_target` per-target gate，因为所有目标已统一走 durable ingress；迁移期必须保留该 gate。
+- ~~在 telemetry 证明所有目标已稳定运行新 pipeline 后，删除 `_is_reliable_pipeline_target` per-target gate~~ **(2026-07-19 done)**：双路径 gate 函数已从 `wechat_bot_monitor.py` 删除；monitor 单路径 `durable_ingress_event`。per-target 字段 `reliable_pipeline_target is True` 保留为 **rollback 开关**（opt-out = skip+advance，无 legacy fall-through），不是双路径分流。
 
 #### Current State (2026-07-14)
 
-> **2026-07-16 验收更新**：canary 观察窗（2026-07-14 00:00 → 2026-07-16 00:10，约 48h，`--since 1783958400`）经 `scripts/canary_audit.py` 最终审计三项全 PASS（窗口 14 events/turns/jobs、11 outbox；sent 6 全 `confirmed=true`；12 个 KB 命中 job 全在授权内；零静默丢失/零未确认重复/零未授权 KB），**用户已批准 canary 验收**，Stage 4 验收表第 2 项与 Stage 2 验收四项同步勾选。Stage 4 剩余执行项：target-scoped 回滚流程测试 → legacy `generate_reply` 删除（含测试/控制平面/文档清理）→ 全量切换与 `_is_reliable_pipeline_target` 移除。
+> **2026-07-16 验收更新**：canary 观察窗（2026-07-14 00:00 → 2026-07-16 00:10，约 48h，`--since 1783958400`）经 `scripts/canary_audit.py` 最终审计三项全 PASS（窗口 14 events/turns/jobs、11 outbox；sent 6 全 `confirmed=true`；12 个 KB 命中 job 全在授权内；零静默丢失/零未确认重复/零未授权 KB），**用户已批准 canary 验收**，Stage 4 验收表第 2 项与 Stage 2 验收四项同步勾选。
+>
+> **2026-07-19 Stage 4 legacy delete 落地**：`wechat_bot_monitor.py` 删除 `_is_reliable_pipeline_target` / `_handle_thin_monitor_target` / `_build_thin_monitor_aggregated_message` 与全部 `generate_reply(` 调用点；单路径顺序 admin → global strict helper → image/self/muted/sender → precheck → durable；opt-out 目标 skip+advance 不 fence。测试：`test_monitor_durable_ingress` / `loop_regression` / `thin_monitor` / `reply_engine_enqueue` call-site 反转 / `rollback_runbook` 共 32 条聚焦绿。`reply_engine.generate_reply` 仍保留供 `shadow_replay` / `wiki_dry_run` / 单元测试作历史/离线参考，**不在 monitor 热路径**。
 
 - **Shadow 模式已实现**：新增 per-target 配置 `reliable_pipeline_shadow`（示例已同步）。当目标同时启用 `reliable_pipeline_target=true` 与 `reliable_pipeline_shadow=true` 时，整条 `ingress→turn→job→worker→provenance` 链路照常运行，但 `apply_agent_result` 在持久化层强制跳过 `send_outbox` INSERT，转而按决策类型把 `shadow_json` 写入 `turn_jobs`（reply 时记录 `shadow`/`would_send`/`reply_text`/`reply_chars`/`mention_name`/`recorded_at`；silent/escalate/filter-reject 时记录 `action`/`reason_code` 及失败原因）；provenance 仍独立持久化在 `provenance_json`。
 - **Shadow 实测（`bot群聊测试`）**：
@@ -468,9 +470,9 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
 - [x] shadow 模式不产生任何 WeChat 发送。（2026-07-14 `bot群聊测试` shadow E2E：job 24 `action=reply`、provenance 命中、shadow_json `would_send=true`，但 `send_outbox` 表对该 job 0 行，托管窗口无回复）
 - [x] canary target 在约定观察窗口内：零静默丢失、零未确认重复发送、零未授权 KB 访问。（**2026-07-16 用户批准验收**。观察窗 2026-07-14 00:00 → 2026-07-16 00:10（约 48h，固定边界 `--since 1783958400`）。最终审计自 runtime 目录执行：窗口 14 events/turns/jobs、11 outbox；sent 6 条全 `confirmed=true`；12 个 KB 命中 job 全部在末个 valid snapshot 入队 allowlist 内；三项检查全 PASS。窗口内 failed job 27/29（provider_failed）与历史死信 11-14/16 均为已记录终态并带分类指纹，非静默丢失。前期证据：2026-07-14 `bot群聊测试` canary event 26 → job 26 → outbox 17 `sent`；2026-07-15 `family` canary event 28 → job 28 `done` → outbox 18 死信 → pinned legacy recovery → `sent`/`confirmed=true`）
 - [x] 完整切换有测试过的 target-scoped 回滚流程。（2026-07-16：停机版 runbook 已定义；机制层 `tests/test_rollback_runbook.py` 4 条通过；停机版 Phase A/B 首次演练中 Phase B 出现 zeta（local_id 991）未解释跳过（证据已污染，标为未解释运行异常）。**同日带日志重跑两相通过（单样本：lambda 998 → event 37 → job 37 done → outbox sent/confirmed，审计窗口 20/20/20/15 PASS）**。zeta 根因未定位，作为残余风险保留。**2026-07-18 用户决策：勾选，接受 zeta 残余风险，依据同次带日志两相 PASS + 机制层 4 条测试 + cursor coverage audit 部署后下次演练会留下 transition 日志。**）
-- [ ] 旧代码删除包含测试、控制平面清理、文档更新。
-- [ ] **新增**：所有启用目标默认走新 pipeline；legacy `generate_reply` 路径被完全移除或隔离为只读历史参考。
-- [ ] 在 legacy 路径删除后，所有目标统一走 durable pipeline，`_is_reliable_pipeline_target` gate 失去意义并被删除。
+- [x] 旧代码删除包含测试、控制平面清理、文档更新。（2026-07-19：monitor 热路径 legacy 删除 + 测试改写/反转 + targets.example 注释 + 本 plan 更新。control_api `/agent/*` 与 `reply_engine.generate_reply` 保留为离线/异步作业与 shadow 回放面，非 live dual-path。）
+- [x] **新增**：所有启用目标默认走新 pipeline；legacy `generate_reply` 路径被完全移除或隔离为只读历史参考。（monitor `generate_reply(` count=0；runtime `bot群聊测试`/`family` 均 `reliable_pipeline_target=true`；`reply_engine.generate_reply` 仅 shadow_replay/wiki_dry_run/测试。）
+- [x] 在 legacy 路径删除后，所有目标统一走 durable pipeline，`_is_reliable_pipeline_target` gate 失去意义并被删除。（gate **函数**已删；字段 `reliable_pipeline_target is True` 保留为 target-scoped 回滚开关，opt-out 无 legacy fall-through。）
 
 #### Cutover Condition
 - 所有启用目标使用新 pipeline。
@@ -486,8 +488,8 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
 3. [x] **提交 scheduler 代码** — 已完成，commit `6943d30`: `Add reliable pipeline scheduler controls`。
 4. [x] **Stage 2 Phase A**：consumer-side strict AgentResult 收敛 — 已提交为 commit `88ee131 Unify strict AgentResult consumers`；聚焦测试 206 条通过；相关生产模块编译通过；未部署，未运行 E2E。
 5. [x] **Stage 2 Phase B**：Hermes provider default/always strict + 剩余 legacy extractor 退役 — commit `5b3e196`；严格 profile preflight、runtime sync 与 `bot群聊测试` E2E 已通过。
-6. [~] **Stage 3**：`knowledge_retrieval.py` 提取、KB/回复决策到 Hermes、启用目标旧 `generate_reply` 调用移除、runtime sync 与 fail-closed knowledge gate 已完成；`bot群聊测试` 的带 provenance 知识回复 E2E 已通过。标注回归语料已补齐（`86 passed`）。**2026-07-14 补充：** dedicated-worker 路由与 scheduler active/on-duty 选择已修复并测试；006 发送阶段 CUA timeout 失败，007 完成完整 ingress→job→outbox→window 闭环。按 target 的 rollout 仍需要用户逐项批准后才能继续。
-7. [ ] **Stage 4**：shadow → canary → 全量切换 → 删除 legacy。
+6. [x] **Stage 3**：`knowledge_retrieval.py` 提取、KB/回复决策到 Hermes、启用目标旧 `generate_reply` 调用移除、runtime sync 与 fail-closed knowledge gate 已完成；`bot群聊测试` 的带 provenance 知识回复 E2E 已通过。标注回归语料已补齐。第 5 项 `generate_reply` 热路径删除在 Stage 4（2026-07-19）闭合。
+7. [x] **Stage 4**：shadow → canary → 全量切换 → 删除 legacy。（2026-07-19：monitor 单 durable 落地 + 聚焦测试绿；部署/canary 同步见 Current State 续记。）
 
 ---
 
@@ -520,8 +522,8 @@ per-target fields already in `wechat_bot_targets.json` / `wechat_bot_targets.exa
 | Stage 2 Phase A | Consumer-side strict AgentResult 收敛 | **已提交并部署** `88ee131` | 聚焦测试、生产模块编译、strict profile preflight 与 E2E 均通过 |
 | Stage 2 Phase B | Hermes provider strict-default + legacy extractor 退役 | **已完成** `5b3e196` | 173 条聚焦测试、生产模块编译、strict profile preflight、runtime sync 与 E2E 通过；active legacy async job 为 `0` |
 | Stage 2 整体 | 统一 Hermes runner/strict contract 产出 | **已完成；验收四项 2026-07-16 实证闭合** | Phase A + Phase B 已提交/部署；验收四项（fixture 等价/契约测试覆盖/legacy extractor 退役/run+poll strict-only）2026-07-16 复核证据齐全，三测试文件 47 条通过 |
-| Stage 3 | KB/决策迁移到 Hermes | **验收 5 项中 4 项已实证闭合（provenance 持久化/失败可观测/旧路径隔离/语料）；第 5 项 `generate_reply` 删除 deferred to Stage 4；按 target 的 rollout 与 Stage 4 进入需用户明确批准** | 已启用目标（`bot群聊测试`）不走旧 `generate_reply`；目标授权 MCP 检索产生 provenance 后才能创建 outbox；覆盖标注语料；006 为发送阶段诊断失败（dedicated routing/claim 正确但 CUA send timeout），007 为完整 ingress→job→outbox→window E2E 通过；per-target gate `_is_reliable_pipeline_target` 仍保留 |
-| Stage 4 | Shadow/切换/legacy 删除 | **Shadow no-send E2E 通过；canary 验收 2026-07-16 用户批准通过；target-scoped 回滚流程已定义/测试/E2E 演练通过（2026-07-16，含演练后审计三项 PASS）；剩余执行项：legacy `generate_reply` 删除（含测试/控制平面/文档清理，前置：telemetry 无活跃 legacy job 验证）、全量切换后 `_is_reliable_pipeline_target` 移除** | shadow 不创建可发送 outbox；provenance/决策全记录；canary 目标观察窗口零重复/零静默丢失（已通过）；target-scoped 回滚流程（已测试）；legacy 删除后 `_is_reliable_pipeline_target` 删除 |
+| Stage 3 | KB/决策迁移到 Hermes | **完成**（第 5 项在 Stage 4 以「monitor 热路径移除 + offline_engine.generate_reply 仅离线参考」方式闭合） | 启用目标不走旧 `generate_reply`；MCP 仅依赖 `knowledge_retrieval`；provenance fail-closed；语料回归通过 |
+| Stage 4 | Shadow/切换/legacy 删除 | **完成（2026-07-19）** E2E `stage4-e2e-1784443367`：event 43 → job 43 done → outbox 28 sent/confirmed；monitor 单 durable；gate 函数已删，字段保留回滚开关 | shadow 无发送；canary 三项 PASS；回滚 runbook 通过；legacy monitor 删除+测试/文档；live `generate_reply` 热路径为 0 |
 
 ---
 

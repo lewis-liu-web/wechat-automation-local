@@ -559,10 +559,13 @@ def test_scoped_snapshot_immutable_after_enqueue():
         assert payload.get("_allowed_kb_ids") == ["scene.a", "scene.b"]
 
 
-def test_monitor_generate_reply_call_sites_pass_config_path():
-    """All three monitor call sites must pass the same config file through."""
+def test_monitor_generate_reply_call_sites_removed_by_stage4():
+    """Stage 4 retires the legacy aggregation in wechat_bot_monitor — no
+    generate_reply call sites should remain. reply_engine itself still uses
+    generate_reply; this assertion is scoped to the monitor source.
+    """
     src = (Path(__file__).resolve().parent.parent / "wechat_bot_monitor.py").read_text(encoding="utf-8")
-    assert src.count("generate_reply(agg_msg, t, cfg, config_path=config_path)") == 2  # thin + main loop
-    assert "generate_reply(agg_msg, turn_target, turn_cfg, config_path=config_path)" in src  # aggregator flush
-    assert "generate_reply(agg_msg, t, cfg)" not in src
-    assert "generate_reply(agg_msg, turn_target, turn_cfg)" not in src
+    assert src.count("generate_reply(") == 0, (
+        "wechat_bot_monitor still has generate_reply call sites; Stage 4 "
+        "should have retired the legacy aggregation path."
+    )
