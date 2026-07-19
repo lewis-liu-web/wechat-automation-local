@@ -1410,6 +1410,19 @@ def generate_reply(message: Dict[str, Any] | str,
                    target: Dict[str, Any] | None = None,
                    config: Dict[str, Any] | None = None,
                    config_path: str | None = None) -> ReplyDecision:
+    """Offline / historical reply entry point (NOT the live monitor path).
+
+    Stage 4 removed every ``generate_reply(`` call site from
+    ``wechat_bot_monitor``. Live traffic uses durable ingress → Hermes worker.
+
+    Remaining legitimate callers:
+      * ``scripts/shadow_replay.py`` — legacy chain comparison harness
+      * ``wiki_dry_run.py`` — CLI dry-run
+      * unit tests under ``tests/test_reply_engine_*``
+
+    Do not reintroduce this into the monitor hot path. Prefer
+    ``durable_ingress_event`` / reliable pipeline for production.
+    """
     config = config or {}
     target = target or {}
     agent_mode = _agent_mode(config, target)
