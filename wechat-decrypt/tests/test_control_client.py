@@ -91,3 +91,29 @@ def test_agent_instance_off_duty_builds_url():
     req = mock.call_args[0][0]
     assert req.full_url == "http://127.0.0.1:18590/agent/instance/hermes-a/off-duty"
 
+
+
+def test_reliable_pipeline_status_builds_url():
+    mock = _mock_urlopen({"enabled": True, "dead_letters": []})
+    with patch("urllib.request.urlopen", mock):
+        control_client.reliable_pipeline_status()
+    req = mock.call_args[0][0]
+    assert req.full_url == "http://127.0.0.1:18590/reliable-pipeline/status"
+
+
+def test_reliable_scheduler_status_builds_url():
+    mock = _mock_urlopen({"running": True})
+    with patch("urllib.request.urlopen", mock):
+        control_client.reliable_scheduler_status()
+    req = mock.call_args[0][0]
+    assert req.full_url == "http://127.0.0.1:18590/reliable-pipeline/scheduler/status"
+
+
+def test_requeue_reliable_outbox_builds_url_and_body():
+    mock = _mock_urlopen({"action": "requeued"})
+    with patch("urllib.request.urlopen", mock):
+        control_client.requeue_reliable_outbox(16, "ops recovery")
+    req = mock.call_args[0][0]
+    assert req.full_url == "http://127.0.0.1:18590/reliable-pipeline/outbox/16/requeue"
+    sent = json.loads(req.data.decode("utf-8"))
+    assert sent["reason"] == "ops recovery"

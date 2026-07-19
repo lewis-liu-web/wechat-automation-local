@@ -492,6 +492,37 @@ def stop_async_loop(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     return _request("POST", "/agent/async-loop/stop", base_url=base_url, body={}, timeout=10)
 
 
+def reliable_pipeline_status(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """GET /reliable-pipeline/status — counts + sanitized dead-letter archive."""
+    return _request("GET", "/reliable-pipeline/status", base_url=base_url)
+
+
+def reliable_scheduler_status(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """GET /reliable-pipeline/scheduler/status."""
+    return _request("GET", "/reliable-pipeline/scheduler/status", base_url=base_url)
+
+
+def reliable_scheduler_start(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    return _request("POST", "/reliable-pipeline/scheduler/start", base_url=base_url, body={}, timeout=10)
+
+
+def reliable_scheduler_stop(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    return _request("POST", "/reliable-pipeline/scheduler/stop", base_url=base_url, body={}, timeout=10)
+
+
+def requeue_reliable_outbox(outbox_id: int, reason: str,
+                            base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """POST safe requeue for a dead-letter (refuses when send_started_at set)."""
+    return _request(
+        "POST",
+        "/reliable-pipeline/outbox/%s/requeue" % int(outbox_id),
+        base_url=base_url,
+        body={"reason": str(reason or "").strip()},
+        timeout=15,
+    )
+
+
+
 __all__ = [
     "ControlAPIError",
     "DEFAULT_BASE_URL",
@@ -564,4 +595,9 @@ __all__ = [
     "async_loop_status",
     "start_async_loop",
     "stop_async_loop",
+    "reliable_pipeline_status",
+    "reliable_scheduler_status",
+    "reliable_scheduler_start",
+    "reliable_scheduler_stop",
+    "requeue_reliable_outbox",
 ]

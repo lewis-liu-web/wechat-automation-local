@@ -111,11 +111,12 @@ class TestStatusRoute:
         assert isinstance(resp["dead_letters"], list)
         assert len(resp["dead_letters"]) == 1
         dl = resp["dead_letters"][0]
-        # Strict whitelist: only ids/status/numerics/timestamps leak.
+        # Strict whitelist: only ids/status/numerics/timestamps (+ requeue_safe) leak.
         assert dl == {"id": 11, "job_id": 7, "target_id": "wxid_t",
                       "group_key": "wxid_t", "status": "dead_letter",
                       "attempts": 5, "max_attempts": 5,
-                      "created_at": 1.0, "dead_at": 2.0, "next_attempt_at": 3.0}
+                      "created_at": 1.0, "dead_at": 2.0, "next_attempt_at": 3.0,
+                      "send_started_at": None, "requeue_safe": True}
         # No body leak in any field.
         assert "LEAK" not in json.dumps(resp)
         # Configured db_path was forwarded to BOTH calls.

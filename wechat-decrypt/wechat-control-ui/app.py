@@ -85,6 +85,11 @@ from api import (  # noqa: E402
     stop_async_loop,
     stop_monitor,
     restart_monitor,
+    reliable_pipeline_status,
+    reliable_scheduler_status,
+    reliable_scheduler_start,
+    reliable_scheduler_stop,
+    requeue_reliable_outbox,
 )
 
 # --- 关闭所有 Streamlit 自带 UI 噪声（Deploy / 菜单 / GitHub / 工具栏） ---
@@ -309,6 +314,16 @@ def _load_data():
     except ControlAPIError:
         if "default_triggers_result" not in st.session_state:
             st.session_state.default_triggers_result = []
+    try:
+        st.session_state.reliable_pipeline_result = reliable_pipeline_status(base_url=base)
+    except ControlAPIError:
+        if "reliable_pipeline_result" not in st.session_state:
+            st.session_state.reliable_pipeline_result = None
+    try:
+        st.session_state.reliable_scheduler_result = reliable_scheduler_status(base_url=base)
+    except ControlAPIError:
+        if "reliable_scheduler_result" not in st.session_state:
+            st.session_state.reliable_scheduler_result = None
     st.session_state.data_loaded = True
 
 
@@ -407,12 +422,37 @@ def _sidebar():
                 st.success("%d 个" % enabled_n)
             else:
                 st.warning("0 个 — monitor 运行中但没有任何目标被监听")
+            # Stage 5: durable pipeline health (single-durable monitor)
+            rp = st.session_state.get("reliable_pipeline_result") or {}
+            sch = st.session_state.get("reliable_scheduler_result") or {}
+            st.markdown("**可靠管线**")
+            if rp.get("enabled"):
+                sch_ok = bool(sch.get("running") or sch.get("thread_alive"))
+                dl_n = 0
+                try:
+                    dl_n = int(((rp.get("counts") or {}).get("send_outbox") or {}).get("dead_letter") or 0)
+                except (TypeError, ValueError):
+                    dl_n = len(rp.get("dead_letters") or [])
+                allow = "仅白名单发送" if rp.get("test_target_only") else "全目标可发送"
+                line = "已启用 · 调度%s · 死信 %d · %s" % (
+                    "运行中" if sch_ok else "已停",
+                    dl_n,
+                    allow,
+                )
+                if sch_ok:
+                    st.success(line)
+                else:
+                    st.warning(line)
+            elif rp:
+                st.caption("可靠管线：全局未启用（config.reliable_pipeline.enabled）")
+            else:
+                st.caption("可靠管线状态读取失败")
         else:
             st.warning("状态读取失败")
         if st.button("🔄 刷新数据", use_container_width=True):
             _clear_data_cache()
             st.rerun()
-        st.caption("agent-agnostic：UI 不依赖任何具体 agent 客户端。")
+        st.caption("Stage 4+ · 单 durable 热路径 · UI 经 control_api")
 
 
 def _kv_table(rows, headers):
@@ -622,6 +662,16 @@ def _page_targets():
                     len(t.get("triggers") or []),
                     len(t.get("knowledge_bases") or []),
                 ))
+                durable_on = t.get("reliable_pipeline_target") is True
+                shadow_on = bool(t.get("reliable_pipeline_shadow"))
+                st.caption(
+                    "可靠管线：%s%s · 专用实例：%s"
+                    % (
+                        "已 opt-in（durable）" if durable_on else "未 opt-in（回滚/跳过推进）",
+                        " · shadow" if shadow_on else "",
+                        (t.get("dedicated_agent_instance_id") or "通用池") or "通用池",
+                    )
+                )
                 bound_kb_ids = [x for x in (t.get("knowledge_bases") or []) if x in kb_id_to_source]
                 if not bound_kb_ids:
                     st.caption("当前 KB 来源：未绑定")
@@ -640,7 +690,7 @@ def _page_targets():
                 mc[0].metric("已读到ID", t.get("last_local_id") or 0)
                 mc[1].metric("触发词", len(t.get("triggers") or []))
                 mc[2].metric("知识库", len(t.get("knowledge_bases") or []))
-                mc[3].metric("状态", status_label)
+                mc[3].metric("Durable", "ON" if durable_on else "OFF")
                 # Response-mode / session-policy editor; only meaningful once the target is enabled.
                 if t.get("enabled"):
                     with st.expander("响应模式 / 会话策略", expanded=False):
@@ -763,29 +813,55 @@ def _page_targets():
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
-                    with st.expander("薄化模式 / Agent 工具模式", expanded=False):
-                        st.caption("薄化模式：monitor 只负责监听和发送，知识库检索、视觉、会话管理都交给 agent 侧。需在 Hermes 配置中注册 wechat_auto skill 与 wechat/leann MCP server。")
-                        thin_monitor = st.toggle(
-                            "启用薄化模式",
-                            value=bool(t.get("thin_monitor")),
-                            key="thin_monitor_%s" % widget_key,
+                    with st.expander("可靠管线 opt-in / 回滚", expanded=False):
+                        st.caption(
+                            "Stage 4 后 monitor 仅走 durable 热路径。"
+                            "reliable_pipeline_target=True 时入站写入可靠管线；"
+                            "False 时 skip+advance（无 legacy fall-through），用于单目标回滚。"
+                            "多 target 本就支持：bot群聊测试 / family 等可同时 opt-in。"
                         )
-                        if st.button("保存薄化模式", key="save_thin_monitor_%s" % widget_key, use_container_width=False):
+                        durable_toggle = st.toggle(
+                            "启用可靠管线（durable opt-in）",
+                            value=bool(t.get("reliable_pipeline_target") is True),
+                            key="rpl_target_%s" % widget_key,
+                        )
+                        shadow_toggle = st.toggle(
+                            "Shadow（跑管线但不发微信）",
+                            value=bool(t.get("reliable_pipeline_shadow")),
+                            key="rpl_shadow_%s" % widget_key,
+                            help="仅在 opt-in 时生效。",
+                        )
+                        if st.button("保存可靠管线开关", key="save_rpl_%s" % widget_key, use_container_width=False):
                             try:
-                                set_target_field(action_key, "thin_monitor", thin_monitor, base_url=base)
-                                st.success("已%s薄化模式" % ("启用" if thin_monitor else "关闭"))
+                                set_target_field(action_key, "reliable_pipeline_target", bool(durable_toggle), base_url=base)
+                                set_target_field(action_key, "reliable_pipeline_shadow", bool(shadow_toggle), base_url=base)
+                                st.success("已保存 durable=%s shadow=%s" % (durable_toggle, shadow_toggle))
                                 _clear_data_cache()
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
-                        st.divider()
+                    with st.expander("Agent 工具模式（离线/历史字段）", expanded=False):
+                        st.caption(
+                            "生产热路径是 durable → Hermes worker，不再是 monitor 薄化双路径。"
+                            "下列字段仅影响历史 offline 面 / 载荷元数据，请勿当作「启用 thin monitor 双路径」。"
+                        )
+                        if t.get("thin_monitor"):
+                            st.warning("配置中仍存 thin_monitor=true（遗留）。对 live monitor 无双路径效果。可清除。")
+                            if st.button("清除 thin_monitor 遗留字段", key="clear_thin_%s" % widget_key):
+                                try:
+                                    set_target_field(action_key, "thin_monitor", False, base_url=base)
+                                    st.success("已清除 thin_monitor")
+                                    _clear_data_cache()
+                                    st.rerun()
+                                except ControlAPIError as e:
+                                    st.error("清除失败：%s" % (e,))
                         agent_mode_options = [("标准（Python 侧预检索）", "standard"), ("工具 Agent（Hermes MCP 工具循环）", "tool_agent")]
                         valid_agent_modes = {v for _, v in agent_mode_options}
                         current_agent_mode = t.get("agent_mode") or "standard"
                         if current_agent_mode not in valid_agent_modes:
                             current_agent_mode = "standard"
                         selected_agent_label = st.selectbox(
-                            "Agent 工具模式",
+                            "Agent 工具模式（payload 元数据）",
                             options=[label for label, _ in agent_mode_options],
                             index=[v for _, v in agent_mode_options].index(current_agent_mode),
                             key="agent_mode_%s" % widget_key,
@@ -2106,9 +2182,152 @@ def _page_agent_jobs():
         st.json(rows)
 
 
+
+def _page_reliable_pipeline():
+    """Stage 5: reliable pipeline ops — counts, scheduler, dead-letter archive."""
+    st.header("可靠管线")
+    st.caption(
+        "Stage 4 单 durable 热路径。死信默认归档：仅当 send_started_at 为空时可安全 requeue "
+        "（否则有重复发送风险）。多 target 已支持：bot群聊测试 / family 等可同时 opt-in。"
+    )
+    base = st.session_state.base_url
+    if st.button("刷新管线状态", key="rpl_refresh"):
+        try:
+            st.session_state.reliable_pipeline_result = reliable_pipeline_status(base_url=base)
+            st.session_state.reliable_scheduler_result = reliable_scheduler_status(base_url=base)
+        except ControlAPIError as e:
+            st.error("刷新失败：%s" % (e,))
+        st.rerun()
+
+    rp = st.session_state.get("reliable_pipeline_result")
+    sch = st.session_state.get("reliable_scheduler_result")
+    if rp is None:
+        try:
+            rp = reliable_pipeline_status(base_url=base)
+            st.session_state.reliable_pipeline_result = rp
+        except ControlAPIError as e:
+            st.error("管线状态不可用：%s" % (e,))
+            rp = {}
+    if sch is None:
+        try:
+            sch = reliable_scheduler_status(base_url=base)
+            st.session_state.reliable_scheduler_result = sch
+        except ControlAPIError as e:
+            st.warning("调度状态不可用：%s" % (e,))
+            sch = {}
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("管线启用", "是" if rp.get("enabled") else "否")
+    c2.metric("发送白名单", "开" if rp.get("test_target_only") else "关")
+    c3.metric("DB", rp.get("db_status") or "?")
+    c4.metric("调度", "运行" if (sch.get("running") or sch.get("thread_alive")) else "停止")
+
+    if rp.get("test_target_only"):
+        st.info("test_target_only=开：仅白名单目标可实际发送。当前常见白名单含 bot群聊测试、family。")
+
+    counts = rp.get("counts") or {}
+    st.subheader("计数")
+    rows = []
+    for table, bag in sorted(counts.items()):
+        if isinstance(bag, dict):
+            for status_name, n in sorted(bag.items()):
+                rows.append({"表": table, "状态": status_name, "数量": n})
+        else:
+            rows.append({"表": table, "状态": "", "数量": bag})
+    if rows:
+        st.table(rows)
+    else:
+        st.caption("无计数（DB 不可用或空）。")
+
+    st.subheader("调度器")
+    sc1, sc2 = st.columns(2)
+    if sc1.button("启动调度", key="rpl_sch_start"):
+        try:
+            res = reliable_scheduler_start(base_url=base)
+            st.success(str(res.get("action") or res))
+            st.session_state.reliable_scheduler_result = reliable_scheduler_status(base_url=base)
+            st.rerun()
+        except ControlAPIError as e:
+            st.error("启动失败：%s" % (e,))
+    if sc2.button("停止调度", key="rpl_sch_stop"):
+        try:
+            res = reliable_scheduler_stop(base_url=base)
+            st.success(str(res.get("action") or res))
+            st.session_state.reliable_scheduler_result = reliable_scheduler_status(base_url=base)
+            st.rerun()
+        except ControlAPIError as e:
+            st.error("停止失败：%s" % (e,))
+    st.json({
+        "running": sch.get("running"),
+        "thread_alive": sch.get("thread_alive"),
+        "iterations": sch.get("iterations"),
+        "interval": sch.get("interval"),
+        "last_error": sch.get("last_error") or "",
+        "last_worker": sch.get("last_worker"),
+        "last_sender": sch.get("last_sender"),
+    })
+
+    st.subheader("死信归档（只读为主）")
+    st.caption(
+        "历史 dead_letter 在 send_started_at 非空时只能归档，不可安全 requeue。"
+        "控制台仅对 requeue_safe=true 的行显示 requeue 按钮。"
+    )
+    dls = rp.get("dead_letters") or []
+    if not dls:
+        st.success("当前无死信。")
+    else:
+        table = []
+        for d in dls:
+            table.append({
+                "outbox_id": d.get("id"),
+                "job_id": d.get("job_id"),
+                "target_id": d.get("target_id"),
+                "attempts": "%s/%s" % (d.get("attempts"), d.get("max_attempts")),
+                "requeue_safe": "是" if d.get("requeue_safe") else "否（归档）",
+                "created_at": d.get("created_at"),
+                "dead_at": d.get("dead_at"),
+            })
+        st.table(table)
+        safe_ids = [d.get("id") for d in dls if d.get("requeue_safe") and d.get("id") is not None]
+        if not safe_ids:
+            st.warning("本页所有死信均为 post-send-start 归档，已禁用 requeue。")
+        else:
+            pick = st.selectbox("可安全 requeue 的 outbox", options=safe_ids, key="rpl_safe_pick")
+            reason = st.text_input("requeue 原因（必填）", key="rpl_requeue_reason", placeholder="ops recovery after pre-send failure")
+            if st.button("安全 requeue", key="rpl_do_requeue"):
+                if not (reason or "").strip():
+                    st.error("原因必填")
+                else:
+                    try:
+                        res = requeue_reliable_outbox(int(pick), reason.strip(), base_url=base)
+                        st.success("已 requeue：%s" % (res,))
+                        st.session_state.reliable_pipeline_result = reliable_pipeline_status(base_url=base)
+                        st.rerun()
+                    except ControlAPIError as e:
+                        st.error("requeue 拒绝/失败：%s" % (e,))
+
+    st.subheader("已 opt-in 的监听目标")
+    targets = [t for t in (st.session_state.get("targets_all") or []) if t.get("reliable_pipeline_target") is True]
+    if not targets:
+        st.caption("没有 reliable_pipeline_target=True 的目标。")
+    else:
+        st.table([
+            {
+                "name": t.get("name"),
+                "enabled": bool(t.get("enabled")),
+                "shadow": bool(t.get("reliable_pipeline_shadow")),
+                "dedicated": t.get("dedicated_agent_instance_id") or "",
+                "last_local_id": t.get("last_local_id"),
+            }
+            for t in targets
+        ])
+
+
+
 PAGES = [
     ("总览", _page_overview),
     ("监听目标", _page_targets),
+    ("可靠管线", _page_reliable_pipeline),
     ("触发词", _page_triggers),
     ("知识库", _page_knowledge),
     ("Agent 任务", _page_agent_jobs),

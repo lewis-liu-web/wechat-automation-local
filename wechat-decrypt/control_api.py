@@ -915,6 +915,10 @@ _RELIABLE_DEAD_LETTER_FIELDS: Tuple[str, ...] = (
     "status",
     "attempts", "max_attempts",
     "created_at", "dead_at", "next_attempt_at",
+    # Stage 5 console: operators need send_started_at to know whether the
+    # safe requeue path will accept the row (NULL only).  Scalar timestamp
+    # only — never reply_text / error / result_json.
+    "send_started_at",
 )
 _RELIABLE_PROCESSED_FIELDS: Tuple[str, ...] = (
     "outbox_id", "target_id", "ok",
@@ -1006,8 +1010,19 @@ def _sanitize_send_once_result(result: Any) -> Dict[str, Any]:
 
 
 def _sanitize_dead_letter(row: Any) -> Optional[Dict[str, Any]]:
-    """Project a dead-letter row down to scalar metadata only."""
-    return _project_row(row, _RELIABLE_DEAD_LETTER_FIELDS)
+    """Project a dead-letter row down to scalar metadata only.
+
+    Also stamps ``requeue_safe`` so the control console can disable the
+    requeue button when ``send_started_at`` is set (post-send-start archive).
+    """
+    projected = _project_row(row, _RELIABLE_DEAD_LETTER_FIELDS)
+    if projected is None:
+        return None
+    # Always surface the key so UI clients need not special-case missing fields.
+    if "send_started_at" not in projected:
+        projected["send_started_at"] = None
+    projected["requeue_safe"] = projected.get("send_started_at") is None
+    return projected
 
 
 def _reliable_worker_run_once(body: Dict[str, Any]) -> Dict[str, Any]:

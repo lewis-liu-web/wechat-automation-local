@@ -102,3 +102,15 @@ ROADMAP.md
 GEMINI.md
 SECURITY.md
 worker_out*.txt
+
+# Stage 5 hygiene: one-off patch scripts and local canary/temp DBs
+/rr_*.py
+/residual_*.py
+/fix_*.py
+/t1.py
+/ttfix1.py
+/reconstruct_*.py
+wechat-decrypt/temp_test_*.sqlite
+wechat-decrypt/temp_test_*.sqlite-*
+**/temp_test_canary*.sqlite
+**/temp_test_canary*.sqlite-*
