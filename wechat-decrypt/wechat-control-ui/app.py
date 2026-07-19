@@ -848,13 +848,21 @@ def _page_targets():
                                 st.rerun()
                             except ControlAPIError as e:
                                 st.error("保存失败：%s" % (e,))
-                    with st.expander("Agent 工具模式（离线/历史字段）", expanded=False):
-                        st.caption(
-                            "生产热路径是 durable → Hermes worker，不再是 monitor 薄化双路径。"
-                            "下列字段仅影响历史 offline 面 / 载荷元数据，请勿当作「启用 thin monitor 双路径」。"
+                    with st.expander("已废弃字段（勿用于生产）", expanded=False):
+                        st.info(
+                            "生产热路径：durable 入站 → 可靠管线 → Hermes worker。"
+                            "下面配置**不会**改变群聊 live 回复行为。"
                         )
+                        st.markdown(
+                            "- **真正有用的**：可靠管线 opt-in / shadow、响应模式、回复策略、"
+                            "触发词、知识库、专用 Agent、CUA 窗口标题、管理员设置。\n"
+                            "- **agent_mode / thin_monitor**：仅 shadow_replay 与历史 "
+                            "`generate_reply` 离线路径；monitor 已不读取。"
+                        )
+                        stored_mode = str(t.get("agent_mode") or "").strip() or "（未设置，历史默认 standard）"
+                        st.caption("当前配置中的 agent_mode 只读值：**%s**" % stored_mode)
                         if t.get("thin_monitor"):
-                            st.warning("配置中仍存 thin_monitor=true（遗留）。对 live monitor 无双路径效果。可清除。")
+                            st.warning("仍残留 thin_monitor=true。对 live monitor 无效果，建议清除。")
                             if st.button("清除 thin_monitor 遗留字段", key="clear_thin_%s" % widget_key):
                                 try:
                                     set_target_field(action_key, "thin_monitor", False, base_url=base)
@@ -863,26 +871,16 @@ def _page_targets():
                                     st.rerun()
                                 except ControlAPIError as e:
                                     st.error("清除失败：%s" % (e,))
-                        agent_mode_options = [("标准（Python 侧预检索）", "standard"), ("工具 Agent（Hermes MCP 工具循环）", "tool_agent")]
-                        valid_agent_modes = {v for _, v in agent_mode_options}
-                        current_agent_mode = t.get("agent_mode") or "standard"
-                        if current_agent_mode not in valid_agent_modes:
-                            current_agent_mode = "standard"
-                        selected_agent_label = st.selectbox(
-                            "Agent 工具模式（payload 元数据）",
-                            options=[label for label, _ in agent_mode_options],
-                            index=[v for _, v in agent_mode_options].index(current_agent_mode),
-                            key="agent_mode_%s" % widget_key,
-                        )
-                        selected_agent_mode = dict(agent_mode_options)[selected_agent_label]
-                        if st.button("保存 Agent 模式", key="save_agent_mode_%s" % widget_key, use_container_width=False):
-                            try:
-                                set_target_field(action_key, "agent_mode", selected_agent_mode, base_url=base)
-                                st.success("已切换 Agent 模式为：%s" % selected_agent_label)
-                                _clear_data_cache()
-                                st.rerun()
-                            except ControlAPIError as e:
-                                st.error("保存失败：%s" % (e,))
+                        if stored_mode and stored_mode != "（未设置，历史默认 standard）":
+                            if st.button("清除 agent_mode 遗留字段", key="clear_agent_mode_%s" % widget_key):
+                                try:
+                                    # Empty string clears target-level override in config field setter semantics.
+                                    set_target_field(action_key, "agent_mode", "", base_url=base)
+                                    st.success("已清除 agent_mode")
+                                    _clear_data_cache()
+                                    st.rerun()
+                                except ControlAPIError as e:
+                                    st.error("清除失败：%s" % (e,))
             with main_cols[1]:
                 if not t.get("enabled") and t.get("is_candidate"):
                     # Pre-pick category at enable time so the user can mark an
