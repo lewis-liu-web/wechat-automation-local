@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Local wiki + boundary reply engine for WeChat bot.
+"""Local wiki + boundary helpers for WeChat bot (OFFLINE SURFACE after Stage 4).
+
+**OFFLINE_SURFACE / historical path — not the live monitor hot path.**
+
+Live production traffic uses ``wechat_bot_monitor.durable_ingress_event`` →
+reliable pipeline → Hermes worker.  Do not reintroduce ``generate_reply`` into
+the monitor loop.
+
+Still used by:
+- ``scripts/shadow_replay.py`` (legacy chain comparison harness)
+- ``wiki_dry_run.py`` (CLI dry-run)
+- unit tests under ``tests/test_reply_engine_*``
+- shared helpers imported by monitor: ``precheck`` / ``postcheck`` /
+  ``DEFAULT_TRIGGERS`` / ``resolve_target_kb_ids`` (these remain live)
 
 V1 is dependency-free and safe-by-default:
 - local markdown wiki retrieval
