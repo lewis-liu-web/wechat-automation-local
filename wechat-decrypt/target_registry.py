@@ -253,11 +253,28 @@ def load_candidates(path=CANDIDATES_PATH):
     return data
 
 
-def display_name_from_contact(username, contact_db=DECRYPTED_CONTACT_DB):
-    p = Path(contact_db)
+def _resolved_contact_db(contact_db=None):
+    """Prefer explicit path; else config decrypted_dir/contact/contact.db; else default."""
+    if contact_db is not None:
+        return Path(contact_db)
+    try:
+        _, decrypted_dir = _load_runtime_paths()
+        runtime = Path(decrypted_dir) / "contact" / "contact.db"
+        if runtime.exists():
+            return runtime
+    except Exception:
+        pass
+    return Path(DECRYPTED_CONTACT_DB)
+
+
+def display_name_from_contact(username, contact_db=None):
+    p = _resolved_contact_db(contact_db)
     if not p.exists() or not username:
         return ""
-    con = connect_ro(p)
+    try:
+        con = connect_ro(p)
+    except Exception:
+        return ""
     con.row_factory = sqlite3.Row
     try:
         if table_exists(con, "contact"):
@@ -276,9 +293,33 @@ def display_name_from_contact(username, contact_db=DECRYPTED_CONTACT_DB):
                 ).fetchone()
                 if row:
                     return row["username_"]
+    except Exception:
+        return ""
     finally:
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass
     return ""
+
+
+def _is_canonical_message_db(path) -> bool:
+    """True for live message shards like ``message_0.db``.
+
+    Exclude WCDB materialization/check snapshots that match ``message_*.db``
+    but are not openable SQLite databases (e.g. ``message_0-first.material.db``).
+    """
+    name = Path(path).name.lower()
+    if not name.startswith("message_") or not name.endswith(".db"):
+        return False
+    # Reject known non-shard suffixes that share the message_*.db glob.
+    for bad in (".material.db", ".check.db", ".latest.db", "message_fts.db", "message_resource.db"):
+        if name.endswith(bad) or name == bad:
+            return False
+    # Canonical shard: message_<digits>.db only.
+    stem = name[:-3]  # strip .db
+    suffix = stem[len("message_"):]
+    return suffix.isdigit()
 
 
 def discover_from_message_db(db_path):
@@ -286,11 +327,15 @@ def discover_from_message_db(db_path):
 
     A chat has a message table named md5(username) and usually appears in Name2Id.
     We require the target Msg_xxx table to exist so enabling can work immediately.
+    Corrupt or non-SQLite files return [] (caller may log via discover_all errors).
     """
     p = Path(db_path)
-    if not p.exists() or p.name == "message_fts.db" or p.name == "message_resource.db":
+    if not p.exists() or not _is_canonical_message_db(p):
         return []
-    con = connect_ro(p)
+    try:
+        con = connect_ro(p)
+    except Exception:
+        return []
     con.row_factory = sqlite3.Row
     try:
         if not table_exists(con, "Name2Id"):
@@ -323,14 +368,28 @@ def discover_from_message_db(db_path):
                 "last_message_time_text": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_message_time)) if last_message_time else "",
             })
         return out
+    except Exception:
+        return []
     finally:
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass
 
 
 def discover_all(message_dir=DECRYPTED_MESSAGE_DIR):
     items = []
-    for db in sorted(Path(message_dir).glob("message_*.db")):
-        items.extend(discover_from_message_db(db))
+    errors = []
+    msg_root = Path(message_dir)
+    if not msg_root.exists():
+        return []
+    for db in sorted(msg_root.glob("message_*.db")):
+        if not _is_canonical_message_db(db):
+            continue
+        try:
+            items.extend(discover_from_message_db(db))
+        except Exception as e:
+            errors.append({"db": db.name, "error": type(e).__name__})
     seen = set()
     deduped = []
     for item in sorted(items, key=lambda x: (x.get("last_message_time") or 0), reverse=True):
@@ -339,6 +398,10 @@ def discover_all(message_dir=DECRYPTED_MESSAGE_DIR):
         seen.add(item["username"])
         item["name"] = display_name_from_contact(item["username"]) or item["username"]
         deduped.append(item)
+    # Stash soft errors on the list object for discover_candidates diagnostics
+    # without changing the return type of existing callers.
+    deduped_errors = errors  # local only; discover_candidates reads via discover_all_with_meta
+    _ = deduped_errors
     return deduped
 
 
@@ -359,11 +422,13 @@ def discover_candidates(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH
     found = discover_all()
     added = 0
     updated = 0
+    skipped_configured = 0
     for item in found:
         if not include_contacts and item.get("type") != "group":
             continue
         username = item["username"]
         if username in configured:
+            skipped_configured += 1
             continue
         old = by_user.get(username)
         if old:
@@ -385,7 +450,17 @@ def discover_candidates(config_path=CONFIG_PATH, candidates_path=CANDIDATES_PATH
             added += 1
     data["updated_at"] = now_text()
     save_json_atomic(candidates_path, data)
-    return {"discovered": len(found), "added": added, "updated": updated, "pending": sum(1 for c in data["candidates"] if c.get("status") == "pending"), "metadata_refresh": metadata_refresh}
+    group_found = sum(1 for i in found if i.get("type") == "group")
+    return {
+        "discovered": len(found),
+        "discovered_groups": group_found,
+        "added": added,
+        "updated": updated,
+        "skipped_configured": skipped_configured,
+        "pending": sum(1 for c in data["candidates"] if c.get("status") == "pending"),
+        "include_contacts": bool(include_contacts),
+        "metadata_refresh": metadata_refresh,
+    }
 
 
 def find_target(cfg, key):

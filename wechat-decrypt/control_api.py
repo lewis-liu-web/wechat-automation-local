@@ -2493,24 +2493,42 @@ def _agent_worker_stop() -> Dict[str, Any]:
 def _call_cli(args: List[str]) -> Tuple[bytes, int, str]:
     """Invoke manage_targets.main() with the given args and return its
     print_json output as the API response.
+
+    Pass the full argv (including flags like ``--include-contacts``).  Older
+    code dropped everything except the subcommand name, so console scan never
+    honored include_contacts and some commands printed nothing useful.
     """
     import io, contextlib
     buf = io.StringIO()
+    err = io.StringIO()
     rc = 0
-    with contextlib.redirect_stdout(buf):
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
         try:
-            mt.main(argv=[args[0]] + (["--json"] if "--json" in args else []))
+            rc = mt.main(argv=list(args))
+            if rc is None:
+                rc = 0
         except SystemExit as e:
             rc = e.code if isinstance(e.code, int) else 1
         except Exception as e:
             return _err("manage_targets error: %r" % (e,), status=500)
     out = buf.getvalue().strip()
+    err_out = err.getvalue().strip()
+    if rc not in (0, None) and not out:
+        return _err(
+            "manage_targets failed rc=%s%s" % (rc, (": " + err_out[:500]) if err_out else ""),
+            status=500,
+        )
     if not out:
-        return _ok(action=args[0])
+        return _ok(action=args[0] if args else "cli", rc=rc)
     try:
-        return _json(json.loads(out), 200)
+        payload = json.loads(out)
+        if isinstance(payload, dict):
+            payload.setdefault("ok", True)
+            if "action" not in payload and args:
+                payload["action"] = args[0]
+        return _json(payload, 200)
     except Exception:
-        return _ok(action=args[0], raw=out)
+        return _ok(action=args[0] if args else "cli", raw=out, rc=rc)
 
 
 # ---------------------------------------------------------------------------

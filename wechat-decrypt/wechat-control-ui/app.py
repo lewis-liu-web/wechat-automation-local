@@ -604,12 +604,20 @@ def _page_targets():
         st.write("")
         if st.button("扫描新目标", use_container_width=True):
             try:
-                with st.spinner("扫描中..."):
+                with st.spinner("扫描中（会刷新 contact/session 元数据）..."):
                     res = scan_targets(include_contacts=include_contacts, base_url=st.session_state.base_url)
                 added = int(res.get("added") or 0)
                 updated = int(res.get("updated") or 0)
                 discovered = int(res.get("discovered") or 0)
-                st.success("扫描完成：发现 %d 个，更新 %d 个，新增 %d 个" % (discovered, updated, added))
+                groups = int(res.get("discovered_groups") or 0)
+                pending = int(res.get("pending") or 0)
+                skipped = int(res.get("skipped_configured") or 0)
+                st.success(
+                    "扫描完成：会话 %d（群 %d）· 新增待启用 %d · 更新 %d · 已配置跳过 %d · 待启用池 %d"
+                    % (discovered, groups, added, updated, skipped, pending)
+                )
+                if added == 0 and discovered > 0:
+                    st.caption("没有新增：常见原因是群已在监听列表/待启用池，或名称未从 contact 库解析到。可切换「待启用」筛选查看。")
                 _clear_data_cache()
                 st.rerun()
             except ControlAPIError as e:
