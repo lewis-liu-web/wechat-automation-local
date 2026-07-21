@@ -321,6 +321,40 @@ class TestWikiKbScan(unittest.TestCase):
         self.assertEqual(workdocs["path"], "scenes/workdocs")
 
 
+    def test_get_kb_info_resolves_relative_path_via_wiki_dir(self):
+        """Relative local paths must resolve under wiki_dir, not process CWD."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        wiki = root / "wiki"
+        scene = wiki / "scenes" / "bus"
+        scene.mkdir(parents=True)
+        (scene / "a.md").write_text("hello", encoding="utf-8")
+        (scene / "b.md").write_text("world", encoding="utf-8")
+        cfg_path = root / "targets.json"
+        cfg_path.write_text(
+            json.dumps({
+                "wiki_dir": "wiki",
+                "knowledge_bases": {
+                    "scene.bus": {
+                        "type": "local",
+                        "path": "scenes/bus",
+                        "description": "bus",
+                    }
+                },
+            }),
+            encoding="utf-8",
+        )
+        info = reg.get_kb_info("scene.bus", config_path=cfg_path)
+        self.assertIsNotNone(info)
+        self.assertTrue(info.get("exists"))
+        self.assertEqual(info.get("file_count"), 2)
+        self.assertTrue(str(info.get("resolved_path") or "").replace("\\", "/").endswith("wiki/scenes/bus"))
+
+        ext = {r["id"]: r for r in reg.list_kbs_extended(config_path=cfg_path)}
+        self.assertTrue(ext["scene.bus"].get("exists"))
+        self.assertEqual(ext["scene.bus"].get("file_count"), 2)
+
 class TestWikiKbScanActions(unittest.TestCase):
     """Regression tests for read-only actions on auto-discovered wiki KBs.
 

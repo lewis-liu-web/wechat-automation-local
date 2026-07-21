@@ -1249,7 +1249,7 @@ def delete_knowledge_base(kb_id, remove_files=False, config_path=CONFIG_PATH):
     save_json_atomic(config_path, cfg)
     if remove_files and (removed or {}).get("type") == "local":
         kb_dir = _resolve_kb_path((removed or {}).get("path") or "", config_path=config_path, cfg=cfg)
-        if kb_dir and kb_dir.exists() and kb_dir.is_dir() and _wiki_root() in kb_dir.resolve().parents:
+        if kb_dir and kb_dir.exists() and kb_dir.is_dir() and _wiki_root(config_path=config_path) in kb_dir.resolve().parents:
             shutil.rmtree(str(kb_dir), ignore_errors=True)
     out = dict(removed or {})
     out["id"] = kb_id
@@ -1315,8 +1315,9 @@ def bind_wiki(key, knowledge_bases, replace=False, config_path=CONFIG_PATH):
     return t
 
 
-def _wiki_root():
-    return ROOT / "wiki"
+def _wiki_root(config_path=CONFIG_PATH):
+    """Return configured wiki root (absolute). Prefer cfg['wiki_dir'] over ROOT/wiki."""
+    return _resolve_wiki_root(config_path=config_path)
 
 
 def create_local_kb_dir(kb_id, description="", replace=False, source="local_folder", config_path=CONFIG_PATH):
@@ -1328,7 +1329,7 @@ def create_local_kb_dir(kb_id, description="", replace=False, source="local_fold
     kbs = cfg.setdefault("knowledge_bases", {})
     if kb_id in kbs and not replace:
         raise ValueError("知识库别名已存在: %s (使用 --replace 覆盖)" % kb_id)
-    base_dir = _wiki_root() / kb_id
+    base_dir = _wiki_root(config_path=config_path) / kb_id
     base_dir.mkdir(parents=True, exist_ok=True)
     spec = {
         "id": kb_id,
@@ -1345,16 +1346,31 @@ def create_local_kb_dir(kb_id, description="", replace=False, source="local_fold
 
 def get_kb_info(kb_id, config_path=CONFIG_PATH):
     """Return knowledge base info including file stats for local dirs
-    and resolved name/counts for online providers (getnote, ima)."""
+    and resolved name/counts for online providers (getnote, ima).
+
+    Local paths are resolved against cfg['wiki_dir'] (not process CWD), so
+    relative entries like ``scenes/bus`` show real file counts in the console.
+    """
     cfg = load_config(config_path)
+    # Prefer configured map; fall back to wiki scan so auto-discovered rows
+    # still get file stats when listed via list_kbs_extended.
     spec = (cfg.get("knowledge_bases") or {}).get(kb_id)
     if not spec:
-        return None
+        scanned = _get_kb_spec(kb_id, cfg=cfg, config_path=config_path)
+        if not scanned:
+            return None
+        spec = scanned
     info = dict(spec)
-    if spec.get("type") == "local":
-        p = Path(spec.get("path") or "")
-        if not p.exists() or not p.is_dir():
+    info["id"] = kb_id
+    if (spec.get("type") or "local") == "local":
+        raw_path = spec.get("path") or spec.get("dir") or ""
+        resolved = _resolve_kb_path(raw_path, config_path=config_path, cfg=cfg)
+        p = Path(str(resolved)) if resolved else None
+        info["path"] = raw_path
+        info["resolved_path"] = str(p) if p else ""
+        if not p or not p.exists() or not p.is_dir():
             info["file_count"] = 0
+            info["total_files"] = 0
             info["exists"] = False
         else:
             files = list(p.rglob("*"))
@@ -1500,7 +1516,13 @@ def list_kbs_extended(config_path=CONFIG_PATH):
             info = get_kb_info(row.get("id"), config_path=config_path) or {}
         except Exception:
             info = {}
-        row["file_count"] = int(info.get("file_count") or 0) if row.get("type") == "local" else None
+        if row.get("type") == "local":
+            row["file_count"] = int(info.get("file_count") or 0)
+            row["total_files"] = int(info.get("total_files") or 0)
+            row["exists"] = bool(info.get("exists"))
+            row["resolved_path"] = info.get("resolved_path") or ""
+        else:
+            row["file_count"] = None
         row["online_name"] = info.get("online_name") or ""
         row["online_note_count"] = info.get("online_note_count")
         row["online_file_count"] = info.get("online_file_count")
