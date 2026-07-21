@@ -179,6 +179,78 @@ def msg_table(username):
     return "Msg_" + hashlib.md5(str(username).encode("utf-8")).hexdigest()
 
 
+def latest_local_id_for_target(target, message_dir=None):
+    """Return max(local_id) for a target's message table, or 0 if unavailable.
+
+    Used when enabling/resuming a listen target so backlog while offline is not
+    treated as new traffic (avoids group reply storms).
+    """
+    if not target:
+        return 0
+    table = str(target.get("table") or "").strip()
+    if not table:
+        username = str(target.get("username") or "").strip()
+        if username:
+            table = msg_table(username)
+    if not table:
+        return 0
+    db_name = str(target.get("db") or "message_0.db")
+    roots = []
+    if message_dir is not None:
+        roots.append(Path(message_dir))
+    try:
+        _, decrypted_dir = _load_runtime_paths()
+        roots.append(Path(decrypted_dir) / "message")
+    except Exception:
+        pass
+    roots.append(Path(DECRYPTED_MESSAGE_DIR))
+    seen = set()
+    for root in roots:
+        try:
+            key = str(Path(root).resolve())
+        except Exception:
+            key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        db_path = Path(root) / db_name
+        if not db_path.exists():
+            continue
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % db_path.as_posix(), uri=True)
+            try:
+                row = con.execute(
+                    'select max(local_id) as mx from "%s"' % table.replace('"', '""')
+                ).fetchone()
+                if row and row[0] is not None:
+                    return int(row[0])
+            finally:
+                con.close()
+        except Exception:
+            continue
+    return 0
+
+
+def snap_target_cursor_to_latest(target, *, message_dir=None, reason="enable_resume"):
+    """Advance target last_local_id to current DB max when newer backlog exists.
+
+    Returns (previous_id, new_id). No-op when DB is unavailable or already current.
+    """
+    if not isinstance(target, dict):
+        return 0, 0
+    try:
+        prev = int(target.get("last_local_id") or 0)
+    except (TypeError, ValueError):
+        prev = 0
+    latest = latest_local_id_for_target(target, message_dir=message_dir)
+    if latest > prev:
+        target["last_local_id"] = latest
+        target["cursor_snap_reason"] = reason
+        target["cursor_snapped_at"] = now_text()
+        return prev, latest
+    return prev, prev
+
+
 def safe_json_load(path, default):
     path = Path(path)
     if not path.exists():
@@ -566,6 +638,8 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
             cur = list(existing.get("knowledge_bases") or [])
             final_kbs = _merge_and_validate(cur, knowledge_bases)
             existing["knowledge_bases"] = final_kbs
+        # Resume listen: skip backlog that arrived while disabled/stopped.
+        snap_target_cursor_to_latest(existing, reason="enable_candidate_reenable")
         cand = find_candidate(data, existing.get("username") or key)
         if cand:
             cand["status"] = "enabled"
@@ -587,6 +661,7 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
             cur = list(existing.get("knowledge_bases") or [])
             final_kbs = _merge_and_validate(cur, knowledge_bases)
             existing["knowledge_bases"] = final_kbs
+        snap_target_cursor_to_latest(existing, reason="enable_candidate_reenable")
         cand["status"] = "enabled"
         cand["updated_at"] = now_text()
         data["updated_at"] = now_text()
@@ -597,18 +672,21 @@ def enable_candidate(key, knowledge_bases=None, category=None, config_path=CONFI
     for kb in selected_kbs:
         _ensure_kb_registered(kb, cfg=cfg, config_path=config_path)
     validate_knowledge_bases(selected_kbs, cfg=cfg)
+    # Prefer live DB max over candidate snapshot so first enable does not replay backlog.
+    seed_cursor = int(cand.get("last_local_id") or 0)
     target = {
         "name": cand.get("name") or username,
         "username": username,
         "db": cand.get("db") or "message_0.db",
         "table": cand.get("table") or msg_table(username),
-        "last_local_id": int(cand.get("last_local_id") or 0),
+        "last_local_id": seed_cursor,
         "enabled": True,
         "triggers": [],
         "reply_template": "",
         "knowledge_bases": selected_kbs,
         "category": _normalize_category(category),
     }
+    snap_target_cursor_to_latest(target, reason="enable_candidate_first")
     if _is_private_chat(username):
         target["response_mode"] = "free"
     cfg.setdefault("targets", []).append(target)
@@ -626,7 +704,11 @@ def set_enabled(key, enabled, config_path=CONFIG_PATH):
     t = find_target(cfg, key)
     if not t:
         raise ValueError("target not found: %s" % key)
+    was_enabled = bool(t.get("enabled", True))
     t["enabled"] = bool(enabled)
+    if bool(enabled) and not was_enabled:
+        # Turning listen back on: do not answer messages accumulated while off.
+        snap_target_cursor_to_latest(t, reason="set_enabled_on")
     save_json_atomic(config_path, cfg)
     return t
 

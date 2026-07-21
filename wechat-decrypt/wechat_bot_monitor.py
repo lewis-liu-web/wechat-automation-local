@@ -215,13 +215,11 @@ def _advance_startup_cursors(targets, cfg):
 
     Mutates targets in place and returns a dict mapping target_key -> last_local_id.
     Controlled by ``monitor.advance_cursor_on_start`` (default True).
-    """
-    # Global-disabled fail-closed: do NOT advance startup cursors when the scheduler
-    # is disabled; otherwise restart silently skips messages before the per-message
-    # guard can record them.
-    if not _reliable_pipeline_globally_enabled(cfg):
-        return {}
 
+    Always skips offline backlog when enabled — independent of whether the
+    reliable pipeline will process new messages.  Processing is still gated
+    per-message; this only prevents reply storms after stop/start.
+    """
     advance = bool((cfg or {}).get('monitor', {}).get('advance_cursor_on_start', True))
     runtime_min = {}
     for t in targets:
@@ -238,6 +236,10 @@ def _advance_startup_cursors(targets, cfg):
     return runtime_min
 
 
+
+# Target keys that were enabled on the previous main-loop cycle. Used to detect
+# hot re-enable while monitor stays running and snap cursors past offline backlog.
+_PREV_ENABLED_TARGET_KEYS = None
 
 def _ensure_sender_mention(text, msg, contact_names=None):
     reply = str(text or '').strip()
@@ -1599,9 +1601,35 @@ def main():
         cfg = load_config(config_path)
         contact_names = load_contact_name_map()
         targets = enabled_targets(cfg)
+        advance_on_start = bool((cfg or {}).get('monitor', {}).get('advance_cursor_on_start', True))
+        global _PREV_ENABLED_TARGET_KEYS
+        current_enabled_keys = set()
+        prev_enabled_keys = _PREV_ENABLED_TARGET_KEYS
+        if prev_enabled_keys is None:
+            # First loop after process start: startup advance already ran for
+            # the initial set; seed the set so we do not double-snap them.
+            prev_enabled_keys = {_target_key(t) for t in targets}
         for t in targets:
-            if _target_key(t) not in _CURSOR_AUDIT:
+            tkey = _target_key(t)
+            target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
+            current_enabled_keys.add(tkey)
+            is_new = tkey not in prev_enabled_keys
+            if tkey not in _CURSOR_AUDIT:
                 _init_cursor_baseline(t)
+            if advance_on_start and is_new:
+                # Newly enabled (or first seen this process after being off):
+                # skip backlog so resume does not storm the group.
+                latest_id = latest_local_id_for_target(t)
+                current_id = int(t.get('last_local_id') or 0)
+                if latest_id > current_id:
+                    log('hot-resume cursor advance target=%s from %s to %s (skip backlog while disabled)' % (
+                        t.get('name'), current_id, latest_id))
+                    _advance_cursor(t, latest_id, 'hot_resume_advance')
+                    runtime_min_last_local_id[target_key] = latest_id
+                else:
+                    runtime_min_last_local_id[target_key] = max(
+                        int(runtime_min_last_local_id.get(target_key, 0) or 0), current_id)
+        _PREV_ENABLED_TARGET_KEYS = current_enabled_keys
         for t in targets:
             target_key = '%s|%s|%s' % (t.get('db'), t.get('table'), t.get('username'))
             file_last_id = int(t.get('last_local_id') or 0)
