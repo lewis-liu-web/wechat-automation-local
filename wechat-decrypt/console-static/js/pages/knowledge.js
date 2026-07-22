@@ -444,7 +444,7 @@ function renderBindingSection(kbs, targets, refresh) {
   );
 
   if (!targets.length) {
-    card.appendChild(h("div", { style: "color:#6b7280", text: "暂无可绑定目标。" }));
+    card.appendChild(h("div", { class: "muted", text: "暂无可绑定目标。" }));
     return card;
   }
 
@@ -805,7 +805,7 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
         logBody.appendChild(pre);
       } catch (err) {
         clear(logBody);
-        logBody.appendChild(h("div", { style: "color:#6b7280", text: err.status === 404 ? "暂无日志" : `读取日志失败：${err.message}` }));
+        logBody.appendChild(h("div", { class: "muted", text: err.status === 404 ? "暂无日志" : `读取日志失败：${err.message}` }));
       }
     }, { once: false });
     header.appendChild(logDetails);
@@ -985,9 +985,9 @@ function renderSearchResult(el, res) {
   const hits = res.hits || [];
   const matched = res.matched_files || 0;
   const total = res.total_files || 0;
-  el.appendChild(h("div", { style: "color:#6b7280" }, h("span", { text: `命中 ${matched} / ${total} 个文档` })));
+  el.appendChild(h("div", { class: "muted" }, h("span", { text: `命中 ${matched} / ${total} 个文档` })));
   if (!hits.length) {
-    el.appendChild(h("div", { style: "color:#6b7280" }, h("span", { text: "没有命中。" })));
+    el.appendChild(h("div", { class: "muted" }, h("span", { text: "没有命中。" })));
     return;
   }
   const ul = h("ul");
@@ -1000,7 +1000,7 @@ function renderSearchResult(el, res) {
     );
     const snippet = (hItem.snippet || "").trim();
     if (snippet) {
-      li.appendChild(h("div", { style: "color:#6b7280" }, h("span", { text: snippet.slice(0, 160).replace(/\n/g, " ") })));
+      li.appendChild(h("div", { class: "muted" }, h("span", { text: snippet.slice(0, 160).replace(/\n/g, " ") })));
     }
     ul.appendChild(li);
   }
@@ -1051,14 +1051,14 @@ function renderImportResult(el, lastImport, kbId) {
   );
   for (const { bucket, items } of grouped) {
     wrapper.appendChild(h("strong", { text: `${bucket.title}（${items.length} 个）` }));
-    wrapper.appendChild(h("div", { style: "color:#6b7280" }, h("span", { text: bucket.advice })));
+    wrapper.appendChild(h("div", { class: "muted" }, h("span", { text: bucket.advice })));
     const ul = h("ul");
     for (const item of items) {
       const err = item.error || "";
       const name = failureBasename(err) || item.path || "?";
       const short = failureShortReason(err);
       const li = h("li", null, h("code", { text: name }));
-      if (short) li.appendChild(h("div", { style: "color:#6b7280" }, h("span", { text: short })));
+      if (short) li.appendChild(h("div", { class: "muted" }, h("span", { text: short })));
       const fullDetails = detailsEl("完整错误", h("pre", null, h("code", { text: err })));
       li.appendChild(fullDetails);
       ul.appendChild(li);

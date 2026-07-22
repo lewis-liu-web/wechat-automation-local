@@ -228,7 +228,7 @@ export function svgGroupedBars({ labels, series, height = 220 }) {
     label.setAttribute('y', innerH + 18);
     label.setAttribute('text-anchor', 'middle');
     label.setAttribute('font-size', '10');
-    label.setAttribute('fill', '#6b7280');
+    label.setAttribute('fill', '#64748b');
     label.textContent = String(labels[gi]);
     g.appendChild(label);
   }
@@ -236,11 +236,18 @@ export function svgGroupedBars({ labels, series, height = 220 }) {
   return svg;
 }
 
-export function pageHeader(title, subtitle) {
-  const el = h('div', { class: 'pageHeader' });
-  el.appendChild(h('h1', { text: title }));
+export function pageHeader(title, subtitle, actions) {
+  const textCol = h('div', null);
+  textCol.appendChild(h('h1', { text: title }));
   if (subtitle !== undefined && subtitle !== null) {
-    el.appendChild(h('p', { class: 'subtitle', text: String(subtitle) }));
+    textCol.appendChild(h('p', { class: 'subtitle', text: String(subtitle) }));
+  }
+  const el = h('div', { class: 'pageHeader' }, textCol);
+  if (actions) {
+    const bar = h('div', { class: 'page-toolbar', style: 'margin:0;' });
+    if (Array.isArray(actions)) actions.forEach((n) => n && bar.appendChild(n));
+    else if (actions instanceof Node) bar.appendChild(actions);
+    el.appendChild(bar);
   }
   return el;
 }

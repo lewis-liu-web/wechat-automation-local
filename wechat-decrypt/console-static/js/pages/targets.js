@@ -211,12 +211,14 @@ export async function render(root) {
       },
     }, isScanning ? '扫描中…' : '扫描新目标');
 
-    return h('div', { class: 'card', style: 'margin-bottom:1rem;' },
-      h('div', { class: 'form-row' },
-        h('div', null, h('label', { text: '筛选' }), kindSelect),
-        h('div', null, h('label', { text: '搜索 (name / username)' }), searchInput),
-        h('div', { style: 'display:flex;align-items:flex-end;gap:0.5rem;' }, refreshBtn, scanBtn),
-        h('div', { style: 'display:flex;align-items:flex-end;gap:0.5rem;' }, includeContactsCheckbox, privateOnlyCheckbox)
+    return h('div', { class: 'card filter-card' },
+      h('div', { class: 'card-body' },
+        h('div', { class: 'form-row' },
+          h('div', null, h('label', { text: '筛选' }), kindSelect),
+          h('div', null, h('label', { text: '搜索' }), searchInput),
+          h('div', { class: 'flex gap-2' }, refreshBtn, scanBtn),
+          h('div', { class: 'flex gap-3' }, includeContactsCheckbox, privateOnlyCheckbox)
+        )
       )
     );
   }
@@ -233,10 +235,10 @@ export async function render(root) {
     const caption = (scanResult.added || 0) === 0 && (scanResult.discovered || 0) > 0
       ? '没有新增：常见原因是群已在监听列表/待启用池，或名称未从 contact 库解析到。可切换「待启用」筛选查看。'
       : '';
-    return h('div', { class: 'card', style: 'margin-bottom:1rem;background:#f0fdf4;border-color:#22c55e;' },
+    return h('div', { class: 'scan-banner' },
       h('div', { class: 'badge badge-ok', text: '扫描完成' }),
-      h('div', { style: 'margin-top:0.5rem;', text: lines.join(' · ') }),
-      caption ? h('div', { style: 'margin-top:0.5rem;color:#666;', text: caption }) : null
+      h('div', { class: 'caption', style: 'margin:6px 0 0;color:inherit;', text: lines.join(' · ') }),
+      caption ? h('div', { class: 'field-hint', text: caption }) : null
     );
   }
 
@@ -265,53 +267,17 @@ export async function render(root) {
       kbSourceText = '混合（' + Array.from(boundSources).sort().map((s) => _label(KB_SOURCE_LABELS, s)).join(', ') + '）';
     }
 
-    const titleLine = h('div', { style: 'display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;' },
-      h('span', { class: 'card-title', text: t.name || '(no name)' }),
-      badge(statusLabel, t.enabled ? 'ok' : ((t.is_candidate || t.status === 'pending') ? 'warn' : 'muted')),
-      isAdmin ? badge('管理员', 'info') : null
-    );
-
-    const metrics = h('div', { class: 'metric-grid' },
-      metricCard('已读到ID', t.last_local_id || 0),
-      metricCard('触发词', (t.triggers || []).length),
-      metricCard('知识库', (t.knowledge_bases || []).length),
-      metricCard('自动回复', durableOn ? '开' : '关')
-    );
-
-    const leftBody = h('div', null,
-      h('div', { class: 'kv' },
-        h('span', { text: '标识' }),
-        h('span', { text: t.username || '—' })
-      ),
-      h('div', { class: 'kv' },
-        h('span', { text: '模式 / 策略 / 类别 / 触发词 / 知识库' }),
-        h('span', {
-          text: `${t.mode || '?'} · ${t.reply_policy || '?'} · ${_label(CATEGORY_LABELS, cat)} · ${(t.triggers || []).length} · ${(t.knowledge_bases || []).length}`
-        })
-      ),
-      h('div', { class: 'kv' },
-        h('span', { text: '自动回复 / 专用 Agent' }),
-        h('span', { text: `${pipeState} · ${t.dedicated_agent_instance_id || '通用池'}` })
-      ),
-      h('div', { class: 'kv' },
-        h('span', { text: '当前 KB 来源' }),
-        h('span', { text: kbSourceText })
-      ),
-      metrics,
-      renderDetails(t)
-    );
-
     const actions = [];
     if (!t.enabled && t.is_candidate) {
-      const catSelect = h('select', { class: 'select' },
+      const catSelect = h('select', { class: 'select', style: 'width:auto;min-width:96px;' },
         h('option', { value: 'user', selected: cat === 'user' }, '普通'),
         h('option', { value: 'admin', selected: cat === 'admin' }, '管理员')
       );
       actions.push(
-        h('div', null, catSelect),
+        catSelect,
         h('button', {
           class: 'btn btn-primary btn-sm',
-          style: 'width:100%;margin-top:0.5rem;',
+          type: 'button',
           onclick: async () => {
             try {
               await saveAndReload(`已启用 ${actionKey}`, async () => {
@@ -326,7 +292,7 @@ export async function render(root) {
     } else if (!t.enabled && !t.is_candidate) {
       actions.push(h('button', {
         class: 'btn btn-primary btn-sm',
-        style: 'width:100%;',
+        type: 'button',
         onclick: async () => {
           try {
             await saveAndReload(`已恢复监听 ${actionKey}`, async () => {
@@ -340,7 +306,7 @@ export async function render(root) {
     } else {
       actions.push(h('button', {
         class: 'btn btn-ghost btn-sm',
-        style: 'width:100%;',
+        type: 'button',
         onclick: async () => {
           try {
             await saveAndReload(`已停用 ${actionKey}`, async () => {
@@ -355,7 +321,7 @@ export async function render(root) {
 
     actions.push(h('button', {
       class: 'btn btn-danger btn-sm',
-      style: 'width:100%;margin-top:0.5rem;',
+      type: 'button',
       onclick: async () => {
         if (!confirmDanger(`确定删除目标「${t.name || actionKey}」？此操作不可恢复。`)) return;
         try {
@@ -369,12 +335,49 @@ export async function render(root) {
       },
     }, '删除'));
 
-    const main = h('div', { class: 'grid-2', style: 'gap:1rem;' },
-      leftBody,
-      h('div', { style: 'display:flex;flex-direction:column;gap:0.5rem;' }, ...actions)
+    const head = h('div', { class: 'card-head' },
+      h('div', { class: 'card-head-main' },
+        h('span', { class: 'card-head-title', text: t.name || '(no name)' }),
+        badge(statusLabel, t.enabled ? 'ok' : ((t.is_candidate || t.status === 'pending') ? 'warn' : 'muted')),
+        isAdmin ? badge('管理员', 'info') : null
+      ),
+      h('div', { class: 'card-actions' }, ...actions)
     );
 
-    return h('div', { class: 'card' }, titleLine, main);
+    const metrics = h('div', { class: 'metric-grid' },
+      metricCard('已读到ID', t.last_local_id || 0),
+      metricCard('触发词', (t.triggers || []).length),
+      metricCard('知识库', (t.knowledge_bases || []).length),
+      metricCard('自动回复', durableOn ? '开' : '关')
+    );
+
+    const body = h('div', { class: 'card-body target-card' },
+      h('div', { class: 'kv-stack' },
+        h('div', { class: 'kv' },
+          h('span', { class: 'k', text: '标识' }),
+          h('span', { class: 'v', text: t.username || '—' })
+        ),
+        h('div', { class: 'kv' },
+          h('span', { class: 'k', text: '模式 / 策略 / 类别' }),
+          h('span', {
+            class: 'v',
+            text: `${t.mode || '?'} · ${t.reply_policy || '?'} · ${_label(CATEGORY_LABELS, cat)}`
+          })
+        ),
+        h('div', { class: 'kv' },
+          h('span', { class: 'k', text: '自动回复 / Agent' }),
+          h('span', { class: 'v', text: `${pipeState} · ${t.dedicated_agent_instance_id || '通用池'}` })
+        ),
+        h('div', { class: 'kv' },
+          h('span', { class: 'k', text: '知识库来源' }),
+          h('span', { class: 'v', text: kbSourceText })
+        )
+      ),
+      metrics,
+      renderDetails(t)
+    );
+
+    return h('div', { class: 'card target-card' }, head, body);
   }
 
   function renderDetails(t) {
@@ -398,7 +401,7 @@ export async function render(root) {
         modeSelect,
         h('button', {
           class: 'btn btn-sm btn-primary',
-          style: 'margin-top:0.5rem;',
+          type: 'button',
           onclick: async () => {
             try {
               await saveAndReload('已切换响应模式', async () => {
@@ -415,7 +418,7 @@ export async function render(root) {
         responseModeSelect,
         h('button', {
           class: 'btn btn-sm btn-primary',
-          style: 'margin-top:0.5rem;',
+          type: 'button',
           onclick: async () => {
             try {
               await saveAndReload('已切换回复策略', async () => {
@@ -454,11 +457,11 @@ export async function render(root) {
           },
         }, '保存类别')
       ),
-      h('p', { style: 'margin:0.5rem 0;color:#666;', text: '管理员白名单：留空表示该目标下所有发送者都被视为管理员。可填写 wxid 或昵称/备注，每行一个。' }),
+      h('p', { class: 'field-hint', text: '管理员白名单：留空表示该目标下所有发送者都被视为管理员。可填写 wxid 或昵称/备注，每行一个。' }),
       adminText,
       h('button', {
         class: 'btn btn-sm btn-primary',
-        style: 'margin-top:0.5rem;',
+        type: 'button',
         onclick: async () => {
           try {
             await saveAndReload('已保存管理员白名单', async () => {
@@ -481,11 +484,11 @@ export async function render(root) {
     );
     const agentBody = h('div', null,
       h('label', { text: '专用 Agent 实例' }),
-      h('p', { style: 'margin:0.25rem 0;color:#666;', text: '留空=不绑定（任务进入通用池）；选择具体实例后只由该实例处理该目标的任务。' }),
+      h('p', { class: 'field-hint', text: '留空=不绑定（任务进入通用池）；选择具体实例后只由该实例处理该目标的任务。' }),
       agentSelect,
       h('button', {
         class: 'btn btn-sm btn-primary',
-        style: 'margin-top:0.5rem;',
+        type: 'button',
         onclick: async () => {
           try {
             await saveAndReload('已保存 Agent 绑定', async () => {
@@ -505,12 +508,12 @@ export async function render(root) {
       placeholder: t.name || '',
     });
     const cuaBody = h('div', null,
-      h('p', { style: 'margin:0 0 0.5rem;color:#666;', text: '如果该目标的独立聊天窗口标题与目标名不同，可在此覆盖。' }),
+      h('p', { class: 'field-hint', text: '如果该目标的独立聊天窗口标题与目标名不同，可在此覆盖。' }),
       h('label', { text: '窗口标题' }),
       cuaInput,
       h('button', {
         class: 'btn btn-sm btn-primary',
-        style: 'margin-top:0.5rem;',
+        type: 'button',
         onclick: async () => {
           try {
             await saveAndReload('已保存窗口标题', async () => {
@@ -533,7 +536,7 @@ export async function render(root) {
       shadowToggle,
       h('button', {
         class: 'btn btn-sm btn-primary',
-        style: 'margin-top:0.5rem;',
+        type: 'button',
         onclick: async () => {
           try {
             await set_target_field(actionKey, 'reliable_pipeline_target', durableInput.checked);

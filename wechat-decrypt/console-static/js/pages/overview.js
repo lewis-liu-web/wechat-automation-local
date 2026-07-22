@@ -85,20 +85,13 @@ export async function render(root) {
 
   function renderStructure() {
     clear(root);
-    root.appendChild(pageHeader("总览", "今日收发与话题概览"));
-
     const refreshBtn = h("button", {
       class: "btn btn-ghost btn-sm",
+      type: "button",
       text: "刷新",
       onclick: refreshAll,
     });
-    root.appendChild(
-      h(
-        "div",
-        { style: "display:flex;justify-content:flex-end;margin-bottom:1rem;" },
-        refreshBtn
-      )
-    );
+    root.appendChild(pageHeader("总览", "今日收发、话题与趋势", refreshBtn));
 
     todaySection = h("section", { id: "overview-today" });
     topicsSection = h("section", { id: "overview-topics" });
@@ -184,7 +177,7 @@ export async function render(root) {
     todaySection.appendChild(metrics);
 
     todaySection.appendChild(
-      h("h2", { class: "card-title", style: "margin-top:1.5rem" }, "今日各群")
+      h("h2", { class: "section-title" }, "今日各群")
     );
     const targets = today.targets || [];
     if (!targets.length) {
@@ -249,7 +242,7 @@ export async function render(root) {
     if (t.stale) {
       statusWrap.appendChild(
         h("span", {
-          style: "font-size:0.8rem;color:#6b7280;",
+          class: "caption", style: "margin:0;font-size:12px;",
           text: "上次生成 " + fmtTs(t.generated_at) + "，正在更新…",
         })
       );
@@ -321,12 +314,12 @@ export async function render(root) {
   }
 
   function renderTopicItem(topic) {
-    const item = h("div", { style: "display:flex;flex-direction:column;gap:0.25rem;" });
+    const item = h("div", { class: "topic-card" });
     item.appendChild(h("strong", { text: topic.title || "未命名话题" }));
     if (topic.summary) {
       item.appendChild(
         h("p", {
-          style: "margin:0;color:#4b5563;font-size:0.9rem;",
+          class: "caption", style: "margin:0;",
           text: topic.summary,
         })
       );
@@ -402,7 +395,7 @@ export async function render(root) {
     );
     historySection.appendChild(tabs);
 
-    const chartWrap = h("div", { class: "card", style: "padding:1rem;overflow-x:auto;" });
+    const chartWrap = h("div", { class: "card chart-card" });
     const series = history.series || [];
     const labels = series.map((s) => s.date.slice(5));
     chartWrap.appendChild(
@@ -431,7 +424,7 @@ export async function render(root) {
     historySection.appendChild(chartWrap);
 
     historySection.appendChild(
-      h("h3", { class: "card-title", style: "margin-top:1.5rem" }, "按群汇总")
+      h("h3", { class: "section-title" }, "按群汇总")
     );
     const perTarget = history.per_target || [];
     if (!perTarget.length) {
