@@ -32,9 +32,12 @@ Run::
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
+import posixpath
+import shutil
 import subprocess
 import sys
 import threading
@@ -45,6 +48,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
+CONSOLE_STATIC_DIR = ROOT / "console-static"
+KB_UPLOAD_STAGING = ROOT / "temp" / "kb_uploads"
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,7 @@ from agent_provider import (  # noqa: E402
 )
 import manage_targets as mt  # noqa: E402
 import target_registry as reg  # noqa: E402
+import digest_service  # noqa: E402
 import reliable_pipeline  # noqa: E402
 import reliable_worker  # noqa: E402
 import reply_engine  # noqa: E402
@@ -167,6 +173,52 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         return json.loads(raw.decode("utf-8", errors="replace"))
     except Exception:
         return {}
+
+
+_CONSOLE_MIME_MAP: Dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
+}
+
+
+def _resolve_console_static(path: str) -> Tuple[Optional[Path], str]:
+    """Resolve a /console/* path to a static file path and MIME type.
+
+    Returns (None, "") for non-console paths, traversal attempts,
+    unsupported extensions, or missing files.
+    """
+    if path in ("/console", "/console/"):
+        rel = "index.html"
+    elif path.startswith("/console/"):
+        rel = path[len("/console/"):]
+    else:
+        return (None, "")
+    # URL-decode before normalization so encoded traversal (%2E%2E, ..%2F) is rejected.
+    rel = urllib.parse.unquote(rel)
+    rel_norm = posixpath.normpath("/" + rel).lstrip("/")
+    if not rel_norm or rel_norm.startswith("..") or rel_norm.startswith("/"):
+        return (None, "")
+    base = CONSOLE_STATIC_DIR.resolve()
+    try:
+        candidate = (base / rel_norm).resolve()
+    except (OSError, ValueError):
+        return (None, "")
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return (None, "")
+    if not candidate.is_file():
+        return (None, "")
+    mime = _CONSOLE_MIME_MAP.get(candidate.suffix.lower())
+    if not mime:
+        return (None, "")
+    return (candidate, mime)
 
 
 # ---------------------------------------------------------------------------
@@ -609,12 +661,138 @@ class ControlHandler(BaseHTTPRequestHandler):
             kbs = list(body.get("knowledge_bases") or [])
             return _ok(action="bound", target=reg.bind_wiki(m[0], kbs, replace=True))
 
+        # ---- overview ----
+        if method == "GET" and path == "/overview/today":
+            return _ok(**_overview_today())
+        if method == "GET" and path == "/overview/history":
+            try:
+                days = int((params.get("days") or ["7"])[0])
+            except (ValueError, TypeError):
+                days = 7
+            return _ok(**_overview_history(days))
+        if method == "GET" and path == "/overview/topics":
+            cfg = reg.load_config()
+            return _ok(**digest_service.get_topics_state(cfg))
+        if method == "POST" and path == "/overview/topics/refresh":
+            cfg = reg.load_config()
+            target = str(body.get("target") or "").strip() if isinstance(body, dict) else ""
+            target = target or None
+            if target:
+                enabled_targets = {
+                    t.get("username")
+                    for t in (cfg.get("targets") or [])
+                    if t.get("enabled") and t.get("username")
+                }
+                if target not in enabled_targets:
+                    return _err("target not found or not enabled: %s" % target, status=404)
+            return _ok(**digest_service.refresh_now(cfg, target_id=target))
+
+        # ---- KB file upload staging (SPA replacement for Streamlit uploader) ----
+        if method == "POST" and (m := _match(path, "/kbs/{kb}/upload")):
+            kb_id = m[0]
+            info = reg.get_kb_info(kb_id, config_path=reg.CONFIG_PATH)
+            if not info:
+                return _err("knowledge base not found: %s" % kb_id, status=404)
+            if (info.get("type") or "local") != "local":
+                return _err("knowledge base is not local: %s" % kb_id, status=400)
+            files = body.get("files") if isinstance(body, dict) else None
+            if not isinstance(files, list):
+                return _err("files must be a list")
+            if len(files) > 100:
+                return _err("too many files: max 100", status=413)
+
+            MAX_SINGLE = 20 * 1024 * 1024
+            MAX_TOTAL = 50 * 1024 * 1024
+            safe_kb = "".join(c for c in kb_id if c.isalnum() or c in "_-")
+            if not safe_kb:
+                return _err("invalid kb id")
+            staging = KB_UPLOAD_STAGING / safe_kb
+            try:
+                if staging.exists():
+                    shutil.rmtree(staging, ignore_errors=True)
+                staging.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return _err("staging failed: %s" % e)
+
+            staged: List[str] = []
+            total = 0
+            for f in files:
+                if not isinstance(f, dict):
+                    return _err("invalid file entry")
+                raw_name = str(f.get("filename") or "")
+                name = Path(raw_name).name
+                if not name or name in (".", ".."):
+                    return _err("invalid filename: %s" % raw_name)
+                try:
+                    data = base64.b64decode(f.get("content_b64") or "", validate=True)
+                except Exception:
+                    return _err("invalid base64 for %s" % name)
+                size = len(data)
+                if size > MAX_SINGLE:
+                    return _err("file too large: %s" % name, status=413)
+                total += size
+                if total > MAX_TOTAL:
+                    return _err("total upload size exceeds 50MB", status=413)
+                (staging / name).write_bytes(data)
+                staged.append(name)
+            return _ok(staged=len(staged), staging_dir=str(staging))
+
+        # ---- LEANN build log ----
+        if method == "GET" and (m := _match(path, "/kbs/{kb}/leann/build/log")):
+            kb_id = m[0]
+            build_id = str((params.get("build_id") or [""])[0]).strip()
+            if build_id:
+                status = reg.get_leann_build_status(build_id)
+            else:
+                latest_build_id = reg.get_latest_leann_build_for_kb(kb_id)
+                if not latest_build_id:
+                    return _err("no build found for kb: %s" % kb_id, status=404)
+                status = reg.get_leann_build_status(latest_build_id)
+            log_path_str = status.get("log_path") if isinstance(status, dict) else None
+            if not log_path_str:
+                return _err("log path not found for build", status=404)
+            try:
+                log_path = Path(str(log_path_str)).resolve()
+                root = ROOT.resolve()
+                log_path.relative_to(root)
+            except (ValueError, OSError):
+                return _err("log path outside root", status=404)
+            if not log_path.is_file():
+                return _err("log file not found: %s" % log_path, status=404)
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                return _err("cannot read log: %s" % e, status=500)
+            tail = text[-4000:] if len(text) > 4000 else text
+            return _ok(log_tail=tail, log_path=str(log_path))
+
         return _err("not found: %s %s" % (method, path), status=404)
 
     # ---- HTTP verbs ----
     def do_GET(self):
         try:
             path, params = self._parse_path()
+            if path.startswith("/console"):
+                static_path, ctype = _resolve_console_static(path)
+                if static_path:
+                    data = static_path.read_bytes()
+                    cc = "no-cache" if path in ("/console", "/console/") else "max-age=3600"
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", cc)
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                body = b"not found"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             resp = self._route("GET", path, params, body={})
             self._send(*resp)
         except Exception as e:
@@ -740,6 +918,155 @@ def _list_targets_by_kind(kind: str):
     else:
         rows = rows + pending_rows
     return rows, candidates
+
+
+def _local_day_start(now: Optional[float] = None) -> float:
+    """Return the Unix timestamp for the start of the local day."""
+    t = time.localtime(now)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def _overview_targets_map(cfg: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, bool]]:
+    """Return (name_map, enabled_map) for configured targets by username."""
+    name_map: Dict[str, str] = {}
+    enabled_map: Dict[str, bool] = {}
+    for t in cfg.get("targets") or []:
+        tid = t.get("username")
+        if not tid:
+            continue
+        name_map[tid] = t.get("name") or tid
+        enabled_map[tid] = bool(t.get("enabled"))
+    return name_map, enabled_map
+
+
+def _overview_zero_totals() -> Dict[str, int]:
+    return {"received": 0, "replied": 0, "failed": 0, "escalated": 0, "dead": 0}
+
+
+def _overview_today() -> Dict[str, Any]:
+    """Return today's per-target and aggregate pipeline counts.
+
+    If the pipeline DB is unreachable the response still contains the
+    configured target list with all counts set to zero plus a warning.
+    """
+    cfg = reg.load_config()
+    db_path = reliable_worker._resolve_db_path(cfg, None)
+    t0 = _local_day_start()
+    date_str = time.strftime("%Y-%m-%d", time.localtime(t0))
+    name_map, enabled_map = _overview_targets_map(cfg)
+    zero_totals = _overview_zero_totals()
+
+    targets: Dict[str, Dict[str, Any]] = {}
+    for tid, name in name_map.items():
+        targets[tid] = {
+            "target_id": tid,
+            "name": name,
+            "enabled": enabled_map.get(tid, False),
+            **zero_totals,
+        }
+
+    metrics = [
+        ("received", "SELECT target_id, COUNT(*) FROM inbound_events WHERE received_at >= ? GROUP BY target_id"),
+        ("replied", "SELECT target_id, COUNT(*) FROM send_outbox WHERE status='sent' AND sent_at >= ? GROUP BY target_id"),
+        ("failed", "SELECT target_id, COUNT(*) FROM turn_jobs WHERE status IN ('failed','timeout') AND finished_at >= ? GROUP BY target_id"),
+        ("escalated", "SELECT target_id, COUNT(*) FROM turn_jobs WHERE status='escalated' AND finished_at >= ? GROUP BY target_id"),
+        ("dead", "SELECT target_id, COUNT(*) FROM send_outbox WHERE status='dead_letter' AND dead_at >= ? GROUP BY target_id"),
+    ]
+
+    try:
+        conn = reliable_pipeline.open_db(db_path)
+        for key, sql in metrics:
+            cur = conn.execute(sql, (t0,))
+            for row in cur.fetchall():
+                tid = str(row[0])
+                cnt = int(row[1] or 0)
+                if tid not in targets:
+                    targets[tid] = {
+                        "target_id": tid,
+                        "name": name_map.get(tid, tid),
+                        "enabled": enabled_map.get(tid, False),
+                        **zero_totals,
+                    }
+                targets[tid][key] = cnt
+    except Exception:
+        return {
+            "generated_at": time.time(),
+            "date": date_str,
+            "totals": zero_totals,
+            "targets": list(targets.values()),
+            "warning": "pipeline db unavailable",
+        }
+
+    target_list = list(targets.values())
+    totals = {key: sum(t.get(key, 0) for t in target_list) for key in zero_totals}
+    return {
+        "generated_at": time.time(),
+        "date": date_str,
+        "totals": totals,
+        "targets": target_list,
+    }
+
+
+def _overview_history(days: int) -> Dict[str, Any]:
+    """Return daily series and per-target aggregates for the last N days.
+
+    Missing days are zero-filled. The DB-unavailable path returns a fully
+    zero-filled series and an empty per_target list with a warning.
+    """
+    days = max(1, min(62, int(days)))
+    cfg = reg.load_config()
+    db_path = reliable_worker._resolve_db_path(cfg, None)
+    t0 = _local_day_start() - (days - 1) * 86400
+    name_map, _ = _overview_targets_map(cfg)
+    zero_series = {"received": 0, "replied": 0, "failed": 0, "dead": 0}
+
+    metrics = [
+        ("received", "SELECT date(received_at, 'unixepoch', 'localtime') AS d, target_id, COUNT(*) FROM inbound_events WHERE received_at >= ? GROUP BY d, target_id"),
+        ("replied", "SELECT date(sent_at, 'unixepoch', 'localtime') AS d, target_id, COUNT(*) FROM send_outbox WHERE status='sent' AND sent_at >= ? GROUP BY d, target_id"),
+        ("failed", "SELECT date(finished_at, 'unixepoch', 'localtime') AS d, target_id, COUNT(*) FROM turn_jobs WHERE status IN ('failed','timeout') AND finished_at >= ? GROUP BY d, target_id"),
+        ("dead", "SELECT date(dead_at, 'unixepoch', 'localtime') AS d, target_id, COUNT(*) FROM send_outbox WHERE status='dead_letter' AND dead_at >= ? GROUP BY d, target_id"),
+    ]
+
+    series: Dict[str, Dict[str, Any]] = {}
+    per_target: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        conn = reliable_pipeline.open_db(db_path)
+        for key, sql in metrics:
+            cur = conn.execute(sql, (t0,))
+            for row in cur.fetchall():
+                d = str(row[0])
+                tid = str(row[1])
+                cnt = int(row[2] or 0)
+                if d not in series:
+                    series[d] = {"date": d, **zero_series}
+                series[d][key] += cnt
+                if tid not in per_target:
+                    per_target[tid] = {
+                        "target_id": tid,
+                        "name": name_map.get(tid, tid),
+                        **zero_series,
+                    }
+                per_target[tid][key] += cnt
+    except Exception:
+        dates = [time.strftime("%Y-%m-%d", time.localtime(t0 + i * 86400)) for i in range(days)]
+        return {
+            "days": days,
+            "series": [{"date": d, **zero_series} for d in dates],
+            "per_target": [],
+            "warning": "pipeline db unavailable",
+        }
+
+    result_series = []
+    for i in range(days):
+        d = time.strftime("%Y-%m-%d", time.localtime(t0 + i * 86400))
+        result_series.append(series.get(d, {"date": d, **zero_series}))
+
+    return {
+        "days": days,
+        "series": result_series,
+        "per_target": list(per_target.values()),
+    }
 
 
 def _register_agent_instance(instance: Any) -> Dict[str, Any]:

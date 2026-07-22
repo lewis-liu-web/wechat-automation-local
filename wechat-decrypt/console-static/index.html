@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>微信助手控制台</title>
+  <link rel="stylesheet" href="/console/css/console.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">微信助手控制台</div>
+    <div class="side-status" id="side-status">
+      <span class="chip" data-chip="health">控制面: 未知</span>
+      <span class="chip" data-chip="monitor">监听: 未知</span>
+      <span class="chip" data-chip="targets">已启用目标: 未知</span>
+      <span class="chip" data-chip="scheduler">自动回复: 未知</span>
+    </div>
+    <nav class="side-nav">
+      <a href="#/overview" data-page="overview">总览</a>
+      <a href="#/targets" data-page="targets">监听目标</a>
+      <a href="#/pipeline" data-page="pipeline">可靠管线</a>
+      <a href="#/triggers" data-page="triggers">触发词</a>
+      <a href="#/knowledge" data-page="knowledge">知识库</a>
+      <a href="#/agent" data-page="agent">Agent 任务</a>
+    </nav>
+    <div class="side-bottom">
+      <button class="btn btn-ghost btn-sm" id="btn-start">启动监听</button>
+      <button class="btn btn-ghost btn-sm" id="btn-stop">停止监听</button>
+      <button class="btn btn-ghost btn-sm" id="btn-restart">重启监听</button>
+      <button class="btn btn-primary btn-sm" id="btn-refresh">刷新数据</button>
+    </div>
+  </aside>
+  <main id="page" class="main"></main>
+  <div id="toast-container" class="toast-container"></div>
+  <script type="module" src="/console/js/app.js"></script>
+</body>
+</html>

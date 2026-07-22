@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time as _stdlib_time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -23,8 +24,14 @@ from wechat_bot_monitor import build_event_payload
 
 # Bounded in-process retry in process_once calls time.sleep between
 # attempts.  Tests must not pay real seconds for that backoff, so we
-# neuter sleep for the worker module only (production code is untouched).
-worker.time.sleep = lambda *_a, **_kw: None  # type: ignore[attr-defined]
+# replace the time module reference in the worker namespace only.
+# (Assigning worker.time.sleep would mutate the shared time module and
+# poison every other test collected in the same run.)
+worker.time = SimpleNamespace(
+    time=_stdlib_time.time,
+    monotonic=_stdlib_time.monotonic,
+    sleep=lambda *_a, **_kw: None,
+)
 
 
 # --- Helpers ----------------------------------------------------------------

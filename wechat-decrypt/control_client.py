@@ -522,6 +522,53 @@ def requeue_reliable_outbox(outbox_id: int, reason: str,
     )
 
 
+def overview_today(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """GET /overview/today — today's per-target and aggregate counts."""
+    return _request("GET", "/overview/today", base_url=base_url)
+
+
+def overview_history(days: int = 7, base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """GET /overview/history?days=N — daily series and per-target aggregates."""
+    return _request("GET", "/overview/history", base_url=base_url,
+                    params={"days": str(days)})
+
+
+def overview_topics(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """GET /overview/topics — current LLM-digest state per enabled target."""
+    return _request("GET", "/overview/topics", base_url=base_url)
+
+
+def refresh_topics(target: Optional[str] = None,
+                   base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """POST /overview/topics/refresh — trigger digest rebuild for one or all targets."""
+    body: Dict[str, Any] = {"target": target} if target else {}
+    return _request("POST", "/overview/topics/refresh", base_url=base_url, body=body)
+
+
+def upload_kb_files(kb_id: str, files: List[Dict[str, Any]],
+                    base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """POST /kbs/{kb}/upload — stage base64-encoded files for a local KB import."""
+    return _request(
+        "POST",
+        "/kbs/%s/upload" % urllib.parse.quote(kb_id, safe=""),
+        base_url=base_url,
+        body={"files": files},
+        timeout=30,
+    )
+
+
+def leann_build_log(kb_id: str, build_id: Optional[str] = None,
+                    base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
+    """GET /kbs/{kb}/leann/build/log — tail of a LEANN build log."""
+    params: Dict[str, str] = {"build_id": build_id} if build_id else {}
+    return _request(
+        "GET",
+        "/kbs/%s/leann/build/log" % urllib.parse.quote(kb_id, safe=""),
+        base_url=base_url,
+        params=params,
+        timeout=10,
+    )
+
 
 __all__ = [
     "ControlAPIError",
@@ -600,4 +647,10 @@ __all__ = [
     "reliable_scheduler_start",
     "reliable_scheduler_stop",
     "requeue_reliable_outbox",
+    "overview_today",
+    "overview_history",
+    "overview_topics",
+    "refresh_topics",
+    "upload_kb_files",
+    "leann_build_log",
 ]
