@@ -22,31 +22,31 @@ class TestIsTrigger(unittest.TestCase):
         return m
 
     def test_free_mode_accepts_any_text(self):
-        cfg = {"default_response_mode": "trigger", "default_triggers": ["飞扬"]}
+        cfg = {"default_response_mode": "trigger", "default_triggers": ["测试助手"]}
         t = {"response_mode": "free", "triggers": []}
         self.assertTrue(monitor.is_trigger(cfg, t, self._msg("随便聊聊")))
 
     def test_trigger_mode_keyword_match(self):
-        cfg = {"default_response_mode": "trigger", "default_triggers": ["飞扬"]}
-        t = {"response_mode": "trigger", "triggers": ["飞扬的跟屁虫"]}
-        self.assertTrue(monitor.is_trigger(cfg, t, self._msg("飞扬的跟屁虫 怎么退押金")))
+        cfg = {"default_response_mode": "trigger", "default_triggers": ["测试助手"]}
+        t = {"response_mode": "trigger", "triggers": ["测试助手"]}
+        self.assertTrue(monitor.is_trigger(cfg, t, self._msg("测试助手 怎么退押金")))
         self.assertFalse(monitor.is_trigger(cfg, t, self._msg("今天天气怎么样")))
 
     def test_empty_triggers_silent(self):
-        cfg = {"default_response_mode": "trigger", "default_triggers": ["飞扬"]}
+        cfg = {"default_response_mode": "trigger", "default_triggers": ["测试助手"]}
         t = {"response_mode": "trigger", "triggers": []}
-        self.assertFalse(monitor.is_trigger(cfg, t, self._msg("飞扬 帮我看看")))
+        self.assertFalse(monitor.is_trigger(cfg, t, self._msg("测试助手 帮我看看")))
 
     def test_none_triggers_falls_back_to_default(self):
-        cfg = {"default_response_mode": "trigger", "default_triggers": ["飞扬"]}
+        cfg = {"default_response_mode": "trigger", "default_triggers": ["测试助手"]}
         t = {"response_mode": "trigger"}  # triggers missing
-        self.assertTrue(monitor.is_trigger(cfg, t, self._msg("飞扬 你好")))
+        self.assertTrue(monitor.is_trigger(cfg, t, self._msg("测试助手 你好")))
         self.assertFalse(monitor.is_trigger(cfg, t, self._msg("无关消息")))
 
     def test_self_sent_never_triggers(self):
-        cfg = {"default_response_mode": "trigger", "default_triggers": ["飞扬"]}
+        cfg = {"default_response_mode": "trigger", "default_triggers": ["测试助手"]}
         t = {"response_mode": "free", "triggers": []}
-        self.assertFalse(monitor.is_trigger(cfg, t, self._msg("飞扬", status=2)))
+        self.assertFalse(monitor.is_trigger(cfg, t, self._msg("测试助手", status=2)))
 
 
 class TestShouldEnterDurable(unittest.TestCase):
@@ -59,7 +59,7 @@ class TestShouldEnterDurable(unittest.TestCase):
     def _cfg(self, target):
         return {
             "default_response_mode": "trigger",
-            "default_triggers": ["飞扬"],
+            "default_triggers": ["测试助手"],
             "targets": [target],
             "session_window": 120,
         }
@@ -69,7 +69,7 @@ class TestShouldEnterDurable(unittest.TestCase):
             "name": "bot群聊测试",
             "username": "100001@chatroom",
             "response_mode": "trigger",
-            "triggers": ["飞扬的跟屁虫"],
+            "triggers": ["测试助手"],
             "mode": "group_assistant",
             "session_policy": {"timeout_seconds": 120, "max_turns": 5, "require_followup_intent": True},
         }
@@ -104,7 +104,7 @@ class TestShouldEnterDurable(unittest.TestCase):
     def test_trigger_hit_enters(self):
         t = self._target()
         enter, hit, sess = monitor.should_enter_durable(
-            self._cfg(t), t, self._msg("飞扬的跟屁虫 怎么退押金")
+            self._cfg(t), t, self._msg("测试助手 怎么退押金")
         )
         self.assertTrue(enter)
         self.assertTrue(hit)
@@ -112,14 +112,14 @@ class TestShouldEnterDurable(unittest.TestCase):
 
     def test_empty_triggers_skip(self):
         t = self._target(triggers=[])
-        enter, hit, sess = monitor.should_enter_durable(self._cfg(t), t, self._msg("飞扬 帮我"))
+        enter, hit, sess = monitor.should_enter_durable(self._cfg(t), t, self._msg("测试助手 帮我"))
         self.assertFalse(enter)
         self.assertFalse(hit)
 
     def test_active_session_followup_enters_without_keyword(self):
         t = self._target()
         cfg = self._cfg(t)
-        trigger = self._msg("飞扬的跟屁虫 怎么退押金")
+        trigger = self._msg("测试助手 怎么退押金")
         monitor._activate_session(t, trigger, cfg)
         enter, hit, sess = monitor.should_enter_durable(cfg, t, self._msg("还是失败了"))
         self.assertTrue(enter)
