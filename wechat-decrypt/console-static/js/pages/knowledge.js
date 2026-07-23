@@ -370,7 +370,7 @@ function renderLeannForm(kbs, localKbPaths, leannIndexes, leannError, refresh) {
 
   function updateMode() {
     const isNew = modeSelect.value === "(新建)";
-    indexNameWrap.style.display = isNew ? "" : "none";
+    indexNameWrap.classList.toggle("hidden", !isNew);
     indexCaption.textContent = isNew ? "" : `将绑定到已有索引：${modeSelect.value}`;
     if (isNew) indexName.value = newId.value.trim();
   }
@@ -464,9 +464,9 @@ function renderBindingSection(kbs, targets, refresh) {
     kbSelect.appendChild(opt);
   }
 
-  const warningEl = h("div", { class: "error-banner", style: "display:none" });
+  const warningEl = h("div", { class: "error-banner hidden" });
   const sourceCaption = h("div", { class: "kv" });
-  const leannInfo = h("div", { style: "display:none" });
+  const leannInfo = h("div", { class: "leann-hint hidden" });
 
   function currentTarget() {
     return targetOptions.find((o) => o.value === targetSelect.value)?.target || targets[0];
@@ -479,7 +479,7 @@ function renderBindingSection(kbs, targets, refresh) {
   function updateSelected() {
     const sel = selectedIds();
     const sources = new Set(sel.map((id) => kbSourceOf(kbs.find((k) => k.id === id) || {})));
-    warningEl.style.display = sources.size > 1 ? "" : "none";
+    warningEl.classList.toggle("hidden", sources.size <= 1);
     warningEl.textContent = sources.size > 1
       ? "一个监听目标只能绑定同源知识库。请只选同一个来源，例如只选 Obsidian、只选普通本地文件夹、只选 Get笔记，或只选 LEANN 索引。"
       : "";
@@ -493,16 +493,16 @@ function renderBindingSection(kbs, targets, refresh) {
           .filter(Boolean);
         if (allowed.length) {
           leannInfo.textContent = `该目标在工具 Agent 模式下只能检索以下 LEANN 索引：${allowed.join(", ")}`;
-          leannInfo.style.display = "";
+          leannInfo.classList.remove("hidden");
         } else {
-          leannInfo.style.display = "none";
+          leannInfo.classList.add("hidden");
         }
       } else {
-        leannInfo.style.display = "none";
+        leannInfo.classList.add("hidden");
       }
     } else {
       sourceCaption.textContent = "";
-      leannInfo.style.display = "none";
+      leannInfo.classList.add("hidden");
     }
   }
 
@@ -544,7 +544,7 @@ function renderBindingSection(kbs, targets, refresh) {
   const searchBtn = h("button", { class: "btn btn-primary", text: "模拟检索" });
   const diagBtn = h("button", { class: "btn btn-ghost", text: "诊断索引" });
   const boundSelect = h("select", { class: "select" });
-  const boundSelectWrap = h("div", { class: "form-row", style: "display:none" },
+  const boundSelectWrap = h("div", { class: "form-row hidden" },
     h("label", { text: "选择要测试的知识库" }),
     boundSelect
   );
@@ -564,10 +564,10 @@ function renderBindingSection(kbs, targets, refresh) {
     const bound = (t.knowledge_bases || []).filter((id) => kbs.some((k) => k.id === id));
     clear(boundSelect);
     if (bound.length <= 1) {
-      boundSelectWrap.style.display = "none";
+      boundSelectWrap.classList.add("hidden");
       return;
     }
-    boundSelectWrap.style.display = "";
+    boundSelectWrap.classList.remove("hidden");
     for (const id of bound) {
       boundSelect.appendChild(h("option", { value: id, text: kbOptionLabel(kbs, id) }));
     }
@@ -812,7 +812,7 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
   }
 
   // Action buttons (enable/disable/delete)
-  const actions = h("div", { style: "display:flex;gap:0.5rem;margin-top:0.5rem" });
+  const actions = h("div", { class: "btn-row" });
   const toggleBtn = h("button", {
     class: "btn " + (enabled ? "btn-ghost" : "btn-primary"),
     text: enabled ? "停用" : "启用",

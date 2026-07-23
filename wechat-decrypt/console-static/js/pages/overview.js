@@ -38,10 +38,7 @@ function renderName(t) {
 }
 
 function smallSpinner() {
-  return h("span", {
-    class: "spinner",
-    style: "width:14px;height:14px;display:inline-block;vertical-align:middle;margin-left:6px;",
-  });
+  return h("span", { class: "spinner spinner-inline" });
 }
 
 export async function render(root) {
@@ -226,23 +223,17 @@ export async function render(root) {
 
   function renderTopicCard(t) {
     const card = h("div", { class: "card topic-card" });
-    const header = h("div", {
-      class: "form-row",
-      style: "justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;",
-    });
+    const header = h("div", { class: "topic-head" });
     const title = h("h3", {
-      class: "card-title",
-      style: "margin:0;font-size:1rem;",
+      class: "topic-title",
       text: t.name || t.target_id || "未知目标",
     });
-    const statusWrap = h("span", {
-      style: "display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;",
-    });
+    const statusWrap = h("span", { class: "inline-flex" });
     statusWrap.appendChild(renderTopicStatus(t));
     if (t.stale) {
       statusWrap.appendChild(
         h("span", {
-          class: "caption", style: "margin:0;font-size:12px;",
+          class: "caption tight",
           text: "上次生成 " + fmtTs(t.generated_at) + "，正在更新…",
         })
       );
@@ -262,7 +253,7 @@ export async function render(root) {
     header.appendChild(refreshBtn);
     card.appendChild(header);
 
-    const body = h("div", { style: "margin-top:0.75rem;" });
+    const body = h("div", { class: "topic-body" });
     if (t.status === "building") {
       body.appendChild(spinner("正在生成话题…"));
     } else if (t.status === "error") {
@@ -286,7 +277,7 @@ export async function render(root) {
       if (!topics.length) {
         body.appendChild(emptyState("暂无话题"));
       } else {
-        const list = h("div", { style: "display:flex;flex-direction:column;gap:0.75rem;" });
+        const list = h("div", { class: "topic-list" });
         for (const topic of topics) {
           list.appendChild(renderTopicItem(topic));
         }
@@ -301,7 +292,7 @@ export async function render(root) {
     if (t.status === "building") {
       return h(
         "span",
-        { style: "display:inline-flex;align-items:center;" },
+        { class: "inline-flex" },
         badge("生成中", "info"),
         smallSpinner()
       );
@@ -319,7 +310,7 @@ export async function render(root) {
     if (topic.summary) {
       item.appendChild(
         h("p", {
-          class: "caption", style: "margin:0;",
+          class: "caption flush",
           text: topic.summary,
         })
       );

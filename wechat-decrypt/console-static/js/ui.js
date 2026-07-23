@@ -160,8 +160,8 @@ export function svgGroupedBars({ labels, series, height = 220 }) {
   const svg = document.createElementNS(svgNs, 'svg');
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
   svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-  svg.style.width = '100%';
-  svg.style.height = 'auto';
+  svg.setAttribute('class', 'chart-svg');
+  // sizing via .chart-card svg / .chart-svg CSS
 
   const g = document.createElementNS(svgNs, 'g');
   g.setAttribute('transform', `translate(${margin.left},${margin.top})`);
@@ -244,7 +244,7 @@ export function pageHeader(title, subtitle, actions) {
   }
   const el = h('div', { class: 'pageHeader' }, textCol);
   if (actions) {
-    const bar = h('div', { class: 'page-toolbar', style: 'margin:0;' });
+    const bar = h('div', { class: 'page-toolbar compact' });
     if (Array.isArray(actions)) actions.forEach((n) => n && bar.appendChild(n));
     else if (actions instanceof Node) bar.appendChild(actions);
     el.appendChild(bar);

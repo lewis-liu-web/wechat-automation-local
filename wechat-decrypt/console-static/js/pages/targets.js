@@ -237,7 +237,7 @@ export async function render(root) {
       : '';
     return h('div', { class: 'scan-banner' },
       h('div', { class: 'badge badge-ok', text: '扫描完成' }),
-      h('div', { class: 'caption', style: 'margin:6px 0 0;color:inherit;', text: lines.join(' · ') }),
+      h('div', { class: 'caption follow', text: lines.join(' · ') }),
       caption ? h('div', { class: 'field-hint', text: caption }) : null
     );
   }
@@ -269,7 +269,7 @@ export async function render(root) {
 
     const actions = [];
     if (!t.enabled && t.is_candidate) {
-      const catSelect = h('select', { class: 'select', style: 'width:auto;min-width:96px;' },
+      const catSelect = h('select', { class: 'select select-inline' },
         h('option', { value: 'user', selected: cat === 'user' }, '普通'),
         h('option', { value: 'admin', selected: cat === 'admin' }, '管理员')
       );
@@ -531,7 +531,7 @@ export async function render(root) {
     const durableToggle = h('label', { class: 'checkbox-row' }, durableInput, h('span', { text: '开启本群自动回复' }));
     const shadowToggle = h('label', { class: 'checkbox-row' }, shadowInput, h('span', { text: '只演练，不真发到微信' }));
     const autoReplyBody = h('div', null,
-      h('p', { style: 'margin:0 0 0.5rem;color:#666;', text: '打开后：群消息会进入自动回复后台（写库 → 想回复 → 发微信）。关闭后：仍继续监听并推进已读位置，但不会自动回。多个群可以同时打开。' }),
+      h('p', { class: 'field-hint', text: '打开后：群消息会进入自动回复后台（写库 → 想回复 → 发微信）。关闭后：仍继续监听并推进已读位置，但不会自动回。多个群可以同时打开。' }),
       durableToggle,
       shadowToggle,
       h('button', {
@@ -559,14 +559,14 @@ export async function render(root) {
 
     const storedMode = String(t.agent_mode || '').trim() || '（未设置，历史默认 standard）';
     const deprecatedBody = h('div', null,
-      h('p', { style: 'margin:0 0 0.5rem;color:#666;', text: '现在自动回复走：监听收消息 → 后台写库 → Agent 想回复 → 发微信。下面字段不会改变群聊是否自动回。' }),
+      h('p', { class: 'field-hint', text: '现在自动回复走：监听收消息 → 后台写库 → Agent 想回复 → 发微信。下面字段不会改变群聊是否自动回。' }),
       h('p', { text: '真正要改的：上面「这个群要不要自动回复」、响应模式、回复策略、触发词、知识库、专用 Agent、CUA 窗口标题、管理员。' }),
       h('p', { text: 'agent_mode / thin_monitor：旧离线脚本用，monitor 已不读。' }),
       h('div', { class: 'kv' },
         h('span', { text: '当前配置中的 agent_mode 只读值' }),
         h('span', { text: storedMode })
       ),
-      t.thin_monitor ? h('div', { class: 'card', style: 'background:#fffbeb;border-color:#f59e0b;' },
+      t.thin_monitor ? h('div', { class: 'warn-banner' },
         h('div', { text: '仍残留 thin_monitor=true。对 live monitor 无效果，建议清除。' }),
         h('button', {
           class: 'btn btn-sm btn-primary',
@@ -595,7 +595,7 @@ export async function render(root) {
       }, '清除 agent_mode 遗留字段') : null
     );
 
-    return h('div', { style: 'margin-top:1rem;' },
+    return h('div', { class: 'details-group' },
       t.enabled ? detailsEl('响应模式 / 会话策略', responseBody) : null,
       t.enabled ? detailsEl('类别 / 管理员设置', categoryBody) : null,
       t.enabled ? detailsEl('Agent 绑定', agentBody) : null,

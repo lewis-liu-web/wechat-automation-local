@@ -446,7 +446,7 @@ export async function render(root) {
         : h("div", { class: "badge badge-muted", text: "自动处理池未启动" }),
       h(
         "div",
-        { class: "form-row", style: "margin-top:0.75rem" },
+        { class: "form-row mt-3" },
         h("button", { class: "btn btn-primary btn-sm", text: "加入自动处理池", onclick: joinLoop }),
         h("button", { class: "btn btn-ghost btn-sm", text: "检查这个实例", onclick: checkInstance }),
         h("button", { class: "btn btn-danger btn-sm", text: "停止自动处理池", onclick: stopLoop })
