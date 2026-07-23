@@ -546,6 +546,18 @@ class ControlHandler(BaseHTTPRequestHandler):
             return _ok(**_reliable_quarantine_turn_job(m[0], body))
         if method == "POST" and (m := _match(path, "/reliable-pipeline/outbox/{id}/requeue")):
             return _ok(**_reliable_requeue_outbox(m[0], body))
+        if method == "GET" and path == "/reliable-pipeline/escalations":
+            limit = int((params.get("limit") or ["50"])[0])
+            cfg = reg.load_config()
+            db_path = reliable_worker._resolve_db_path(cfg, None)
+            items = reliable_pipeline.list_escalations(limit=limit, db_path=db_path)
+            return _ok(items=items, count=len(items))
+        if method == "GET" and path == "/reliable-pipeline/terminal-failures":
+            limit = int((params.get("limit") or ["50"])[0])
+            cfg = reg.load_config()
+            db_path = reliable_worker._resolve_db_path(cfg, None)
+            items = reliable_pipeline.list_recent_terminal_failures(limit=limit, db_path=db_path)
+            return _ok(items=items, count=len(items))
         # ---- M5 async: dispatcher / reconciler / sender ----
         if method == "POST" and path == "/agent/dispatcher/run-once":
             return _ok(**_async_dispatcher_run_once(body))

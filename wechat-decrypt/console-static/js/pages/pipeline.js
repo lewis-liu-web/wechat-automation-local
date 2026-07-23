@@ -1,4 +1,4 @@
-import { reliable_pipeline_status, reliable_scheduler_status, reliable_scheduler_start, reliable_scheduler_stop, requeue_reliable_outbox, list_targets } from "../api.js";
+import { reliable_pipeline_status, reliable_scheduler_status, reliable_scheduler_start, reliable_scheduler_stop, requeue_reliable_outbox, list_pipeline_escalations, list_pipeline_terminal_failures, list_targets } from "../api.js";
 import { h, clear, tableEl, badge, toast, spinner, metricCard, detailsEl, pageHeader, emptyState, fmtTs } from "../ui.js";
 
 const TABLE_CN = {
@@ -50,13 +50,15 @@ export async function render(root) {
     root.appendChild(spinner("加载管线状态…"));
 
     try {
-      const [rp, sch, targets] = await Promise.all([
+      const [rp, sch, targets, escalations, failures] = await Promise.all([
         reliable_pipeline_status(),
         reliable_scheduler_status(),
         list_targets("all"),
+        list_pipeline_escalations().catch(() => []),
+        list_pipeline_terminal_failures().catch(() => []),
       ]);
       if (aborted) return;
-      renderPage(rp, sch, targets);
+      renderPage(rp, sch, targets, escalations, failures);
     } catch (err) {
       showError(err.message || "加载失败", load);
     }
@@ -111,7 +113,7 @@ export async function render(root) {
     }
   }
 
-  function renderPage(rp, sch, targets) {
+  function renderPage(rp, sch, targets, escalations, failures) {
     clear(root);
 
     const enabled = Boolean(rp.enabled);
@@ -257,6 +259,54 @@ export async function render(root) {
           requeueBtn
         ));
       }
+    }
+
+    // Escalations and terminal failures
+    root.appendChild(h("h2", { class: "card-title" }, "升级与失败"));
+    root.appendChild(h("p", { text: "需要人工介入的升级，以及最近进入终态的失败任务。" }));
+
+    const escRows = (Array.isArray(escalations) ? escalations : []).map((e) => ({
+      jobId: e.job_id,
+      target: e.target_id,
+      reason: e.reason_code,
+      risk: e.risk_level,
+      created: e.created_at ? fmtTs(e.created_at) : "",
+    }));
+    if (!escRows.length) {
+      root.appendChild(emptyState("暂无需要升级的记录"));
+    } else {
+      root.appendChild(tableEl(
+        [
+          { key: "jobId", label: "任务ID" },
+          { key: "target", label: "目标" },
+          { key: "reason", label: "原因码" },
+          { key: "risk", label: "风险", render: (row) => badge(row.risk, row.risk === "high" ? "danger" : row.risk === "medium" ? "warning" : "info") },
+          { key: "created", label: "时间" },
+        ],
+        escRows
+      ));
+    }
+
+    const failRows = (Array.isArray(failures) ? failures : []).map((f) => ({
+      jobId: f.job_key || f.id,
+      status: f.status,
+      error: f.error,
+      target: f.target_id,
+      finished: f.finished_at ? fmtTs(f.finished_at) : "",
+    }));
+    if (!failRows.length) {
+      root.appendChild(emptyState("暂无终态失败任务"));
+    } else {
+      root.appendChild(tableEl(
+        [
+          { key: "jobId", label: "任务ID" },
+          { key: "status", label: "状态", render: (row) => badge(row.status, row.status === "failed" ? "danger" : row.status === "timeout" ? "warning" : "info") },
+          { key: "error", label: "错误", render: (row) => h("span", { title: row.error || "", text: (row.error || "").slice(0, 60) + ((row.error || "").length > 60 ? "…" : "") }) },
+          { key: "target", label: "目标" },
+          { key: "finished", label: "时间" },
+        ],
+        failRows
+      ));
     }
 
     // Auto-reply enabled groups

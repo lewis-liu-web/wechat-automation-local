@@ -371,6 +371,16 @@ export function requeue_reliable_outbox(outbox_id, reason) {
   });
 }
 
+export async function list_pipeline_escalations(limit = 50) {
+  const res = await _request('GET', '/reliable-pipeline/escalations' + toQuery({ limit }));
+  return res.items || [];
+}
+
+export async function list_pipeline_terminal_failures(limit = 50) {
+  const res = await _request('GET', '/reliable-pipeline/terminal-failures' + toQuery({ limit }));
+  return res.items || [];
+}
+
 // ---- Step 1f new endpoints ----
 
 export function overview_today() { return _request('GET', '/overview/today'); }

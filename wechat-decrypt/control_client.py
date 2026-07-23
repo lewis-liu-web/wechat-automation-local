@@ -522,6 +522,22 @@ def requeue_reliable_outbox(outbox_id: int, reason: str,
     )
 
 
+def list_reliable_pipeline_escalations(limit: int = 50,
+                                       base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]]:
+    """GET /reliable-pipeline/escalations — recent escalation rows."""
+    res = _request("GET", "/reliable-pipeline/escalations", base_url=base_url,
+                   params={"limit": str(limit)})
+    return res.get("items") or []
+
+
+def list_reliable_pipeline_terminal_failures(limit: int = 50,
+                                             base_url: str = DEFAULT_BASE_URL) -> List[Dict[str, Any]]:
+    """GET /reliable-pipeline/terminal-failures — recent failed/timeout/escalated jobs."""
+    res = _request("GET", "/reliable-pipeline/terminal-failures", base_url=base_url,
+                   params={"limit": str(limit)})
+    return res.get("items") or []
+
+
 def overview_today(base_url: str = DEFAULT_BASE_URL) -> Dict[str, Any]:
     """GET /overview/today — today's per-target and aggregate counts."""
     return _request("GET", "/overview/today", base_url=base_url)
@@ -647,6 +663,8 @@ __all__ = [
     "reliable_scheduler_start",
     "reliable_scheduler_stop",
     "requeue_reliable_outbox",
+    "list_reliable_pipeline_escalations",
+    "list_reliable_pipeline_terminal_failures",
     "overview_today",
     "overview_history",
     "overview_topics",

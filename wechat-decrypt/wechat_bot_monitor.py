@@ -67,6 +67,7 @@ _PER_MESSAGE_REASONS = {
     'reliable_pipeline_sender_not_allowed',
     'precheck_boundary',
     'trigger_skip',
+    'rate_limit_skip',
 }
 
 
@@ -316,6 +317,10 @@ CLOSE_SESSION_PATTERNS = ['谢谢', '谢了', '好了', '好啦', '明白', '懂
 # Key: target+sender, Value: [{'path': str, 'time': float}, ...]
 _pending_images = {}
 
+# In-memory rate limit hits per target+sender.
+# Key: target|sender, Value: list of enter timestamps (float)
+_RATE_LIMIT_HITS: dict[str, list[float]] = {}
+
 try:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # type: ignore[attr-defined]
@@ -405,6 +410,71 @@ def _session_key(t, msg):
         msg.get('sender_username') or '',
         key))
     return key
+
+
+def _rate_limit_key(t, msg):
+    """Unique key for rate limiting: target username + sender."""
+    sender = msg.get('real_sender_id')
+    if sender is None:
+        sender = msg.get('sender_username')
+        if not sender:
+            sender = msg.get('sender') or ''
+    return '%s|%s' % (t.get('username') or '', sender)
+
+
+def check_rate_limit(cfg, target, msg, now=None):
+    """Return (allowed, info) for one durable ingress attempt.
+
+    Counts only enters that would go durable; caller must invoke only when
+    should_enter_durable has already returned enter=True.
+    """
+    resolved = None
+    target_rl = target.get('rate_limit')
+    if isinstance(target_rl, dict):
+        resolved = target_rl
+    if resolved is None:
+        cfg_rl = cfg.get('rate_limit')
+        if isinstance(cfg_rl, dict):
+            resolved = cfg_rl
+    if resolved is None:
+        resolved = {"window_seconds": 60, "max_enters": 3}
+
+    if resolved.get('enabled') is False:
+        return True, {
+            'window_seconds': resolved.get('window_seconds', 60),
+            'max_enters': resolved.get('max_enters', 3),
+            'count': 0,
+            'key': _rate_limit_key(target, msg),
+            'enabled': False,
+        }
+
+    now = now if now is not None else time.time()
+    window_seconds = int(resolved.get('window_seconds', 60))
+    max_enters = int(resolved.get('max_enters', 3))
+    key = _rate_limit_key(target, msg)
+    hits = _RATE_LIMIT_HITS.setdefault(key, [])
+    cutoff = now - window_seconds
+    # Keep simple: prune in place on every check.
+    hits[:] = [ts for ts in hits if ts > cutoff]
+    if len(hits) >= max_enters:
+        return False, {
+            'window_seconds': window_seconds,
+            'max_enters': max_enters,
+            'count': len(hits),
+            'key': key,
+        }
+    hits.append(now)
+    return True, {
+        'window_seconds': window_seconds,
+        'max_enters': max_enters,
+        'count': len(hits),
+        'key': key,
+    }
+
+
+def reset_rate_limit_state():
+    """Clear in-memory rate limit state; test helper."""
+    _RATE_LIMIT_HITS.clear()
 
 
 def _clear_expired_sessions(cfg):
@@ -1739,6 +1809,16 @@ def main():
                     continue
                 if _trigger_hit and not _session_active:
                     _activate_session(t, m, cfg)
+                # --- rate-limit gate (single-process, in-memory) ---
+                _rl_ok, _rl_info = check_rate_limit(cfg, t, m)
+                if not _rl_ok:
+                    log('rate_limit_skip target=%s local_id=%s sender=%s count=%s max=%s window=%s' % (
+                        t.get('name'), lid, sender, _rl_info['count'],
+                        _rl_info['max_enters'], _rl_info['window_seconds']))
+                    _record_event('rate_limit_skip', target=t.get('name'), sender=sender,
+                                  payload={'local_id': lid, **_rl_info})
+                    _advance_cursor(t, lid, 'rate_limit_skip')
+                    continue
                 # --- durable ingress (single path; survives monitor restarts) ---
                 _rl_event_context = {
                     'mode': 'durable_ingress',
@@ -1746,6 +1826,7 @@ def main():
                     'sender': sender,
                     'session_active': bool(_session_active or _trigger_hit),
                     'trigger_hit': _trigger_hit,
+                    'rate_limit_count': _rl_info['count'],
                 }
                 _rl_result = durable_ingress_event(
                     t, m, cfg=cfg, config_path=config_path, db_path=_rl_db_path,

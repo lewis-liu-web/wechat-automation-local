@@ -843,6 +843,59 @@ def list_dead_letters(*, limit: int = 50, db_path: Optional[Path] = None) -> Lis
     return [item for row in rows if (item := _row(row))]
 
 
+def list_escalations(*, limit: int = 50, db_path: Optional[Path] = None) -> list[dict]:
+    """Return recent escalations with optional joined job status."""
+    with _connect(db_path) as con:
+        rows = con.execute(
+            """SELECT e.id, e.job_id, e.target_id, e.group_key, e.reason_code,
+                      e.risk_level, e.created_at, j.status AS job_status
+               FROM escalations e
+               LEFT JOIN turn_jobs j ON j.id = e.job_id
+               ORDER BY e.created_at DESC
+               LIMIT ?""",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_recent_terminal_failures(*, limit: int = 50, db_path: Optional[Path] = None) -> list[dict]:
+    """Return terminal turn jobs (failed, timeout, escalated) with reason_code snippet."""
+    with _connect(db_path) as con:
+        rows = con.execute(
+            """SELECT id, job_key, target_id, group_key, status, error,
+                      finished_at, created_at, result_json
+               FROM turn_jobs
+               WHERE status IN (?, ?, ?)
+               ORDER BY COALESCE(finished_at, created_at) DESC
+               LIMIT ?""",
+            (JOB_FAILED, JOB_TIMEOUT, JOB_ESCALATED, max(1, int(limit))),
+        ).fetchall()
+    out = []
+    for row in rows:
+        reason_code = ""
+        raw_json = row["result_json"]
+        if raw_json:
+            try:
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, dict):
+                    reason_code = parsed.get("reason_code") or ""
+            except (ValueError, json.JSONDecodeError):
+                pass
+        out.append({
+            "id": row["id"],
+            "job_key": row["job_key"],
+            "target_id": row["target_id"],
+            "group_key": row["group_key"],
+            "status": row["status"],
+            "error": row["error"],
+            "finished_at": row["finished_at"],
+            "created_at": row["created_at"],
+            "result_json": raw_json[:240] if raw_json else "",
+            "reason_code": reason_code,
+        })
+    return out
+
+
 def record_send_started(*, outbox_id: int, lease_id: str, lease_extension_seconds: float = 45.0,
                         db_path: Optional[Path] = None, now: Optional[float] = None) -> bool:
     """Persist the moment the sender is about to be invoked for a claimed row.
