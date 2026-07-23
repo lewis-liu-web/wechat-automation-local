@@ -281,7 +281,7 @@ async function renderPage(root, clearTimers, buildPollTimers) {
 
   // 已配置知识库
   container.appendChild(
-    h("h3", { text: "已配置知识库" })
+    h("h3", { class: "section-heading", text: "已配置知识库" })
   );
   if (!kbs.length) {
     container.appendChild(emptyState("未配置知识库。"));
@@ -366,7 +366,7 @@ function renderLeannForm(kbs, localKbPaths, leannIndexes, leannError, refresh) {
 
   // Update indexName visibility based on mode
   const indexNameWrap = h("div", null, h("label", { text: "LEANN 索引名" }), indexName);
-  const indexCaption = h("div", { class: "kv" });
+  const indexCaption = h("div", { class: "caption flush" });
 
   function updateMode() {
     const isNew = modeSelect.value === "(新建)";
@@ -416,25 +416,27 @@ function renderLeannForm(kbs, localKbPaths, leannIndexes, leannError, refresh) {
 
   return h("div", { class: "card" },
     h("div", { class: "card-title", text: "新增 LEANN 索引" }),
-    leannError
-      ? h("div", { class: "error-banner", text: `读取现有 LEANN 索引列表失败：${leannError}` })
-      : null,
-    h("div", { class: "form-row" },
-      h("label", { text: "选择已有索引或新建" }),
-      modeSelect
-    ),
-    h("div", { class: "form-grid" },
-      h("div", null, h("label", { text: "别名" }), newId),
-      h("div", null, h("label", { text: "说明" }), newDesc),
-      indexNameWrap,
-      indexCaption
-    ),
-    h("div", { class: "form-grid" },
-      h("div", null, h("label", { text: "来源目录" }), docsDir),
-      h("div", null, h("label", { text: "从本地 KB 复制路径" }), copyFrom)
-    ),
-    h("label", { class: "checkbox-row" }, buildNow, h("span", { text: "创建后立即后台构建索引" })),
-    createBtn
+    h("div", { class: "card-body stack" },
+      leannError
+        ? h("div", { class: "error-banner", text: `读取现有 LEANN 索引列表失败：${leannError}` })
+        : null,
+      h("div", { class: "form-row" },
+        h("label", { text: "选择已有索引或新建" }),
+        modeSelect
+      ),
+      h("div", { class: "form-grid" },
+        h("div", null, h("label", { text: "别名" }), newId),
+        h("div", null, h("label", { text: "说明" }), newDesc),
+        indexNameWrap
+      ),
+      indexCaption,
+      h("div", { class: "form-grid" },
+        h("div", null, h("label", { text: "来源目录" }), docsDir),
+        h("div", null, h("label", { text: "从本地 KB 复制路径" }), copyFrom)
+      ),
+      h("label", { class: "checkbox-row" }, buildNow, h("span", { text: "创建后立即后台构建索引" })),
+      h("div", { class: "btn-row" }, createBtn)
+    )
   );
 }
 
@@ -442,9 +444,11 @@ function renderBindingSection(kbs, targets, refresh) {
   const card = h("div", { class: "card" },
     h("div", { class: "card-title", text: "绑定知识库到目标" })
   );
+  const body = h("div", { class: "card-body stack" });
 
   if (!targets.length) {
-    card.appendChild(h("div", { class: "muted", text: "暂无可绑定目标。" }));
+    body.appendChild(h("div", { class: "muted", text: "暂无可绑定目标。" }));
+    card.appendChild(body);
     return card;
   }
 
@@ -465,7 +469,7 @@ function renderBindingSection(kbs, targets, refresh) {
   }
 
   const warningEl = h("div", { class: "error-banner hidden" });
-  const sourceCaption = h("div", { class: "kv" });
+  const sourceCaption = h("div", { class: "caption flush" });
   const leannInfo = h("div", { class: "leann-hint hidden" });
 
   function currentTarget() {
@@ -637,20 +641,21 @@ function renderBindingSection(kbs, targets, refresh) {
   searchBtn.onclick = doTargetSearch;
   diagBtn.onclick = doTargetDiagnose;
 
-  card.appendChild(h("div", { class: "form-row" },
+  body.appendChild(h("div", { class: "form-row" },
     h("label", { text: "选择目标" }),
     targetSelect
   ));
-  card.appendChild(h("div", { class: "form-row" },
+  body.appendChild(h("div", { class: "form-row" },
     h("label", { text: "绑定知识库" }),
     kbSelect
   ));
-  card.appendChild(warningEl);
-  card.appendChild(sourceCaption);
-  card.appendChild(leannInfo);
-  card.appendChild(saveBtn);
-  card.appendChild(diagSection);
+  body.appendChild(warningEl);
+  body.appendChild(sourceCaption);
+  body.appendChild(leannInfo);
+  body.appendChild(saveBtn);
+  body.appendChild(diagSection);
 
+  card.appendChild(body);
   return card;
 }
 
@@ -659,63 +664,94 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
   const enabled = Boolean(kb.enabled);
   const type = kbTypeOf(kb);
   const managed = kb.managed !== false;
+  const sourceLabel = labelSource(kbSourceOf(kb));
 
-  const titleBits = [kbId, enabled ? "已启用" : "已停用"];
+  // --- title / badges ---
+  let typeBadge = null;
   if (type === "local") {
     const fc = kb.file_count;
-    if (Number.isInteger(fc) && fc) titleBits.push(`${fc} 个文档`);
+    typeBadge = Number.isInteger(fc) && fc
+      ? badge(`${fc} 个文档`, "info")
+      : badge("本地", "info");
   } else if (type === "getnote" || type === "ima") {
-    const name = (kb.online_name || "").trim();
-    const noteCount = kb.online_note_count;
-    const fileCount = kb.online_file_count;
-    if (name) {
-      let detail = `知识库/文件夹：${name}（ID：${kb.knowledge_base_id || ""}）`;
-      const bits = [];
-      if (Number.isInteger(noteCount) && noteCount) bits.push(`笔记 ${noteCount}`);
-      if (Number.isInteger(fileCount) && fileCount) bits.push(`文件 ${fileCount}`);
-      if (bits.length) detail += `（${bits.join("，")}）`;
-      titleBits.push(detail);
-    } else {
-      titleBits.push(`在线知识库（名称未获取：${kb.online_error || "未知"}）`);
-    }
+    typeBadge = badge(type === "getnote" ? "Get笔记" : "IMA", "info");
   } else if (type === "leann") {
-    const idx = kb.index_name || kb.knowledge_base_id || "";
     const exists = Boolean(kb.exists);
-    if (idx) titleBits.push(`LEANN 索引：${idx} ${exists ? "（存在）" : "（缺失）"}`);
-    else titleBits.push("LEANN 索引未配置");
+    typeBadge = badge(exists ? "LEANN · 存在" : "LEANN · 缺失", exists ? "ok" : "warn");
+  } else if (type) {
+    typeBadge = badge(type, "muted");
   }
 
-  const card = h("div", { class: "card" });
+  // --- meta rows (proper k/v so long paths use full width) ---
+  const meta = h("div", { class: "kv-stack" });
+  function addRow(label, value, valueClass) {
+    if (value === null || value === undefined || value === "") return;
+    const vCls = valueClass ? `v ${valueClass}` : "v";
+    meta.appendChild(
+      h("div", { class: "kv" },
+        h("span", { class: "k", text: label }),
+        h("span", { class: vCls, text: String(value) })
+      )
+    );
+  }
 
-  const header = h("div", {});
-  const title = h("div", { class: "card-title" },
-    h("span", { text: titleBits.join(" · ") })
-  );
-  header.appendChild(title);
+  addRow("来源", sourceLabel);
+  addRow("说明", (kb.description || "").trim() || "—");
+  if (!managed) addRow("注册状态", "未注册（只读）");
 
-  // Source / description line
-  const managedCaption = managed ? "" : " · 未注册";
-  header.appendChild(h("div", { class: "kv" },
-    h("span", { text: `来源：${labelSource(kbSourceOf(kb))} · 说明：${kb.description || ""}${managedCaption}` })
-  ));
-  if (kb.path) header.appendChild(h("div", { class: "kv" }, h("span", { text: `路径：${kb.path}` })));
-  if (kb.knowledge_base_id) header.appendChild(h("div", { class: "kv" }, h("span", { text: `外部ID：${kb.knowledge_base_id}` })));
-  if (kb.index_name) header.appendChild(h("div", { class: "kv" }, h("span", { text: `LEANN 索引名：${kb.index_name}` })));
-
-  // LEANN-specific: docs_dir, edit, build status, log
+  if (type === "local") {
+    addRow("路径", kb.path || "—", "path-value");
+  }
+  if (type === "getnote" || type === "ima") {
+    const name = (kb.online_name || "").trim();
+    if (name) {
+      const bits = [];
+      if (Number.isInteger(kb.online_note_count) && kb.online_note_count) bits.push(`笔记 ${kb.online_note_count}`);
+      if (Number.isInteger(kb.online_file_count) && kb.online_file_count) bits.push(`文件 ${kb.online_file_count}`);
+      addRow("在线库", bits.length ? `${name}（${bits.join("，")}）` : name);
+    } else if (kb.online_error) {
+      addRow("在线库", `名称未获取：${kb.online_error}`, "text-warn");
+    }
+    if (kb.knowledge_base_id) addRow("外部ID", kb.knowledge_base_id, "path-value");
+  }
   if (type === "leann") {
+    addRow("索引名", kb.index_name || kb.knowledge_base_id || "—", "path-value");
     const docsDir = kb.docs_dir || "";
     const docsDirResolved = kb.docs_dir_resolved || "";
     if (docsDir) {
-      header.appendChild(h("div", { class: "kv" }, h("span", {
-        text: `来源目录：${docsDir}${docsDirResolved && docsDirResolved !== docsDir ? ` → ${docsDirResolved}` : ""}`,
-      })));
-    } else {
-      header.appendChild(h("div", { class: "error-banner" }, h("span", { text: "未配置来源目录（docs_dir），无法构建索引。请在这里补充来源目录。" })));
+      addRow(
+        "来源目录",
+        docsDirResolved && docsDirResolved !== docsDir ? `${docsDir}  →  ${docsDirResolved}` : docsDir,
+        "path-value"
+      );
+    }
+    if (kb.index_path) addRow("物理位置", kb.index_path, "path-value");
+  } else if (kb.path && type !== "local") {
+    addRow("路径", kb.path, "path-value");
+  }
+
+  // --- LEANN: missing docs_dir warning + edit + build ---
+  const leannBlocks = [];
+  if (type === "leann") {
+    const docsDir = kb.docs_dir || "";
+    if (!docsDir) {
+      leannBlocks.push(
+        h("div", { class: "error-banner" },
+          h("span", { text: "未配置来源目录（docs_dir），无法构建索引。请在下方补充。" })
+        )
+      );
     }
 
-    const editDocsDir = h("input", { class: "input", value: docsDir, placeholder: "例如 wiki/workdocs 或 C:\\docs\\work" });
-    const saveDocsBtn = h("button", { class: "btn btn-primary", text: "保存来源目录" });
+    const editDocsDir = h("input", {
+      class: "input",
+      value: docsDir,
+      placeholder: "例如 wiki/workdocs 或 C:\\docs\\work",
+    });
+    const saveDocsBtn = h("button", {
+      class: "btn btn-primary btn-sm",
+      type: "button",
+      text: "保存来源目录",
+    });
     saveDocsBtn.onclick = async () => {
       const v = editDocsDir.value.trim();
       if (!v) {
@@ -742,79 +778,193 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
         toast(`保存失败：${err.message}`, "err");
       }
     };
-    const editDetails = detailsEl("编辑 LEANN 来源目录", h("div", null,
-      h("div", { class: "form-row" }, h("label", { text: "来源目录" }), editDocsDir),
-      saveDocsBtn
-    ), !docsDir);
-    header.appendChild(editDetails);
+    leannBlocks.push(
+      detailsEl(
+        "编辑 LEANN 来源目录",
+        h("div", { class: "stack-sm" },
+          h("div", { class: "form-row" },
+            h("label", { text: "来源目录" }),
+            editDocsDir
+          ),
+          saveDocsBtn
+        ),
+        !docsDir
+      )
+    );
 
-    if (kb.index_path) header.appendChild(h("div", { class: "kv" }, h("span", { text: `物理位置：${kb.index_path}` })));
-
-    const canBuild = Boolean(docsDirResolved || docsDir);
     const buildBtn = h("button", {
-      class: "btn btn-primary",
-      text: "🔄 重建索引",
-      disabled: !canBuild,
-      title: canBuild ? "" : "先配置来源目录",
+      class: "btn btn-primary btn-sm",
+      type: "button",
+      text: "重建索引",
     });
-    const buildStatusEl = h("div", {});
+    const buildStatusEl = h("span", { class: "badge badge-muted", text: "—" });
+
+    function applyBuildStatus(info) {
+      if (!info) {
+        buildStatusEl.className = "badge badge-muted";
+        buildStatusEl.textContent = "—";
+        return;
+      }
+      const st = String(info.status || "");
+      if (st === "running" || st === "started" || st === "pending") {
+        buildStatusEl.className = "badge badge-info";
+        buildStatusEl.textContent = `构建中 · ${st}`;
+      } else if (st === "done" || st === "success" || st === "completed") {
+        buildStatusEl.className = "badge badge-ok";
+        const raw = info.finished_at || info.updated_at || info.started_at || "";
+        let tsLabel = "";
+        if (raw !== "" && raw !== null && raw !== undefined) {
+          const n = Number(raw);
+          if (Number.isFinite(n) && n > 1e9) tsLabel = fmtTs(n > 1e12 ? n / 1000 : n);
+          else tsLabel = String(raw).slice(0, 16).replace("T", " ");
+        }
+        buildStatusEl.textContent = tsLabel
+          ? `构建完成 · ${tsLabel}`
+          : "构建完成";
+      } else if (st === "error" || st === "failed") {
+        buildStatusEl.className = "badge badge-err";
+        buildStatusEl.textContent = `构建失败 · ${st}`;
+      } else {
+        buildStatusEl.className = "badge badge-muted";
+        buildStatusEl.textContent = st || "—";
+      }
+    }
+
+    // seed status from kb if present
+    if (kb.last_build_status || kb.build_status) {
+      applyBuildStatus({
+        status: kb.last_build_status || kb.build_status,
+        finished_at: kb.last_build_finished_at || kb.last_build_at,
+      });
+    } else if (kb.last_build_id) {
+      buildStatusEl.textContent = "有历史构建";
+    }
+
+    function startBuildPoll(buildId) {
+      if (!buildId || !buildPollTimers) return;
+      if (buildPollTimers[kbId]) {
+        clearInterval(buildPollTimers[kbId]);
+        delete buildPollTimers[kbId];
+      }
+      const tick = async () => {
+        try {
+          const info = await leann_build_status(kbId, buildId || "");
+          applyBuildStatus(info);
+          const st = String((info && info.status) || "");
+          if (["done", "success", "completed", "error", "failed"].includes(st)) {
+            clearInterval(buildPollTimers[kbId]);
+            delete buildPollTimers[kbId];
+            if (st === "done" || st === "success" || st === "completed") {
+              // soft refresh index existence
+              setTimeout(() => refresh(), 400);
+            }
+          }
+        } catch (err) {
+          buildStatusEl.className = "badge badge-err";
+          buildStatusEl.textContent = `读取构建状态失败：${err.message}`;
+        }
+      };
+      tick();
+      buildPollTimers[kbId] = setInterval(tick, 2000);
+    }
 
     buildBtn.onclick = async () => {
       try {
         const res = await build_leann_kb(kbId, null, true);
         toast(`已启动后台构建：${res.build_id || ""}`, "ok");
-        startBuildPoll(res.build_id);
+        applyBuildStatus({ status: "started" });
+        if (res.build_id) startBuildPoll(res.build_id);
       } catch (err) {
         toast(`启动失败：${err.message}`, "err");
       }
     };
 
-    function startBuildPoll(buildId) {
-      clearTimeout(buildPollTimers[kbId]);
-      const poll = async () => {
-        try {
-          const info = await leann_build_status(kbId, buildId || "");
-          renderBuildStatus(buildStatusEl, info, kbId, refresh, buildPollTimers);
-          if (info.status === "running" || info.status === "started") {
-            buildPollTimers[kbId] = setTimeout(poll, 2000);
-          }
-        } catch (err) {
-          buildStatusEl.textContent = `读取构建状态失败：${err.message}`;
-        }
-      };
-      poll();
-    }
+    if (kb.last_build_id) startBuildPoll(kb.last_build_id);
 
-    // Show persisted latest build status if any
-    if (kb.last_build_id) {
-      startBuildPoll(kb.last_build_id);
-    }
+    leannBlocks.push(
+      h("div", { class: "kb-toolbar" }, buildBtn, buildStatusEl)
+    );
 
-    const buildRow = h("div", { class: "form-row" }, buildBtn, buildStatusEl);
-    header.appendChild(buildRow);
-
-    // Build log details
     const logBody = h("div");
     const logDetails = detailsEl("查看构建日志", logBody);
     logDetails.addEventListener("toggle", async () => {
       if (!logDetails.open) return;
       try {
         const info = await leann_build_log(kbId, kb.last_build_id || null);
-        logBody.textContent = "";
-        const pre = h("pre", {}, h("code", { text: info.log_tail || "" }));
-        logBody.appendChild(pre);
+        clear(logBody);
+        logBody.appendChild(h("pre", null, h("code", { text: info.log_tail || "（空）" })));
       } catch (err) {
         clear(logBody);
-        logBody.appendChild(h("div", { class: "muted", text: err.status === 404 ? "暂无日志" : `读取日志失败：${err.message}` }));
+        logBody.appendChild(
+          h("div", {
+            class: "muted",
+            text: err.status === 404 ? "暂无日志" : `读取日志失败：${err.message}`,
+          })
+        );
       }
     }, { once: false });
-    header.appendChild(logDetails);
+    leannBlocks.push(logDetails);
   }
 
-  // Action buttons (enable/disable/delete)
-  const actions = h("div", { class: "btn-row" });
+  // --- local KB: upload / import ---
+  const localBlocks = [];
+  if (type === "local") {
+    const fileInput = h("input", { class: "input", type: "file", multiple: true });
+    const dirInput = h("input", {
+      class: "input",
+      type: "text",
+      placeholder: "或填写目录路径，例如 C:\\\\docs\\\\project-x",
+    });
+    const importBtn = h("button", {
+      class: "btn btn-primary btn-sm",
+      type: "button",
+      text: "导入文件",
+    });
+    importBtn.onclick = async () => {
+      const files = fileInput.files;
+      const source = (dirInput.value || "").trim();
+      if ((!files || !files.length) && !source) {
+        toast("请先选择文件或输入目录路径", "err");
+        return;
+      }
+      importBtn.disabled = true;
+      const prev = importBtn.textContent;
+      importBtn.textContent = "导入/转换中…";
+      try {
+        if (files && files.length) {
+          const fileList = await readFilesAsBase64(files);
+          await upload_kb_files(kbId, fileList);
+          toast(`已上传 ${fileList.length} 个文件`, "ok");
+          fileInput.value = "";
+        }
+        if (source) {
+          await import_kb(kbId, source, true);
+          toast("已从目录导入", "ok");
+        }
+        refresh();
+      } catch (err) {
+        toast(`导入失败：${err.message}`, "err");
+      } finally {
+        importBtn.disabled = false;
+        importBtn.textContent = prev;
+      }
+    };
+    localBlocks.push(
+      detailsEl(
+        "导入文档",
+        h("div", { class: "stack" },
+          h("div", { class: "form-row" }, h("label", { text: "选择文件" }), fileInput),
+          h("div", { class: "form-row" }, h("label", { text: "目录路径" }), dirInput),
+          importBtn
+        )
+      )
+    );
+  }
+
+  // --- actions ---
   const toggleBtn = h("button", {
-    class: "btn " + (enabled ? "btn-ghost" : "btn-primary"),
+    class: "btn " + (enabled ? "btn-ghost" : "btn-primary") + " btn-sm",
+    type: "button",
     text: enabled ? "停用" : "启用",
     disabled: !managed,
     title: managed ? "" : "未注册的 KB 无法启用/停用",
@@ -831,13 +981,13 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
   };
 
   const deleteBtn = h("button", {
-    class: "btn btn-danger",
+    class: "btn btn-danger btn-sm",
+    type: "button",
     text: "删除",
     disabled: !managed,
-    title: managed ? "" : "未注册的 KB 无法删除",
   });
   deleteBtn.onclick = async () => {
-    if (!confirmDanger(`确定删除知识库「${kbId}」？`)) return;
+    if (!confirmDanger(`确定删除知识库「${kbId}」？此操作不可恢复。`)) return;
     try {
       await delete_kb(kbId, false);
       toast("已删除", "ok");
@@ -847,83 +997,27 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
     }
   };
 
-  actions.appendChild(toggleBtn);
-  actions.appendChild(deleteBtn);
-  header.appendChild(actions);
-  card.appendChild(header);
-
-  // Local KB import
-  if (type === "local") {
-    const fileInput = h("input", { type: "file", multiple: true });
-    const dirInput = h("input", { class: "input", placeholder: "例如 C:\\docs\\project-x" });
-    const progressEl = h("div", {});
-    const resultEl = h("div", {});
-
-    // Restore any persisted import result
-    if (lastImports.has(kbId)) {
-      renderImportResult(resultEl, lastImports.get(kbId), kbId);
-    }
-
-    const importBtn = h("button", { class: "btn btn-primary", text: "导入到知识库" });
-    importBtn.onclick = async () => {
-      const files = fileInput.files;
-      const dirPath = dirInput.value.trim();
-      if (!files.length && !dirPath) {
-        toast("请先选择文件或输入目录路径", "err");
-        return;
-      }
-      progressEl.textContent = "导入/转换中…";
-      clear(resultEl);
-      try {
-        let source = dirPath;
-        if (files.length) {
-          const fileList = await readFilesAsBase64(files);
-          const uploadRes = await upload_kb_files(kbId, fileList);
-          source = uploadRes.staging_dir;
-        }
-        const res = await import_kb(kbId, source, true);
-        const copied = res.copied || [];
-        const failed = res.failed || [];
-        const nOk = copied.length;
-        const nFail = failed.length;
-        const importState = { copied, failed, ts: Date.now() };
-        lastImports.set(kbId, importState);
-        progressEl.textContent = "";
-        fileInput.value = "";
-        renderImportResult(resultEl, importState, kbId);
-        if (nFail) toast(`导入 ${nOk} 个文件，${nFail} 个失败。`, "err");
-        else toast(`已导入 ${nOk} 个文件`, "ok");
-        refresh();
-      } catch (err) {
-        progressEl.textContent = "";
-        toast(`导入失败：${err.message}`, "err");
-      }
-    };
-
-    const importDetails = detailsEl("导入文件或目录", h("div", null,
-      h("div", { class: "form-row" },
-        h("label", { text: "选择要导入的文件（可多选）" }),
-        fileInput
-      ),
-      h("div", { class: "form-row" },
-        h("label", { text: "或直接输入本地目录路径" }),
-        dirInput
-      ),
-      importBtn,
-      progressEl,
-      resultEl
-    ));
-    card.appendChild(importDetails);
-  }
-
-  // Test search / open directory
+  // --- test / open ---
+  const testBlocks = [];
   if (type === "local" || type === "leann") {
-    const qInput = h("input", { class: "input", placeholder: "例如：押金怎么退" });
-    const testResultEl = h("div");
-
-    const searchBtn = h("button", { class: "btn btn-primary", text: "查询" });
+    const queryInput = h("input", {
+      class: "input",
+      type: "text",
+      placeholder: "例如：押金怎么退",
+    });
+    const testResultEl = h("div", { class: "kb-test-result" });
+    const searchBtn = h("button", {
+      class: "btn btn-primary btn-sm",
+      type: "button",
+      text: "查询",
+    });
+    const diagBtn = h("button", {
+      class: "btn btn-ghost btn-sm",
+      type: "button",
+      text: "诊断索引",
+    });
     searchBtn.onclick = async () => {
-      const q = qInput.value.trim();
+      const q = queryInput.value.trim();
       if (!q) {
         toast("请先输入查询词", "err");
         return;
@@ -935,49 +1029,82 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
         toast(`查询失败：${err.message}`, "err");
       }
     };
-
-    const diagBtn = h("button", { class: "btn btn-ghost", text: "诊断索引" });
     diagBtn.onclick = async () => {
-      const q = qInput.value.trim();
-      if (!q && type !== "leann") {
-        toast("请先输入查询词", "err");
-        return;
-      }
+      const q = queryInput.value.trim() || "测试";
       try {
         const res = await diagnose_kb(kbId, q);
-        renderDiagnoseResult(testResultEl, res);
+        clear(testResultEl);
+        testResultEl.appendChild(
+          h("pre", null, h("code", { text: JSON.stringify(res, null, 2) }))
+        );
       } catch (err) {
         toast(`诊断失败：${err.message}`, "err");
       }
     };
 
-    const openBtn = h("button", { class: "btn btn-ghost", text: kbSourceOf(kb) === "obsidian" ? "打开 Obsidian" : "打开目录" });
-    openBtn.onclick = async () => {
-      try {
-        if (kbSourceOf(kb) === "obsidian") {
-          await open_kb_obsidian(kbId);
-          toast("已打开 Obsidian", "ok");
-        } else {
+    const openBtns = [];
+    if (type === "local" || type === "leann") {
+      const openBtn = h("button", {
+        class: "btn btn-ghost btn-sm",
+        type: "button",
+        text: "打开目录",
+      });
+      openBtn.onclick = async () => {
+        try {
           await open_kb(kbId);
           toast("已打开目录", "ok");
+        } catch (err) {
+          toast(`打开失败：${err.message}`, "err");
         }
-      } catch (err) {
-        toast(`打开失败：${err.message}`, "err");
-      }
-    };
+      };
+      openBtns.push(openBtn);
+    }
+    // obsidian open if applicable
+    if (String(kbSourceOf(kb) || "").includes("obsidian") || kb.source === "obsidian") {
+      const obsBtn = h("button", {
+        class: "btn btn-ghost btn-sm",
+        type: "button",
+        text: "打开 Obsidian",
+      });
+      obsBtn.onclick = async () => {
+        try {
+          await open_kb_obsidian(kbId);
+          toast("已打开 Obsidian", "ok");
+        } catch (err) {
+          toast(`打开失败：${err.message}`, "err");
+        }
+      };
+      openBtns.push(obsBtn);
+    }
 
-    const testDetails = detailsEl("测试检索 / 打开目录", h("div", null,
-      h("div", { class: "form-row" },
-        h("label", { text: "查询词（测试这个知识库的检索效果）" }),
-        qInput
-      ),
-      h("div", { class: "form-row" }, searchBtn, diagBtn, openBtn),
-      testResultEl
-    ));
-    card.appendChild(testDetails);
+    testBlocks.push(
+      detailsEl(
+        "测试检索 / 打开目录",
+        h("div", { class: "stack" },
+          h("div", { class: "form-row" },
+            h("label", { text: "查询词" }),
+            queryInput
+          ),
+          h("div", { class: "btn-row" }, searchBtn, diagBtn, ...openBtns),
+          testResultEl
+        )
+      )
+    );
   }
 
-  return card;
+  const head = h("div", { class: "card-head" },
+    h("div", { class: "card-head-main" },
+      h("span", { class: "card-head-title", text: kbId || "(no id)" }),
+      badge(enabled ? "已启用" : "已停用", enabled ? "ok" : "muted"),
+      typeBadge
+    ),
+    h("div", { class: "card-actions" }, toggleBtn, deleteBtn)
+  );
+
+  const bodyChildren = [meta, ...leannBlocks, ...localBlocks, ...testBlocks];
+  const body = h("div", { class: "card-body kb-card-body" }, ...bodyChildren);
+
+  return h("div", { class: "card kb-card" }, head, body);
 }
 
 function renderSearchResult(el, res) {
@@ -985,22 +1112,21 @@ function renderSearchResult(el, res) {
   const hits = res.hits || [];
   const matched = res.matched_files || 0;
   const total = res.total_files || 0;
-  el.appendChild(h("div", { class: "muted" }, h("span", { text: `命中 ${matched} / ${total} 个文档` })));
+  el.appendChild(h("div", { class: "muted", text: `命中 ${matched} / ${total} 个文档` }));
   if (!hits.length) {
-    el.appendChild(h("div", { class: "muted" }, h("span", { text: "没有命中。" })));
+    el.appendChild(h("div", { class: "muted", text: "没有命中。" }));
     return;
   }
-  const ul = h("ul");
+  const ul = h("ul", { class: "hit-list" });
   for (const hItem of hits) {
     const score = hItem.score;
-    const scoreTxt = Number.isInteger(score) ? `（分数 ${score}）` : "";
-    const li = h("li", null,
-      h("strong", { text: hItem.rel_path || "" }),
-      h("span", { text: scoreTxt })
+    const scoreTxt = (typeof score === "number") ? ` · 分数 ${Number.isInteger(score) ? score : score.toFixed(3)}` : "";
+    const li = h("li", { class: "hit-item" },
+      h("div", { class: "hit-title", text: `${hItem.rel_path || "（无路径）"}${scoreTxt}` })
     );
     const snippet = (hItem.snippet || "").trim();
     if (snippet) {
-      li.appendChild(h("div", { class: "muted" }, h("span", { text: snippet.slice(0, 160).replace(/\n/g, " ") })));
+      li.appendChild(h("div", { class: "muted", text: snippet.slice(0, 200).replace(/\n/g, " ") }));
     }
     ul.appendChild(li);
   }

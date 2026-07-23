@@ -923,10 +923,10 @@ body {
 
 .kv {
   display: grid;
-  grid-template-columns: minmax(100px, 32%) 1fr;
-  gap: 8px 16px;
-  align-items: baseline;
-  padding: 9px 0;
+  grid-template-columns: minmax(88px, 120px) minmax(0, 1fr);
+  gap: 6px 20px;
+  align-items: start;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--border);
   font-size: 13px;
 }
@@ -951,9 +951,25 @@ body {
 .kv > :last-child {
   color: var(--text);
   font-weight: 500;
-  text-align: right;
-  word-break: break-all;
+  text-align: left;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
   font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+
+.kv .v.path-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 450;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.kv .v.text-warn {
+  color: var(--warn);
 }
 
 .kv-stack {
@@ -1332,4 +1348,151 @@ pre code {
   font-size: 12.5px;
   color: var(--text-secondary);
   line-height: 1.45;
+}
+
+
+/* ========== Knowledge cards ========== */
+
+.kb-card .card-body.kb-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0;
+}
+
+.kb-card .kv-stack {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+.kb-card .kv-stack .kv {
+  padding: 10px 18px;
+}
+
+.kb-card .kb-card-body > .details,
+.kb-card .kb-card-body > .error-banner,
+.kb-card .kb-card-body > .kb-toolbar,
+.kb-card .kb-card-body > .btn-row {
+  margin-left: 18px;
+  margin-right: 18px;
+}
+
+.kb-card .kb-card-body > .details:last-child,
+.kb-card .kb-card-body > .kb-toolbar:last-child {
+  margin-bottom: 16px;
+}
+
+.kb-card .kb-card-body > .error-banner {
+  margin-top: 4px;
+}
+
+.kb-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.kb-test-result {
+  margin-top: 4px;
+}
+
+.kb-test-result .hit-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kb-test-result .hit-item {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.kb-test-result .hit-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+
+/* page section title for 已配置知识库 */
+.page .section-heading {
+  margin: 8px 0 12px;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+/* prevent form-row labels from starving inputs on wide paths */
+.form-row {
+  align-items: flex-start;
+}
+
+.form-row > .input,
+.form-row > .select,
+.form-row > .textarea {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* card children without .card-body: keep inner content off the border */
+.card > .form-row,
+.card > .form-grid,
+.card > .stack,
+.card > .btn-row,
+.card > .checkbox-row,
+.card > .caption,
+.card > .field-hint,
+.card > .error-banner,
+.card > .details,
+.card > .table,
+.card > p,
+.card > .muted,
+.card > .input,
+.card > .select,
+.card > .textarea,
+.card > .flex,
+.card > .flex-between {
+  margin-left: 18px;
+  margin-right: 18px;
+}
+.card > .form-row:first-of-type,
+.card > .form-grid:first-of-type,
+.card > .stack:first-of-type {
+  margin-top: 14px;
+}
+.card > .form-row:last-child,
+.card > .form-grid:last-child,
+.card > .stack:last-child,
+.card > .btn-row:last-child,
+.card > .details:last-child,
+.card > .caption:last-child,
+.card > button:last-child,
+.card > .flex:last-child {
+  margin-bottom: 16px;
+}
+.card > button.btn {
+  margin-left: 18px;
+  margin-right: 18px;
+  margin-bottom: 16px;
+  width: auto;
+}
+
+/* multi-select readability */
+select.select[multiple] {
+  min-height: 140px;
+  padding: 8px;
+  line-height: 1.5;
+}
+select.select[multiple] option {
+  padding: 4px 6px;
+  border-radius: 4px;
 }

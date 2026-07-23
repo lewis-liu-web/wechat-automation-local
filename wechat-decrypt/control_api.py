@@ -776,7 +776,8 @@ class ControlHandler(BaseHTTPRequestHandler):
                 static_path, ctype = _resolve_console_static(path)
                 if static_path:
                     data = static_path.read_bytes()
-                    cc = "no-cache" if path in ("/console", "/console/") else "max-age=3600"
+                    # Local ops console: never long-cache JS/CSS modules (stale ES graph after deploy).
+                    cc = "no-cache, must-revalidate"
                     self.send_response(200)
                     self.send_header("Content-Type", ctype)
                     self.send_header("Content-Length", str(len(data)))
