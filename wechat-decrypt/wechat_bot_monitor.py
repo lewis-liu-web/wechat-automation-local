@@ -66,6 +66,7 @@ _PER_MESSAGE_REASONS = {
     'target_muted_skip',
     'reliable_pipeline_sender_not_allowed',
     'precheck_boundary',
+    'trigger_skip',
 }
 
 
@@ -1084,6 +1085,18 @@ def is_trigger(cfg, target, msg):
     return _match_triggers(text, triggers)
 
 
+def should_enter_durable(cfg, target, msg):
+    """Return (enter, trigger_hit, session_active) for durable ingress gate.
+
+    free mode: always enter (via is_trigger).
+    trigger mode: enter on keyword match OR active multi-turn session.
+    empty triggers + trigger mode: never enter unless session already open.
+    """
+    session_active = bool(_is_in_session(target, msg, cfg))
+    trigger_hit = bool(is_trigger(cfg, target, msg))
+    return (trigger_hit or session_active), trigger_hit, session_active
+
+
 def reply_text(cfg, target):
     return target.get('reply_template') or cfg.get('default_reply_template') or ''
 
@@ -1712,11 +1725,27 @@ def main():
                                                'precheck_boundary': True})
                     _advance_cursor(t, lid, 'precheck_boundary')
                     continue
+                # --- trigger / free / active-session gate (Stage-4 cutover residual) ---
+                # free: all messages enter durable. trigger: keyword or active session only.
+                # Empty triggers + trigger mode: silent (cursor advances, no Hermes job).
+                _enter, _trigger_hit, _session_active = should_enter_durable(cfg, t, m)
+                if not _enter:
+                    log('trigger_skip target=%s local_id=%s sender=%s mode=%s' % (
+                        t.get('name'), lid, sender,
+                        (t.get('response_mode') or cfg.get('default_response_mode') or 'trigger')))
+                    _record_event('trigger_skip', target=t.get('name'), sender=sender,
+                                  payload={'local_id': lid, 'session_active': False})
+                    _advance_cursor(t, lid, 'trigger_skip')
+                    continue
+                if _trigger_hit and not _session_active:
+                    _activate_session(t, m, cfg)
                 # --- durable ingress (single path; survives monitor restarts) ---
                 _rl_event_context = {
                     'mode': 'durable_ingress',
                     'local_id': lid,
                     'sender': sender,
+                    'session_active': bool(_session_active or _trigger_hit),
+                    'trigger_hit': _trigger_hit,
                 }
                 _rl_result = durable_ingress_event(
                     t, m, cfg=cfg, config_path=config_path, db_path=_rl_db_path,
