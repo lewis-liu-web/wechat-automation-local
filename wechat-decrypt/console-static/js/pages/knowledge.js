@@ -209,7 +209,10 @@ export async function render(root) {
   const buildPollTimers = {};
 
   function clearTimers() {
-    Object.values(buildPollTimers).forEach(clearTimeout);
+    Object.values(buildPollTimers).forEach((id) => {
+      clearInterval(id);
+      clearTimeout(id);
+    });
     for (const key of Object.keys(buildPollTimers)) delete buildPollTimers[key];
   }
 
@@ -253,7 +256,8 @@ async function renderPage(root, clearTimers, buildPollTimers) {
   }
 
   function refresh() {
-    renderPage(root, clearTimers, buildPollTimers);
+    clearTimers();
+    return renderPage(root, clearTimers, buildPollTimers);
   }
 
   clear(root);
@@ -840,22 +844,29 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
       buildStatusEl.textContent = "有历史构建";
     }
 
-    function startBuildPoll(buildId) {
+    function startBuildPoll(buildId, { autoRefreshOnDone = true } = {}) {
       if (!buildId || !buildPollTimers) return;
       if (buildPollTimers[kbId]) {
         clearInterval(buildPollTimers[kbId]);
         delete buildPollTimers[kbId];
       }
+      const TERMINAL = ["done", "success", "completed", "error", "failed"];
       const tick = async () => {
         try {
           const info = await leann_build_status(kbId, buildId || "");
           applyBuildStatus(info);
           const st = String((info && info.status) || "");
-          if (["done", "success", "completed", "error", "failed"].includes(st)) {
-            clearInterval(buildPollTimers[kbId]);
-            delete buildPollTimers[kbId];
-            if (st === "done" || st === "success" || st === "completed") {
-              // soft refresh index existence
+          if (TERMINAL.includes(st) || st === "unknown" || !st) {
+            if (buildPollTimers[kbId]) {
+              clearInterval(buildPollTimers[kbId]);
+              delete buildPollTimers[kbId];
+            }
+            // Full-page refresh only after a user-started build finishes.
+            // History last_build_id must NOT re-trigger refresh (infinite loop).
+            if (
+              autoRefreshOnDone &&
+              (st === "done" || st === "success" || st === "completed")
+            ) {
               setTimeout(() => refresh(), 400);
             }
           }
@@ -873,13 +884,28 @@ function renderKbCard(kb, kbs, refresh, buildPollTimers) {
         const res = await build_leann_kb(kbId, null, true);
         toast(`已启动后台构建：${res.build_id || ""}`, "ok");
         applyBuildStatus({ status: "started" });
-        if (res.build_id) startBuildPoll(res.build_id);
+        if (res.build_id) startBuildPoll(res.build_id, { autoRefreshOnDone: true });
       } catch (err) {
         toast(`启动失败：${err.message}`, "err");
       }
     };
 
-    if (kb.last_build_id) startBuildPoll(kb.last_build_id);
+    // History build: one-shot status only. Poll only if still in-flight.
+    if (kb.last_build_id) {
+      (async () => {
+        try {
+          const info = await leann_build_status(kbId, kb.last_build_id);
+          applyBuildStatus(info);
+          const st = String((info && info.status) || "");
+          if (["running", "started", "pending"].includes(st)) {
+            startBuildPoll(kb.last_build_id, { autoRefreshOnDone: false });
+          }
+        } catch (err) {
+          buildStatusEl.className = "badge badge-muted";
+          buildStatusEl.textContent = "有历史构建";
+        }
+      })();
+    }
 
     leannBlocks.push(
       h("div", { class: "kb-toolbar" }, buildBtn, buildStatusEl)
