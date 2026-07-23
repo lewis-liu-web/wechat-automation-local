@@ -1486,6 +1486,129 @@ pre code {
   width: auto;
 }
 
+
+/* ========== Agent page ========== */
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  word-break: break-all;
+}
+
+.input-narrow {
+  width: auto;
+  max-width: 120px;
+  min-width: 80px;
+}
+
+.form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.form-field > label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.form-field-span {
+  grid-column: 1 / -1;
+}
+
+.agent-test-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.agent-test-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px 14px;
+}
+
+.agent-test-actions {
+  margin-top: 2px;
+}
+
+.agent-test-actions .btn {
+  width: auto;
+  min-width: 108px;
+  max-width: 200px;
+}
+
+.agent-test-result {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.agent-instance-list {
+  gap: 12px;
+}
+
+/* Nested instance cards: no double outer margin from parent rules */
+.agent-instance-list > .agent-instance-card {
+  margin: 0;
+  box-shadow: var(--shadow-sm);
+}
+
+.agent-instance-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 !important;
+}
+
+.agent-instance-body > .kv-stack {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+.agent-instance-body > .kv-stack .kv {
+  padding: 10px 18px;
+}
+
+.agent-instance-body > .btn-row,
+.agent-instance-body > .details {
+  margin-left: 18px;
+  margin-right: 18px;
+}
+
+.agent-instance-body > .details:last-child,
+.agent-instance-body > .btn-row:last-child {
+  margin-bottom: 16px;
+}
+
+.agent-instance-actions .btn {
+  width: auto;
+}
+
+.agent-instance-actions .btn-danger {
+  background: var(--danger-soft);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+.agent-instance-actions .btn-danger:hover:not(:disabled) {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+/* prevent form-grid from stretching primary CTAs */
+.form-grid > .btn,
+.form-grid > button.btn {
+  width: auto;
+  max-width: 220px;
+  justify-self: start;
+  align-self: end;
+}
+
 /* multi-select readability */
 select.select[multiple] {
   min-height: 140px;

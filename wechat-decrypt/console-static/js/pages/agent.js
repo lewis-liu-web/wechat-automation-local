@@ -37,6 +37,7 @@ import {
   metricCard,
   detailsEl,
   pageHeader,
+  badge,
 } from "../ui.js";
 
 function jobStatusForDisplay(job) {
@@ -115,7 +116,7 @@ function poolStatusLabel(value) {
 }
 
 function instanceKindLabel(kind) {
-  return { hermes: "Hermes profile/worker", echo: "Echo" }[String(kind)] || String(kind || "—");
+  return { hermes: "Hermes", echo: "Echo" }[String(kind)] || String(kind || "—");
 }
 
 function errorBanner(msg, onRetry) {
@@ -246,15 +247,19 @@ export async function render(root) {
       "div",
       { class: "card" },
       h("h3", { class: "card-title", text: "当前状态" }),
-      alert,
       h(
         "div",
-        { class: "metric-grid" },
-        metricCard("排队中", queued),
-        metricCard("处理中", running),
-        metricCard("已完成", done),
-        metricCard("异常", abnormal),
-        metricCard("自动处理", loopRunning ? "运行中" : "未启动")
+        { class: "card-body stack" },
+        alert,
+        h(
+          "div",
+          { class: "metric-grid" },
+          metricCard("排队中", queued),
+          metricCard("处理中", running),
+          metricCard("已完成", done),
+          metricCard("异常", abnormal),
+          metricCard("自动处理", loopRunning ? "运行中" : "未启动")
+        )
       )
     );
   }
@@ -288,11 +293,7 @@ export async function render(root) {
     const label = String(inst.label || inst.profile || iid || "实例");
     const kind = String(inst.provider || inst.type || "hermes").toLowerCase();
     const kindLabel = instanceKindLabel(kind);
-    const bridge = inst.bridge_url || inst.bridge_cwd || inst.hermes_home || "-";
-    const extras = [];
-    if (inst.profile) extras.push("profile=" + inst.profile);
-    if (inst.model) extras.push("model=" + inst.model);
-    if (inst.toolsets) extras.push("toolsets=" + inst.toolsets);
+    const bridge = inst.bridge_url || inst.bridge_cwd || inst.hermes_home || "—";
 
     const poolById = {};
     (state.poolState.instances || []).forEach((r) => {
@@ -303,6 +304,7 @@ export async function render(root) {
     const loopRunning = Boolean(state.loopState && state.loopState.running);
     const loopCfg = (state.loopState && state.loopState.config) || {};
     const loopInst = String(loopCfg.instance_id || "");
+    const isOnDuty = loopRunning && loopInst && loopInst === iid;
 
     const configuredIds = new Set((state.instances || []).map((i) => String(i.id || "")));
 
@@ -332,9 +334,16 @@ export async function render(root) {
         const hdata = (resp && resp.health) || resp || {};
         state.healthCache[iid] = hdata;
         if (hdata.ok || hdata.ready) {
-          toast("可用 · provider=" + (hdata.provider || kind) + " · workers=" + (hdata.workers || 0), "ok");
+          toast(
+            "可用 · provider=" + (hdata.provider || kind) + " · workers=" + (hdata.workers || 0),
+            "ok"
+          );
         } else {
-          toast("未在自动池中或暂未检测：" + (hdata.error || "可点击加入自动处理池进行注册和启动"), "warn");
+          toast(
+            "未在自动池中或暂未检测：" +
+              (hdata.error || "可点击加入自动处理池进行注册和启动"),
+            "warn"
+          );
         }
       } catch (e) {
         state.healthCache[iid] = { ok: false, ready: false, error: e.message || String(e) };
@@ -413,7 +422,7 @@ export async function render(root) {
     }
 
     const timeoutInput = h("input", {
-      class: "input",
+      class: "input input-narrow",
       type: "number",
       value: 240,
       min: 3,
@@ -421,41 +430,73 @@ export async function render(root) {
       step: 1,
     });
 
-    return h(
-      "div",
-      { class: "card" },
-      h("h4", { class: "card-title", text: label }),
+    const statusBadge = isOnDuty
+      ? badge("在岗 · 自动处理中", "ok")
+      : loopRunning
+        ? badge("池运行中 · 在岗=" + (loopInst || "—"), "info")
+        : badge("自动处理未启动", "muted");
+
+    const poolStatus = poolStatusLabel(poolRow.status) || "未知";
+
+    const bodyKids = [
       h(
         "div",
-        { class: "kv" },
-        h("span", { text: "id=" + iid + " · 类型=" + kindLabel + " · 配置=" + bridge }),
-        extras.length ? h("span", { text: " · " + extras.join(" · ") }) : null
+        { class: "kv-stack" },
+        h("div", { class: "kv" }, h("span", { class: "k", text: "实例 ID" }), h("span", { class: "v mono", text: iid || "—" })),
+        h("div", { class: "kv" }, h("span", { class: "k", text: "类型" }), h("span", { class: "v", text: kindLabel })),
+        h(
+          "div",
+          { class: "kv" },
+          h("span", { class: "k", text: "Profile" }),
+          h("span", { class: "v mono", text: inst.profile || "—" })
+        ),
+        h(
+          "div",
+          { class: "kv" },
+          h("span", { class: "k", text: "配置路径" }),
+          h("span", { class: "v path-value", text: bridge })
+        ),
+        h(
+          "div",
+          { class: "kv" },
+          h("span", { class: "k", text: "池状态" }),
+          h("span", { class: "v", text: poolStatus })
+        ),
+        cur.id
+          ? h(
+              "div",
+              { class: "kv" },
+              h("span", { class: "k", text: "当前任务" }),
+              h(
+                "span",
+                {
+                  class: "v",
+                  text: "#" + cur.id + " · " + (cur.target_name || "—") + " · " + (cur.status || "—"),
+                }
+              )
+            )
+          : null,
+        inst.model
+          ? h(
+              "div",
+              { class: "kv" },
+              h("span", { class: "k", text: "Model" }),
+              h("span", { class: "v mono", text: String(inst.model) })
+            )
+          : null
       ),
-      h("div", { class: "metric-grid" }, metricCard("自动池状态", poolStatusLabel(poolRow.status) || "未知")),
-      cur.id
-        ? h(
-            "div",
-            { class: "kv" },
-            h("span", {
-              text: "当前任务：#" + cur.id + " · " + cur.target_name + " · " + cur.status,
-            })
-          )
-        : null,
-      loopRunning
-        ? h("div", { class: "badge badge-ok", text: "自动处理池运行中" + (loopInst ? " · 在岗=" + loopInst : "") })
-        : h("div", { class: "badge badge-muted", text: "自动处理池未启动" }),
       h(
         "div",
-        { class: "form-row mt-3" },
+        { class: "btn-row agent-instance-actions" },
         h("button", { class: "btn btn-primary btn-sm", text: "加入自动处理池", onclick: joinLoop }),
-        h("button", { class: "btn btn-ghost btn-sm", text: "检查这个实例", onclick: checkInstance }),
+        h("button", { class: "btn btn-ghost btn-sm", text: "检查实例", onclick: checkInstance }),
         h("button", { class: "btn btn-danger btn-sm", text: "停止自动处理池", onclick: stopLoop })
       ),
       detailsEl(
         "调试：单步推进队列",
         h(
           "div",
-          { class: "form-row" },
+          { class: "btn-row" },
           h("button", { class: "btn btn-ghost btn-sm", text: "派发一次", onclick: runDispatch }),
           h("button", { class: "btn btn-ghost btn-sm", text: "轮询一次", onclick: runReconcile }),
           h("button", { class: "btn btn-ghost btn-sm", text: "发送一次", onclick: runSend })
@@ -465,7 +506,7 @@ export async function render(root) {
         "旧同步 worker（调试用，不推荐日常使用）",
         h(
           "div",
-          null,
+          { class: "stack-sm" },
           h(
             "div",
             { class: "form-row" },
@@ -474,25 +515,65 @@ export async function render(root) {
           ),
           h(
             "div",
-            { class: "form-row" },
+            { class: "btn-row" },
             h("button", {
               class: "btn btn-primary btn-sm",
               text: "启动旧 worker",
               onclick: () => startOldWorker(timeoutInput.value),
             }),
-            h("button", { class: "btn btn-danger btn-sm", text: "停止旧 worker", onclick: stopOldWorker })
+            h("button", {
+              class: "btn btn-danger btn-sm",
+              text: "停止旧 worker",
+              onclick: stopOldWorker,
+            })
           )
         )
       ),
-      state.detailCache[iid + "_dispatch"]
-        ? detailsEl("派发结果 JSON", h("pre", { text: JSON.stringify(state.detailCache[iid + "_dispatch"], null, 2) }), true)
-        : null,
-      state.detailCache[iid + "_reconcile"]
-        ? detailsEl("轮询结果 JSON", h("pre", { text: JSON.stringify(state.detailCache[iid + "_reconcile"], null, 2) }), true)
-        : null,
-      state.detailCache[iid + "_send"]
-        ? detailsEl("发送结果 JSON", h("pre", { text: JSON.stringify(state.detailCache[iid + "_send"], null, 2) }), true)
-        : null
+    ];
+
+    if (state.detailCache[iid + "_dispatch"]) {
+      bodyKids.push(
+        detailsEl(
+          "派发结果 JSON",
+          h("pre", { text: JSON.stringify(state.detailCache[iid + "_dispatch"], null, 2) }),
+          true
+        )
+      );
+    }
+    if (state.detailCache[iid + "_reconcile"]) {
+      bodyKids.push(
+        detailsEl(
+          "轮询结果 JSON",
+          h("pre", { text: JSON.stringify(state.detailCache[iid + "_reconcile"], null, 2) }),
+          true
+        )
+      );
+    }
+    if (state.detailCache[iid + "_send"]) {
+      bodyKids.push(
+        detailsEl(
+          "发送结果 JSON",
+          h("pre", { text: JSON.stringify(state.detailCache[iid + "_send"], null, 2) }),
+          true
+        )
+      );
+    }
+
+    return h(
+      "div",
+      { class: "card agent-instance-card" },
+      h(
+        "div",
+        { class: "card-head" },
+        h(
+          "div",
+          { class: "card-head-main" },
+          h("span", { class: "card-head-title", text: label }),
+          badge(kindLabel, "info"),
+          statusBadge
+        )
+      ),
+      h("div", { class: "card-body agent-instance-body" }, ...bodyKids)
     );
   }
 
@@ -506,11 +587,24 @@ export async function render(root) {
       "div",
       { class: "card" },
       h("h3", { class: "card-title", text: "Agent 自动处理池" }),
-      h("p", { text: "推荐只用这一块：把可用 Hermes profile/worker 加入自动处理池，系统会自动派任务、轮询结果、发回微信。同一个群仍然串行，多个群可以并发。" }),
-      renderPoolTable(),
-      !available.length
-        ? h("p", { class: "empty-state", text: "未在 wechat_bot_targets.json 的 agent_provider.instances 找到实例配置，也未发现可用 Hermes profile/worker。" })
-        : h("div", null, ...available.map((inst) => renderInstanceCard(inst)))
+      h(
+        "div",
+        { class: "card-body stack" },
+        h(
+          "p",
+          {
+            class: "caption flush",
+            text: "把可用 Hermes profile/worker 加入自动处理池后，系统会自动派任务、轮询结果、发回微信。同群串行，多群可并发。",
+          }
+        ),
+        renderPoolTable(),
+        !available.length
+          ? h("p", {
+              class: "empty-state",
+              text: "未在 wechat_bot_targets.json 的 agent_provider.instances 找到实例配置，也未发现可用 Hermes profile/worker。",
+            })
+          : h("div", { class: "stack agent-instance-list" }, ...available.map((inst) => renderInstanceCard(inst)))
+      )
     );
   }
 
@@ -525,11 +619,18 @@ export async function render(root) {
     const senderInput = h("input", { class: "input", type: "text", value: "tester" });
     const targetOptions = [h("option", { value: 0, text: "不绑定目标" })].concat(
       state.targets.map((t, i) =>
-        h("option", { value: i + 1, text: (t.name || "?") + "（" + (t.username || "") + "）" })
+        h("option", {
+          value: i + 1,
+          text: (t.name || "?") + "（" + (t.username || "") + "）",
+        })
       )
     );
     const targetSel = h("select", { class: "select" }, ...targetOptions);
-    const promptArea = h("textarea", { class: "textarea", rows: 3, text: "请用一句话说明今天上海天气适合穿什么" });
+    const promptArea = h("textarea", {
+      class: "textarea",
+      rows: 3,
+      text: "请用一句话说明今天上海天气适合穿什么",
+    });
 
     async function submitTest(e) {
       e.preventDefault();
@@ -555,8 +656,8 @@ export async function render(root) {
         ];
         state.detailCache["test_form_result"] = { rows, raw: res };
         rebuild();
-      } catch (e) {
-        toast("创建失败：" + (e.message || String(e)), "err");
+      } catch (err) {
+        toast("创建失败：" + (err.message || String(err)), "err");
       }
     }
 
@@ -566,32 +667,57 @@ export async function render(root) {
       "div",
       { class: "card" },
       h("h3", { class: "card-title", text: "快速测试" }),
-      h("p", { text: "用一条测试任务确认：创建任务 → 被处理 → 返回结果，这个流程是否正常。" }),
       h(
-        "form",
-        { class: "form-grid", onsubmit: submitTest },
-        h("div", { class: "form-row" }, h("label", { text: "测试内容" }), promptArea),
+        "div",
+        { class: "card-body" },
         h(
-          "div",
-          { class: "form-row" },
-          h("label", { text: "测试模式" }), providerSel,
-          h("label", { text: "测试分组" }), groupInput,
-          h("label", { text: "操作人" }), senderInput,
-          h("label", { text: "绑定目标" }), targetSel
+          "p",
+          {
+            class: "caption flush",
+            text: "用一条测试任务确认：创建任务 → 被处理 → 返回结果。",
+          }
         ),
-        h("button", { class: "btn btn-primary", type: "submit", text: "开始测试" })
-      ),
-      result
-        ? h(
+        h(
+          "form",
+          { class: "agent-test-form", onsubmit: submitTest },
+          h(
             "div",
-            null,
-            tableEl(
-              ["任务编号", "当前状态", "测试分组", "处理方式"].map((k) => ({ key: k, label: k })),
-              result.rows
-            ),
-            detailsEl("查看创建详情（JSON）", h("pre", { text: JSON.stringify(result.raw, null, 2) }))
+            { class: "form-field form-field-span" },
+            h("label", { text: "测试内容" }),
+            promptArea
+          ),
+          h(
+            "div",
+            { class: "agent-test-fields" },
+            h("div", { class: "form-field" }, h("label", { text: "测试模式" }), providerSel),
+            h("div", { class: "form-field" }, h("label", { text: "测试分组" }), groupInput),
+            h("div", { class: "form-field" }, h("label", { text: "操作人" }), senderInput),
+            h("div", { class: "form-field" }, h("label", { text: "绑定目标" }), targetSel)
+          ),
+          h(
+            "div",
+            { class: "btn-row agent-test-actions" },
+            h("button", { class: "btn btn-primary", type: "submit", text: "开始测试" })
           )
-        : null
+        ),
+        result
+          ? h(
+              "div",
+              { class: "stack agent-test-result" },
+              tableEl(
+                ["任务编号", "当前状态", "测试分组", "处理方式"].map((k) => ({
+                  key: k,
+                  label: k,
+                })),
+                result.rows
+              ),
+              detailsEl(
+                "查看创建详情（JSON）",
+                h("pre", { text: JSON.stringify(result.raw, null, 2) })
+              )
+            )
+          : null
+      )
     );
   }
 
@@ -602,7 +728,7 @@ export async function render(root) {
       h("option", { value: "echo", text: "安全测试（不调用真实模型）" }),
       h("option", { value: "hermes", text: "Hermes 本地 Agent" })
     );
-    const timeoutInput = h("input", { class: "input", type: "number", value: 240, min: 3, max: 600, step: 1 });
+    const timeoutInput = h("input", { class: "input input-narrow", type: "number", value: 240, min: 3, max: 600, step: 1 });
 
     async function runOnce() {
       try {
@@ -624,14 +750,21 @@ export async function render(root) {
         "高级操作：立即处理一次",
         h(
           "div",
-          null,
-          h("p", { text: "用于排查“任务已创建但没有自动处理”的情况。普通使用无需操作。只执行一次处理检查，不会持续后台运行。" }),
+          { class: "stack" },
+          h("p", {
+            class: "caption flush",
+            text: "用于排查“任务已创建但没有自动处理”的情况。普通使用无需操作。只执行一次处理检查，不会持续后台运行。",
+          }),
           h(
             "div",
-            { class: "form-row" },
-            h("label", { text: "处理模式" }), providerSel,
-            h("label", { text: "最长等待时间" }), timeoutInput,
-            h("button", { class: "btn btn-primary", text: "立即处理一次", onclick: runOnce })
+            { class: "agent-test-fields" },
+            h("div", { class: "form-field" }, h("label", { text: "处理模式" }), providerSel),
+            h("div", { class: "form-field" }, h("label", { text: "最长等待时间（秒）" }), timeoutInput)
+          ),
+          h(
+            "div",
+            { class: "btn-row" },
+            h("button", { class: "btn btn-primary btn-sm", text: "立即处理一次", onclick: runOnce })
           ),
           state.detailCache["advanced_once"]
             ? detailsEl("查看处理详情（JSON）", h("pre", { text: JSON.stringify(state.detailCache["advanced_once"], null, 2) }), true)
